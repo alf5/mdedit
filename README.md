@@ -16,7 +16,11 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
   bullet/numbered/task lists, blockquote, code block, links, images, tables,
   horizontal rules — works in both WYSIWYG and source mode.
 - **Native menus**: File (New / Open / Save / Save As / Quit), Edit (undo,
-  redo, clipboard, Find / Replace), View, Format, Help.
+  redo, clipboard, Find / Replace), View, Insert (link, image, table, hr,
+  table rows/columns), Format, Help.
+- **Table editing**: insert row above/below and column left/right, delete
+  row/column/table — from the toolbar (shown while the caret is in a table),
+  the Insert menu, or a right-click context menu on any table cell.
 - **Find & replace** (`Ctrl+F` / `Ctrl+H`) with match count, case toggle,
   replace one / all.
 - Window title shows the current file (`notes.md - mdedit`, `*` when

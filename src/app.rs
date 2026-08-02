@@ -49,11 +49,14 @@ struct Ctl {
     url_modal: RwSignal<Option<UrlKind>>,
     url_val: RwSignal<String>,
     url_text: RwSignal<String>,
+    in_table: RwSignal<bool>,
+    ctx_menu: RwSignal<Option<(f64, f64)>>,
     editor_ref: NodeRef<html::Div>,
     ta_ref: NodeRef<html::Textarea>,
     find_ref: NodeRef<html::Input>,
     url_ref: NodeRef<html::Input>,
     saved_range: StoredValue<Option<web_sys::Range>, LocalStorage>,
+    ctx_cell: StoredValue<Option<Element>, LocalStorage>,
 }
 
 thread_local! {
@@ -308,6 +311,7 @@ fn toggle_mode(ctl: Ctl) {
     }
     recount(ctl);
     focus_current(ctl);
+    update_in_table(ctl);
 }
 
 // ---------- file operations ----------
@@ -398,7 +402,10 @@ fn open_find(ctl: Ctl, with_replace: bool) {
 
 fn close_overlays(ctl: Ctl) -> bool {
     let mut closed = false;
-    if ctl.url_modal.get_untracked().is_some() {
+    if ctl.ctx_menu.get_untracked().is_some() {
+        close_ctx_menu(ctl);
+        closed = true;
+    } else if ctl.url_modal.get_untracked().is_some() {
         ctl.url_modal.set(None);
         closed = true;
     } else if ctl.pending.get_untracked().is_some() {
@@ -823,6 +830,202 @@ fn fmt_action(ctl: Ctl, action: &str) {
     }
 }
 
+// ---------- table operations ----------
+
+fn selection_element() -> Option<Element> {
+    let sel = window().get_selection().ok().flatten()?;
+    let node = sel.anchor_node()?;
+    node.dyn_ref::<Element>()
+        .cloned()
+        .or_else(|| node.parent_element())
+}
+
+/// (cell, row, table) — only for cells inside the WYSIWYG editor.
+fn cell_from(el: &Element) -> Option<(Element, Element, Element)> {
+    let cell = el.closest("td,th").ok().flatten()?;
+    cell.closest(".editor.wysiwyg").ok().flatten()?;
+    let row = cell.closest("tr").ok().flatten()?;
+    let table = cell.closest("table").ok().flatten()?;
+    Some((cell, row, table))
+}
+
+/// The cell an operation targets: the right-clicked cell while the context
+/// menu is open, otherwise the selection's cell.
+fn active_cell(ctl: Ctl) -> Option<(Element, Element, Element)> {
+    if let Some(c) = ctl.ctx_cell.get_value() {
+        return cell_from(&c);
+    }
+    selection_element().and_then(|e| cell_from(&e))
+}
+
+fn row_cells(row: &Element) -> Vec<Element> {
+    children(row.unchecked_ref())
+        .into_iter()
+        .filter_map(|n| n.dyn_into::<Element>().ok())
+        .filter(|e| {
+            let t = e.tag_name().to_uppercase();
+            t == "TD" || t == "TH"
+        })
+        .collect()
+}
+
+fn children(node: &web_sys::Node) -> Vec<web_sys::Node> {
+    let list = node.child_nodes();
+    (0..list.length()).filter_map(|i| list.item(i)).collect()
+}
+
+fn caret_into(el: &Element) {
+    let _ = el.scroll_into_view_with_bool(false);
+    if let (Ok(range), Ok(Some(sel))) = (document().create_range(), window().get_selection()) {
+        let _ = range.set_start(el.unchecked_ref::<web_sys::Node>(), 0);
+        range.collapse_with_to_start(true);
+        let _ = sel.remove_all_ranges();
+        let _ = sel.add_range(&range);
+    }
+}
+
+fn new_cell(tag: &str) -> Option<Element> {
+    let el = document().create_element(tag).ok()?;
+    el.set_inner_html("<br>");
+    Some(el)
+}
+
+fn table_changed(ctl: Ctl) {
+    mark_dirty(ctl);
+    recount(ctl);
+}
+
+fn table_insert_row(ctl: Ctl, below: bool) {
+    let Some((_, row, table)) = active_cell(ctl) else {
+        return;
+    };
+    let cols = row_cells(&row).len().max(1);
+    let Ok(tr) = document().create_element("tr") else {
+        return;
+    };
+    for _ in 0..cols {
+        if let Some(td) = new_cell("td") {
+            let _ = tr.append_child(&td);
+        }
+    }
+    let in_head = row.closest("thead").ok().flatten().is_some();
+    if in_head {
+        // The header must stay first; both directions insert at the top of
+        // the body.
+        if let Some(tbody) = table.query_selector("tbody").ok().flatten() {
+            let _ = tbody.insert_before(&tr, tbody.first_child().as_ref());
+        } else {
+            let _ = table.append_child(&tr);
+        }
+    } else if below {
+        let _ = row.after_with_node_1(&tr);
+    } else {
+        let _ = row.before_with_node_1(&tr);
+    }
+    if let Some(first) = row_cells(&tr).into_iter().next() {
+        caret_into(&first);
+    }
+    table_changed(ctl);
+}
+
+fn table_insert_col(ctl: Ctl, right: bool) {
+    let Some((cell, row, table)) = active_cell(ctl) else {
+        return;
+    };
+    let cells = row_cells(&row);
+    let Some(idx) = cells.iter().position(|c| c == &cell) else {
+        return;
+    };
+    let insert_at = if right { idx + 1 } else { idx };
+    let Ok(rows) = table.query_selector_all("tr") else {
+        return;
+    };
+    let mut caret_target: Option<Element> = None;
+    for i in 0..rows.length() {
+        let Some(tr) = rows.item(i).and_then(|n| n.dyn_into::<Element>().ok()) else {
+            continue;
+        };
+        let in_head = tr.closest("thead").ok().flatten().is_some();
+        let Some(nc) = new_cell(if in_head { "th" } else { "td" }) else {
+            continue;
+        };
+        let tr_cells = row_cells(&tr);
+        let at = insert_at.min(tr_cells.len());
+        if at >= tr_cells.len() {
+            let _ = tr.append_child(&nc);
+        } else {
+            let _ = tr.insert_before(&nc, Some(tr_cells[at].unchecked_ref()));
+        }
+        if tr == row {
+            caret_target = Some(nc);
+        }
+    }
+    if let Some(c) = caret_target {
+        caret_into(&c);
+    }
+    table_changed(ctl);
+}
+
+fn table_delete_row(ctl: Ctl) {
+    let Some((_, row, _)) = active_cell(ctl) else {
+        return;
+    };
+    if row.closest("thead").ok().flatten().is_some() {
+        return; // a GFM table cannot lose its header row
+    }
+    row.remove();
+    table_changed(ctl);
+}
+
+fn table_delete_col(ctl: Ctl) {
+    let Some((cell, row, table)) = active_cell(ctl) else {
+        return;
+    };
+    let cells = row_cells(&row);
+    if cells.len() <= 1 {
+        table.remove();
+        table_changed(ctl);
+        return;
+    }
+    let Some(idx) = cells.iter().position(|c| c == &cell) else {
+        return;
+    };
+    let Ok(rows) = table.query_selector_all("tr") else {
+        return;
+    };
+    for i in 0..rows.length() {
+        let Some(tr) = rows.item(i).and_then(|n| n.dyn_into::<Element>().ok()) else {
+            continue;
+        };
+        let tr_cells = row_cells(&tr);
+        if let Some(c) = tr_cells.get(idx) {
+            c.remove();
+        }
+    }
+    table_changed(ctl);
+}
+
+fn table_delete_table(ctl: Ctl) {
+    let Some((_, _, table)) = active_cell(ctl) else {
+        return;
+    };
+    table.remove();
+    table_changed(ctl);
+}
+
+fn update_in_table(ctl: Ctl) {
+    let inside = ctl.mode.get_untracked() == Mode::Wysiwyg
+        && selection_element().and_then(|e| cell_from(&e)).is_some();
+    if ctl.in_table.get_untracked() != inside {
+        ctl.in_table.set(inside);
+    }
+}
+
+fn close_ctx_menu(ctl: Ctl) {
+    ctl.ctx_menu.set(None);
+    ctl.ctx_cell.set_value(None);
+}
+
 // ---------- action dispatch ----------
 
 fn do_action(ctl: Ctl, action: &str) {
@@ -851,6 +1054,13 @@ fn do_action(ctl: Ctl, action: &str) {
         "find" => open_find(ctl, false),
         "replace" => open_find(ctl, true),
         "toggle_mode" => toggle_mode(ctl),
+        "tbl_row_above" => table_insert_row(ctl, false),
+        "tbl_row_below" => table_insert_row(ctl, true),
+        "tbl_col_left" => table_insert_col(ctl, false),
+        "tbl_col_right" => table_insert_col(ctl, true),
+        "tbl_del_row" => table_delete_row(ctl),
+        "tbl_del_col" => table_delete_col(ctl),
+        "tbl_del_table" => table_delete_table(ctl),
         a if a.starts_with("fmt_") => fmt_action(ctl, a),
         _ => {}
     }
@@ -897,12 +1107,24 @@ pub fn App() -> impl IntoView {
         url_modal: RwSignal::new(None),
         url_val: RwSignal::new(String::new()),
         url_text: RwSignal::new(String::new()),
+        in_table: RwSignal::new(false),
+        ctx_menu: RwSignal::new(None),
         editor_ref: NodeRef::new(),
         ta_ref: NodeRef::new(),
         find_ref: NodeRef::new(),
         url_ref: NodeRef::new(),
         saved_range: StoredValue::new_local(None),
+        ctx_cell: StoredValue::new_local(None),
     };
+
+    // Track whether the caret sits inside a table (drives the table toolbar
+    // group).
+    {
+        let cb = Closure::<dyn FnMut()>::new(move || update_in_table(ctl));
+        let _ = document()
+            .add_event_listener_with_callback("selectionchange", cb.as_ref().unchecked_ref());
+        cb.forget();
+    }
 
     // Initialize the editor element once it exists.
     Effect::new(move |_| {
@@ -1046,6 +1268,43 @@ pub fn App() -> impl IntoView {
         }
     };
 
+    let on_editor_ctxmenu = move |e: web_sys::MouseEvent| {
+        if ctl.mode.get_untracked() != Mode::Wysiwyg {
+            return;
+        }
+        let Some(el) = e
+            .target()
+            .and_then(|t| t.dyn_into::<Element>().ok())
+        else {
+            return;
+        };
+        let Some((cell, _, _)) = cell_from(&el) else {
+            return; // outside a table: keep the default context menu
+        };
+        e.prevent_default();
+        ctl.ctx_cell.set_value(Some(cell));
+        let win = window();
+        let vw = win.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(800.0);
+        let vh = win.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(600.0);
+        let x = f64::from(e.client_x()).min(vw - 200.0).max(0.0);
+        let y = f64::from(e.client_y()).min(vh - 270.0).max(0.0);
+        ctl.ctx_menu.set(Some((x, y)));
+    };
+
+    let ctx_item = move |action: &'static str, label: &'static str| {
+        view! {
+            <button
+                class="ctx-item"
+                on:click=move |_| {
+                    do_action(ctl, action);
+                    close_ctx_menu(ctl);
+                }
+            >
+                {label}
+            </button>
+        }
+    };
+
     let mode_is = move |m: Mode| ctl.mode.get() == m;
 
     view! {
@@ -1071,6 +1330,15 @@ pub fn App() -> impl IntoView {
                 {tb_btn(ctl, "fmt_image", "", "🖼", "Insert image")}
                 {tb_btn(ctl, "fmt_table", "", "⊞", "Insert table")}
                 {tb_btn(ctl, "fmt_hr", "", "―", "Horizontal rule")}
+                <span class="tb-group" class:hidden=move || !ctl.in_table.get()>
+                    <span class="tb-sep"></span>
+                    {tb_btn(ctl, "tbl_row_above", "tb-text", "Row ↑", "Insert row above")}
+                    {tb_btn(ctl, "tbl_row_below", "tb-text", "Row ↓", "Insert row below")}
+                    {tb_btn(ctl, "tbl_col_left", "tb-text", "Col ←", "Insert column left")}
+                    {tb_btn(ctl, "tbl_col_right", "tb-text", "Col →", "Insert column right")}
+                    {tb_btn(ctl, "tbl_del_row", "tb-text", "− Row", "Delete row")}
+                    {tb_btn(ctl, "tbl_del_col", "tb-text", "− Col", "Delete column")}
+                </span>
                 <span class="tb-spacer"></span>
                 <button
                     class="tb-btn tb-mode"
@@ -1156,6 +1424,7 @@ pub fn App() -> impl IntoView {
                     on:keydown=on_editor_keydown
                     on:paste=on_editor_paste
                     on:click=on_editor_click
+                    on:contextmenu=on_editor_ctxmenu
                     on:change=move |_| {
                         mark_dirty(ctl);
                     }
@@ -1189,6 +1458,33 @@ pub fn App() -> impl IntoView {
                 <span class="status-sep">"·"</span>
                 <span>{move || if mode_is(Mode::Source) { "Markdown" } else { "WYSIWYG" }}</span>
             </div>
+
+            <Show when=move || ctl.ctx_menu.get().is_some()>
+                <div
+                    class="ctx-backdrop"
+                    on:mousedown=move |_| close_ctx_menu(ctl)
+                    on:contextmenu=move |e: web_sys::MouseEvent| {
+                        e.prevent_default();
+                        close_ctx_menu(ctl);
+                    }
+                ></div>
+                <div
+                    class="ctxmenu"
+                    style=move || {
+                        let (x, y) = ctl.ctx_menu.get().unwrap_or((0.0, 0.0));
+                        format!("left:{x}px;top:{y}px")
+                    }
+                >
+                    {ctx_item("tbl_row_above", "Insert row above")}
+                    {ctx_item("tbl_row_below", "Insert row below")}
+                    {ctx_item("tbl_col_left", "Insert column left")}
+                    {ctx_item("tbl_col_right", "Insert column right")}
+                    <div class="ctx-sep"></div>
+                    {ctx_item("tbl_del_row", "Delete row")}
+                    {ctx_item("tbl_del_col", "Delete column")}
+                    {ctx_item("tbl_del_table", "Delete table")}
+                </div>
+            </Show>
 
             <Show when=move || ctl.pending.get().is_some()>
                 <div class="overlay">

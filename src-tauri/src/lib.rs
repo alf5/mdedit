@@ -257,6 +257,27 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         )?],
     )?;
 
+    let insert_menu = Submenu::with_items(
+        app,
+        "Insert",
+        true,
+        &[
+            &MenuItem::with_id(app, "fmt_link", "Link…", true, None::<&str>)?,
+            &MenuItem::with_id(app, "fmt_image", "Image…", true, None::<&str>)?,
+            &MenuItem::with_id(app, "fmt_table", "Table", true, None::<&str>)?,
+            &MenuItem::with_id(app, "fmt_hr", "Horizontal Rule", true, None::<&str>)?,
+            &PredefinedMenuItem::separator(app)?,
+            &MenuItem::with_id(app, "tbl_row_above", "Row Above", true, None::<&str>)?,
+            &MenuItem::with_id(app, "tbl_row_below", "Row Below", true, None::<&str>)?,
+            &MenuItem::with_id(app, "tbl_col_left", "Column Left", true, None::<&str>)?,
+            &MenuItem::with_id(app, "tbl_col_right", "Column Right", true, None::<&str>)?,
+            &PredefinedMenuItem::separator(app)?,
+            &MenuItem::with_id(app, "tbl_del_row", "Delete Row", true, None::<&str>)?,
+            &MenuItem::with_id(app, "tbl_del_col", "Delete Column", true, None::<&str>)?,
+            &MenuItem::with_id(app, "tbl_del_table", "Delete Table", true, None::<&str>)?,
+        ],
+    )?;
+
     let format_menu = Submenu::with_items(
         app,
         "Format",
@@ -278,10 +299,6 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(app, "fmt_quote", "Blockquote", true, None::<&str>)?,
             &MenuItem::with_id(app, "fmt_codeblock", "Code Block", true, None::<&str>)?,
-            &MenuItem::with_id(app, "fmt_link", "Insert Link…", true, None::<&str>)?,
-            &MenuItem::with_id(app, "fmt_image", "Insert Image…", true, None::<&str>)?,
-            &MenuItem::with_id(app, "fmt_table", "Insert Table", true, None::<&str>)?,
-            &MenuItem::with_id(app, "fmt_hr", "Horizontal Rule", true, None::<&str>)?,
         ],
     )?;
 
@@ -300,6 +317,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
             &file_menu,
             &edit_menu,
             &view_menu,
+            &insert_menu,
             &format_menu,
             &help_menu,
         ],

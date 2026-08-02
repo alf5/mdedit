@@ -271,7 +271,10 @@ fn cell_alignment(cell: &Element) -> char {
 }
 
 fn cell_text(cell: &Element) -> String {
+    // Hard breaks aren't representable inside GFM cells; a <br> becomes a
+    // space (and a placeholder <br> in an empty cell becomes nothing).
     inline_children(cell)
+        .replace("\\\n", " ")
         .trim()
         .replace('\n', " ")
         .replace('|', "\\|")

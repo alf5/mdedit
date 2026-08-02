@@ -451,6 +451,55 @@ body {
   opacity: 0.5;
 }
 
+/* ---------- table context menu ---------- */
+
+.tb-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.ctx-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 150;
+}
+
+.ctxmenu {
+  position: fixed;
+  z-index: 151;
+  min-width: 180px;
+  padding: 5px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+}
+
+.ctx-item {
+  display: block;
+  width: 100%;
+  padding: 6px 12px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ctx-item:hover {
+  background: var(--accent);
+  color: var(--accent-text);
+}
+
+.ctx-sep {
+  height: 1px;
+  background: var(--border);
+  margin: 5px 8px;
+}
+
 /* ---------- modals ---------- */
 
 .overlay {

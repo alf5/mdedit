@@ -1,0 +1,47 @@
+[package]
+name = "mdedit-ui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+leptos = { version = "0.8", features = ["csr"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
+console_error_panic_hook = "0.1.7"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+web-sys = { version = "0.3", features = [
+    "Document",
+    "HtmlDocument",
+    "Window",
+    "Element",
+    "HtmlElement",
+    "HtmlDivElement",
+    "HtmlInputElement",
+    "HtmlTextAreaElement",
+    "Node",
+    "NodeList",
+    "Selection",
+    "Range",
+    "DomTokenList",
+    "ClipboardEvent",
+    "DataTransfer",
+    "KeyboardEvent",
+    "MouseEvent",
+    "Event",
+    "EventTarget",
+] }
+
+[workspace]
+members = ["src-tauri"]
+
+# Profiles must live at the workspace root — Cargo ignores profile sections in
+# member crates (src-tauri). strip covers the "stripped executables" requirement.
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

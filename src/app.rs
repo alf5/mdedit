@@ -24,6 +24,7 @@ enum Pending {
     Open,
     OpenPath(String),
     ImportHtml,
+    ImportDocx,
     Close,
 }
 
@@ -573,12 +574,35 @@ fn do_import_html(ctl: Ctl) {
     });
 }
 
+fn do_import_docx(ctl: Ctl) {
+    spawn_local(async move {
+        match tauri_api::invoke_no_args("import_docx").await {
+            Ok(v) => {
+                let Ok(Some(md)) = serde_wasm_bindgen::from_value::<Option<String>>(v) else {
+                    return; // dialog cancelled
+                };
+                let _ = tauri_api::invoke_no_args("new_doc").await;
+                ctl.doc_name.set("Untitled".to_string());
+                ctl.doc_path.set(String::new());
+                load_markdown(ctl, &md);
+                ctl.dirty.set(false);
+                mark_dirty(ctl); // imported content is unsaved
+            }
+            Err(e) => {
+                let msg = e.as_string().unwrap_or_else(|| "unknown error".into());
+                let _ = window().alert_with_message(&format!("Could not import file: {msg}"));
+            }
+        }
+    });
+}
+
 fn perform_pending(ctl: Ctl, p: Pending) {
     match p {
         Pending::New => do_new(ctl),
         Pending::Open => do_open(ctl),
         Pending::OpenPath(path) => do_open_path(ctl, path),
         Pending::ImportHtml => do_import_html(ctl),
+        Pending::ImportDocx => do_import_docx(ctl),
         Pending::Close => spawn_local(async move {
             let _ = tauri_api::invoke_no_args("force_close").await;
         }),
@@ -1317,6 +1341,7 @@ fn do_action(ctl: Ctl, action: &str) {
         "new" => guarded(ctl, Pending::New),
         "open" => guarded(ctl, Pending::Open),
         "import_html" => guarded(ctl, Pending::ImportHtml),
+        "import_docx" => guarded(ctl, Pending::ImportDocx),
         "save" => do_save(ctl, false, None),
         "save_as" => do_save(ctl, true, None),
         "undo" => history_undo(ctl),

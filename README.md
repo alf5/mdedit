@@ -38,6 +38,10 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
   text instead. **File → Import HTML…** converts an HTML file into a new
   markdown document. Scripts/styles are stripped, `&nbsp;` normalized, and
   embedded data-URI images degrade to their alt text.
+- **Word import**: **File → Import Word Document…** converts a `.docx`
+  (pure-Rust OOXML parser — headings, bold/italic/strikethrough,
+  hyperlinks, nested bullet/numbered lists, tables, quotes, line breaks;
+  images, footnotes and TOC field machinery are skipped).
 
 ## Keyboard shortcuts
 

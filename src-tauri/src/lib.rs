@@ -1,3 +1,5 @@
+mod docx;
+
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -106,6 +108,21 @@ async fn import_html(app: AppHandle) -> Result<Option<String>, String> {
     let Some(fp) = picked else { return Ok(None) };
     let path = fp.into_path().map_err(|e| e.to_string())?;
     std::fs::read_to_string(&path).map(Some).map_err(|e| e.to_string())
+}
+
+/// Pick a .docx and return it converted to markdown. Like import_html,
+/// the result becomes a new unsaved document.
+#[tauri::command]
+async fn import_docx(app: AppHandle) -> Result<Option<String>, String> {
+    let picked = app
+        .dialog()
+        .file()
+        .add_filter("Word document", &["docx"])
+        .blocking_pick_file();
+    let Some(fp) = picked else { return Ok(None) };
+    let path = fp.into_path().map_err(|e| e.to_string())?;
+    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+    docx::docx_to_markdown(&bytes).map(Some)
 }
 
 #[tauri::command]
@@ -252,6 +269,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
             &MenuItem::with_id(app, "new", "New", true, Some("CmdOrCtrl+N"))?,
             &MenuItem::with_id(app, "open", "Open…", true, Some("CmdOrCtrl+O"))?,
             &MenuItem::with_id(app, "import_html", "Import HTML…", true, None::<&str>)?,
+            &MenuItem::with_id(app, "import_docx", "Import Word Document…", true, None::<&str>)?,
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(app, "save", "Save", true, Some("CmdOrCtrl+S"))?,
             &MenuItem::with_id(app, "save_as", "Save As…", true, Some("CmdOrCtrl+Shift+S"))?,
@@ -381,8 +399,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState(Mutex::new(DocState::default())))
         .invoke_handler(tauri::generate_handler![
-            init_doc, new_doc, open_doc, open_path, import_html, save_doc, save_doc_as,
-            set_dirty, force_close, show_about
+            init_doc, new_doc, open_doc, open_path, import_html, import_docx, save_doc,
+            save_doc_as, set_dirty, force_close, show_about
         ])
         .setup(|app| {
             let menu = build_menu(app.handle())?;

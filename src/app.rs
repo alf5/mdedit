@@ -214,6 +214,8 @@ fn enable_checkboxes(ctl: Ctl) {
                 if let Some(n) = list.item(i) {
                     if let Some(e) = n.dyn_ref::<Element>() {
                         let _ = e.remove_attribute("disabled");
+                        // Keep the caret from landing inside the control.
+                        let _ = e.set_attribute("contenteditable", "false");
                     }
                 }
             }
@@ -1013,6 +1015,16 @@ pub fn App() -> impl IntoView {
 
     let on_editor_click = move |e: web_sys::MouseEvent| {
         if let Some(t) = e.target() {
+            // Toggle task checkboxes ourselves — native toggling inside
+            // contenteditable is engine-dependent.
+            if let Some(input) = t.dyn_ref::<web_sys::HtmlInputElement>() {
+                if input.type_() == "checkbox" {
+                    e.prevent_default();
+                    input.set_checked(!input.checked());
+                    mark_dirty(ctl);
+                    return;
+                }
+            }
             if let Some(el) = t.dyn_ref::<Element>() {
                 if el.closest("a").ok().flatten().is_some() {
                     e.prevent_default();

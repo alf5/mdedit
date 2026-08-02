@@ -26,6 +26,10 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
 - Window title shows the current file (`notes.md - mdedit`, `*` when
   modified), unsaved-changes prompt on close, word/char count status bar,
   light + dark theme, open a file from the CLI: `mdedit notes.md`.
+- **Drag & drop** a markdown file onto the window to open it (with the usual
+  unsaved-changes prompt), and installed bundles register a **file
+  association** for `.md`/`.markdown`/`.mdown`/`.mkd`, so "Open With →
+  mdedit" and double-click work on all three platforms.
 
 ## Keyboard shortcuts
 

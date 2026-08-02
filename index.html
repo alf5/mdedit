@@ -8,10 +8,19 @@
       // without the Tauri shell), so the UI stays fully functional for
       // frontend development. Inside Tauri, withGlobalTauri wins.
       if (!window.__TAURI__) {
+        const listeners = {};
         window.__TAURI__ = {
           core: { invoke: async () => null },
-          event: { listen: async () => () => {} },
+          event: {
+            listen: async (evt, cb) => {
+              (listeners[evt] ||= []).push(cb);
+              return () => {};
+            },
+          },
         };
+        // Test/dev hook: simulate a backend event.
+        window.__TAURI_TEST_EMIT__ = (evt, payload) =>
+          (listeners[evt] || []).forEach((cb) => cb({ event: evt, payload }));
       }
     </script>
     <link data-trunk rel="css" href="styles.css" />

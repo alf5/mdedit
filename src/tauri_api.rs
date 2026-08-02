@@ -34,6 +34,11 @@ pub struct DirtyArgs {
     pub dirty: bool,
 }
 
+#[derive(Serialize)]
+pub struct PathArgs {
+    pub path: String,
+}
+
 pub async fn invoke_no_args(cmd: &str) -> Result<JsValue, JsValue> {
     invoke(cmd, JsValue::UNDEFINED).await
 }

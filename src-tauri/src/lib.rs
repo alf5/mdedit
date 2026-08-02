@@ -10,6 +10,21 @@ use tauri_plugin_dialog::DialogExt;
 struct DocState {
     path: Option<PathBuf>,
     dirty: bool,
+    /// File handed to us by the OS (macOS open event) before the frontend
+    /// was ready to receive events.
+    pending_open: Option<PathBuf>,
+}
+
+fn is_markdown_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "md" | "markdown" | "mdown" | "mkd" | "txt"
+            )
+        })
+        .unwrap_or(false)
 }
 
 struct AppState(Mutex<DocState>);
@@ -45,24 +60,36 @@ fn update_title(app: &AppHandle) {
     }
 }
 
-/// File passed on the command line, loaded once at startup.
-#[tauri::command]
-fn init_doc(app: AppHandle, state: State<AppState>) -> Option<FileInfo> {
-    let arg = std::env::args().nth(1)?;
-    let path = PathBuf::from(&arg);
-    let content = std::fs::read_to_string(&path).ok()?;
+fn load_into_state(app: &AppHandle, path: PathBuf) -> Result<FileInfo, String> {
+    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let path = path.canonicalize().unwrap_or(path);
     {
+        let state = app.state::<AppState>();
         let mut s = state.0.lock().unwrap();
         s.path = Some(path.clone());
         s.dirty = false;
     }
-    update_title(&app);
-    Some(FileInfo {
+    update_title(app);
+    Ok(FileInfo {
         name: file_name_of(&path),
         path: path.display().to_string(),
         content,
     })
+}
+
+/// File passed on the command line (or via a macOS open event that arrived
+/// before the frontend was up), loaded once at startup.
+#[tauri::command]
+fn init_doc(app: AppHandle, state: State<AppState>) -> Option<FileInfo> {
+    let pending = { state.0.lock().unwrap().pending_open.take() };
+    let path = std::env::args().nth(1).map(PathBuf::from).or(pending)?;
+    load_into_state(&app, path).ok()
+}
+
+/// Open a concrete path (drag & drop, OS file association).
+#[tauri::command]
+fn open_path(app: AppHandle, path: String) -> Result<Option<FileInfo>, String> {
+    load_into_state(&app, PathBuf::from(path)).map(Some)
 }
 
 #[tauri::command]
@@ -337,8 +364,8 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState(Mutex::new(DocState::default())))
         .invoke_handler(tauri::generate_handler![
-            init_doc, new_doc, open_doc, save_doc, save_doc_as, set_dirty, force_close,
-            show_about
+            init_doc, new_doc, open_doc, open_path, save_doc, save_doc_as, set_dirty,
+            force_close, show_about
         ])
         .setup(|app| {
             let menu = build_menu(app.handle())?;
@@ -359,8 +386,8 @@ pub fn run() {
                 }
             }
         })
-        .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(|window, event| match event {
+            WindowEvent::CloseRequested { api, .. } => {
                 let dirty = {
                     let state = window.app_handle().state::<AppState>();
                     let s = state.0.lock().unwrap();
@@ -371,7 +398,33 @@ pub fn run() {
                     let _ = window.emit("close-requested", ());
                 }
             }
+            WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => {
+                // The frontend decides what to do with it (it may need to
+                // prompt about unsaved changes first).
+                if let Some(p) = paths.iter().find(|p| is_markdown_file(p)) {
+                    let _ = window.emit("drop-open", p.display().to_string());
+                }
+            }
+            _ => {}
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, _event| {
+            // Files opened via Finder / "Open With" arrive as Apple events,
+            // not argv. If the frontend is already up it handles the emitted
+            // event; the stashed path covers launch-time opens (drained by
+            // init_doc).
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Opened { urls } = &_event {
+                if let Some(path) = urls
+                    .iter()
+                    .filter_map(|u| u.to_file_path().ok())
+                    .find(|p| is_markdown_file(p))
+                {
+                    let _ = _app.emit("drop-open", path.display().to_string());
+                    let state = _app.state::<AppState>();
+                    state.0.lock().unwrap().pending_open = Some(path);
+                }
+            }
+        });
 }

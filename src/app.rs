@@ -17,10 +17,11 @@ enum Mode {
     Source,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum Pending {
     New,
     Open,
+    OpenPath(String),
     Close,
 }
 
@@ -364,10 +365,31 @@ fn do_save(ctl: Ctl, save_as: bool, then: Option<Pending>) {
     });
 }
 
+fn do_open_path(ctl: Ctl, path: String) {
+    spawn_local(async move {
+        let args = serde_wasm_bindgen::to_value(&tauri_api::PathArgs { path }).unwrap();
+        match tauri_api::invoke("open_path", args).await {
+            Ok(v) => {
+                if let Some(info) = tauri_api::parse_file_info(v) {
+                    load_markdown(ctl, &info.content);
+                    mark_clean(ctl);
+                    ctl.doc_name.set(info.name);
+                    ctl.doc_path.set(info.path);
+                }
+            }
+            Err(e) => {
+                let msg = e.as_string().unwrap_or_else(|| "unknown error".into());
+                let _ = window().alert_with_message(&format!("Could not open file: {msg}"));
+            }
+        }
+    });
+}
+
 fn perform_pending(ctl: Ctl, p: Pending) {
     match p {
         Pending::New => do_new(ctl),
         Pending::Open => do_open(ctl),
+        Pending::OpenPath(path) => do_open_path(ctl, path),
         Pending::Close => spawn_local(async move {
             let _ = tauri_api::invoke_no_args("force_close").await;
         }),
@@ -1161,6 +1183,21 @@ pub fn App() -> impl IntoView {
         });
         tauri_api::listen("close-requested", close_cb.as_ref().unchecked_ref()).await;
         close_cb.forget();
+        // A markdown file was dropped on the window or opened via the OS
+        // file association while we're running.
+        let drop_cb = Closure::<dyn FnMut(JsValue)>::new(move |ev: JsValue| {
+            if let Ok(p) = js_sys::Reflect::get(&ev, &JsValue::from_str("payload")) {
+                if let Some(path) = p.as_string() {
+                    if ctl.dirty.get_untracked() {
+                        ctl.pending.set(Some(Pending::OpenPath(path)));
+                    } else {
+                        do_open_path(ctl, path);
+                    }
+                }
+            }
+        });
+        tauri_api::listen("drop-open", drop_cb.as_ref().unchecked_ref()).await;
+        drop_cb.forget();
     });
 
     // Global shortcuts (also reachable via native menu accelerators; the

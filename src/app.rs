@@ -1016,11 +1016,17 @@ pub fn App() -> impl IntoView {
     let on_editor_click = move |e: web_sys::MouseEvent| {
         if let Some(t) = e.target() {
             // Toggle task checkboxes ourselves — native toggling inside
-            // contenteditable is engine-dependent.
+            // contenteditable is engine-dependent. The checkbox pre-toggles
+            // before `click` fires and preventDefault reverts it after the
+            // handler returns, so the flip must happen post-dispatch.
             if let Some(input) = t.dyn_ref::<web_sys::HtmlInputElement>() {
                 if input.type_() == "checkbox" {
                     e.prevent_default();
-                    input.set_checked(!input.checked());
+                    let input = input.clone();
+                    set_timeout(
+                        move || input.set_checked(!input.checked()),
+                        std::time::Duration::ZERO,
+                    );
                     mark_dirty(ctl);
                     return;
                 }

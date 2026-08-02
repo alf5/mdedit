@@ -134,10 +134,16 @@ fn pre_to_md(el: &Element) -> String {
 fn blockquote_to_md(el: &Element) -> String {
     let mut inner_blocks = serialize_blocks(el.unchecked_ref(), &|_| false);
     // GFM alerts render as <blockquote class="markdown-alert-note"> etc.
+    // The [!KIND] marker must sit directly above the first content line.
     let classes = el.class_name();
     for kind in ["note", "tip", "important", "warning", "caution"] {
         if classes.contains(&format!("markdown-alert-{kind}")) {
-            inner_blocks.insert(0, format!("[!{}]", kind.to_uppercase()));
+            let marker = format!("[!{}]", kind.to_uppercase());
+            if inner_blocks.is_empty() {
+                inner_blocks.push(marker);
+            } else {
+                inner_blocks[0] = format!("{marker}\n{}", inner_blocks[0]);
+            }
             break;
         }
     }
@@ -211,16 +217,17 @@ fn assemble_list_item(marker: &str, task_prefix: &str, blocks: &[String]) -> Str
     for (bi, block) in blocks.iter().enumerate() {
         if bi > 0 {
             // Nested lists attach directly; other blocks need a blank line.
-            let tight = is_list_block(block);
-            out.push_str(if tight { "\n" } else { "\n\n" });
+            out.push_str(if is_list_block(block) { "\n" } else { "\n\n" });
         }
         for (li_line, line) in block.lines().enumerate() {
+            if li_line > 0 {
+                out.push('\n');
+            }
             if bi == 0 && li_line == 0 {
                 out.push_str(marker);
                 out.push_str(task_prefix);
                 out.push_str(line);
             } else {
-                out.push('\n');
                 out.push_str(&indent);
                 out.push_str(line);
             }

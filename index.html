@@ -3,6 +3,17 @@
   <head>
     <meta charset="utf-8" />
     <title>mdedit</title>
+    <script>
+      // Stub the Tauri IPC when running in a plain browser (trunk serve
+      // without the Tauri shell), so the UI stays fully functional for
+      // frontend development. Inside Tauri, withGlobalTauri wins.
+      if (!window.__TAURI__) {
+        window.__TAURI__ = {
+          core: { invoke: async () => null },
+          event: { listen: async () => () => {} },
+        };
+      }
+    </script>
     <link data-trunk rel="css" href="styles.css" />
     <link
       data-trunk

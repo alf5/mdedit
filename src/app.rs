@@ -7,6 +7,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{Element, HtmlTextAreaElement};
 
+use crate::history::{self, Snap};
 use crate::markdown::to_html;
 use crate::serialize::{dom_to_markdown, html_to_markdown};
 use crate::tauri_api::{self, ContentArgs, DirtyArgs};
@@ -61,7 +62,24 @@ struct Ctl {
     ctx_cell: StoredValue<Option<Element>, LocalStorage>,
     /// Set by Ctrl+Shift+V just before the paste event it triggers.
     plain_paste: StoredValue<bool>,
+    hist: StoredValue<Hist>,
+    can_undo: RwSignal<bool>,
+    can_redo: RwSignal<bool>,
 }
+
+#[derive(Default)]
+struct Hist {
+    undo: Vec<Snap>,
+    redo: Vec<Snap>,
+    /// Copy of the current editor state, i.e. what a commit would push.
+    /// Kept in sync after every mutation so commits can snapshot the
+    /// *pre-change* state even though input events fire post-change.
+    shadow: Option<Snap>,
+    last_input: f64,
+}
+
+const HISTORY_LIMIT: usize = 200;
+const TYPING_BURST_MS: f64 = 800.0;
 
 thread_local! {
     static LAST_ACTION: RefCell<(String, f64)> = RefCell::new((String::new(), 0.0));
@@ -69,11 +87,17 @@ thread_local! {
 
 /// Menu accelerators and the in-page keydown handler can both fire for one
 /// keypress (platform-dependent); collapse duplicates within a short window.
+/// Undo/redo use a tighter window so held-key repeats still get through.
 fn dedup_ok(action: &str) -> bool {
+    let window_ms = if matches!(action, "undo" | "redo") {
+        75.0
+    } else {
+        200.0
+    };
     let now = js_sys::Date::now();
     LAST_ACTION.with(|l| {
         let mut l = l.borrow_mut();
-        if l.0 == action && now - l.1 < 200.0 {
+        if l.0 == action && now - l.1 < window_ms {
             return false;
         }
         *l = (action.to_string(), now);
@@ -279,6 +303,7 @@ fn load_markdown(ctl: Ctl, md: &str) {
         }
     }
     recount(ctl);
+    history_reset(ctl);
 }
 
 fn mark_dirty(ctl: Ctl) {
@@ -316,6 +341,143 @@ fn toggle_mode(ctl: Ctl) {
     recount(ctl);
     focus_current(ctl);
     update_in_table(ctl);
+    history_sync(ctl);
+}
+
+// ---------- undo / redo ----------
+
+fn capture_current(ctl: Ctl) -> Option<Snap> {
+    match ctl.mode.get_untracked() {
+        Mode::Wysiwyg => {
+            editor_el(ctl).map(|el| history::capture_wys(el.unchecked_ref::<Element>()))
+        }
+        Mode::Source => ta_el(ctl).map(|ta| Snap::Src {
+            text: ta.value(),
+            sel_start: ta.selection_start().ok().flatten().unwrap_or(0),
+            sel_end: ta.selection_end().ok().flatten().unwrap_or(0),
+        }),
+    }
+}
+
+fn history_flags(ctl: Ctl) {
+    let (u, r) = ctl
+        .hist
+        .with_value(|h| (!h.undo.is_empty(), !h.redo.is_empty()));
+    if ctl.can_undo.get_untracked() != u {
+        ctl.can_undo.set(u);
+    }
+    if ctl.can_redo.get_untracked() != r {
+        ctl.can_redo.set(r);
+    }
+}
+
+/// Record the current state as the baseline the next commit will push.
+fn history_sync(ctl: Ctl) {
+    if let Some(s) = capture_current(ctl) {
+        ctl.hist.update_value(|h| h.shadow = Some(s));
+    }
+}
+
+/// Push the pre-change state (the shadow) onto the undo stack. Duplicate
+/// consecutive states are dropped, so double-fires are harmless.
+fn history_commit(ctl: Ctl) {
+    ctl.hist.update_value(|h| {
+        let Some(s) = h.shadow.clone() else { return };
+        if h.undo.last() != Some(&s) {
+            h.undo.push(s);
+            if h.undo.len() > HISTORY_LIMIT {
+                h.undo.remove(0);
+            }
+        }
+        h.redo.clear();
+    });
+    history_flags(ctl);
+}
+
+/// Typing input: commit once per burst, using the shadow taken before the
+/// burst started.
+fn history_on_input(ctl: Ctl) {
+    let now = js_sys::Date::now();
+    let new_burst = ctl.hist.with_value(|h| now - h.last_input > TYPING_BURST_MS);
+    if new_burst {
+        history_commit(ctl);
+    }
+    ctl.hist.update_value(|h| h.last_input = now);
+}
+
+/// Fresh document: history starts over.
+fn history_reset(ctl: Ctl) {
+    let shadow = capture_current(ctl);
+    ctl.hist.update_value(|h| {
+        h.undo.clear();
+        h.redo.clear();
+        h.shadow = shadow;
+        h.last_input = 0.0;
+    });
+    history_flags(ctl);
+}
+
+fn restore_snap(ctl: Ctl, snap: Snap) {
+    match &snap {
+        Snap::Wys { html, caret } => {
+            if ctl.mode.get_untracked() != Mode::Wysiwyg {
+                ctl.mode.set(Mode::Wysiwyg);
+            }
+            if let Some(el) = editor_el(ctl) {
+                el.set_inner_html(html);
+                enable_checkboxes(ctl);
+                let caret = *caret;
+                request_animation_frame(move || {
+                    let _ = el.focus();
+                    history::restore_caret_at(el.unchecked_ref::<Element>(), caret);
+                });
+            }
+        }
+        Snap::Src {
+            text,
+            sel_start,
+            sel_end,
+        } => {
+            if ctl.mode.get_untracked() != Mode::Source {
+                ctl.mode.set(Mode::Source);
+            }
+            ctl.source.set(text.clone());
+            if let Some(ta) = ta_el(ctl) {
+                ta.set_value(text);
+                let (s, e) = (*sel_start, *sel_end);
+                request_animation_frame(move || {
+                    let _ = ta.focus();
+                    let _ = ta.set_selection_range(s, e);
+                });
+            }
+        }
+    }
+    ctl.hist.update_value(|h| h.shadow = Some(snap));
+    mark_dirty(ctl);
+    recount(ctl);
+    update_in_table(ctl);
+}
+
+fn history_undo(ctl: Ctl) {
+    let mut prev = None;
+    ctl.hist.update_value(|h| prev = h.undo.pop());
+    let Some(prev) = prev else { return };
+    if let Some(cur) = capture_current(ctl) {
+        ctl.hist.update_value(|h| h.redo.push(cur));
+    }
+    restore_snap(ctl, prev);
+    history_flags(ctl);
+}
+
+fn history_redo(ctl: Ctl) {
+    let mut next = None;
+    ctl.hist.update_value(|h| next = h.redo.pop());
+    let Some(next) = next else { return };
+    if let Some(cur) = capture_current(ctl) {
+        ctl.hist.update_value(|h| h.undo.push(cur));
+    }
+    restore_snap(ctl, next);
+    history_flags(ctl);
 }
 
 // ---------- file operations ----------
@@ -542,9 +704,11 @@ fn replace_one(ctl: Ctl) {
     match ctl.mode.get_untracked() {
         Mode::Wysiwyg => {
             if selection_matches_query(ctl) {
+                history_commit(ctl);
                 exec_val("insertText", &rep);
                 mark_dirty(ctl);
                 recount(ctl);
+                history_sync(ctl);
             }
             find_next(ctl, false);
         }
@@ -579,12 +743,14 @@ fn replace_one(ctl: Ctl) {
                         .all(|(&x, &y)| chars_eq(x, y, ctl.case_sens.get_untracked()))
             };
             if matches {
+                history_commit(ctl);
                 let _ = ta.set_range_text_with_start_and_end(&rep, start, end);
                 let new_pos = start + rep.encode_utf16().count() as u32;
                 let _ = ta.set_selection_range(new_pos, new_pos);
                 ctl.source.set(ta.value());
                 mark_dirty(ctl);
                 recount(ctl);
+                history_sync(ctl);
             }
             ta_find(ctl, false);
         }
@@ -601,6 +767,9 @@ fn replace_all(ctl: Ctl) {
     match ctl.mode.get_untracked() {
         Mode::Wysiwyg => {
             let total = count_matches(&visible_text(ctl), &q, cs);
+            if total > 0 {
+                history_commit(ctl);
+            }
             focus_current(ctl);
             for _ in 0..total {
                 if !tauri_api::window_find(&q, cs, false, true) {
@@ -613,16 +782,19 @@ fn replace_all(ctl: Ctl) {
             if total > 0 {
                 mark_dirty(ctl);
                 recount(ctl);
+                history_sync(ctl);
             }
         }
         Mode::Source => {
             let Some(ta) = ta_el(ctl) else { return };
             let (new_val, count) = replace_all_str(&ta.value(), &q, &rep, cs);
             if count > 0 {
+                history_commit(ctl);
                 ta.set_value(&new_val);
                 ctl.source.set(new_val);
                 mark_dirty(ctl);
                 recount(ctl);
+                history_sync(ctl);
             }
         }
     }
@@ -675,6 +847,7 @@ fn confirm_url_modal(ctl: Ctl) {
     match ctl.mode.get_untracked() {
         Mode::Wysiwyg => {
             restore_selection(ctl);
+            history_commit(ctl);
             match kind {
                 UrlKind::Link => {
                     let sel = selection_string();
@@ -705,6 +878,7 @@ fn confirm_url_modal(ctl: Ctl) {
             }
             mark_dirty(ctl);
             recount(ctl);
+            history_sync(ctl);
         }
         Mode::Source => {
             let md = match kind {
@@ -718,6 +892,7 @@ fn confirm_url_modal(ctl: Ctl) {
 
 fn ta_replace_selection(ctl: Ctl, text: &str) {
     let Some(ta) = ta_el(ctl) else { return };
+    history_commit(ctl);
     let _ = ta.focus();
     let start = ta.selection_start().ok().flatten().unwrap_or(0);
     let end = ta.selection_end().ok().flatten().unwrap_or(0);
@@ -727,10 +902,12 @@ fn ta_replace_selection(ctl: Ctl, text: &str) {
     ctl.source.set(ta.value());
     mark_dirty(ctl);
     recount(ctl);
+    history_sync(ctl);
 }
 
 fn ta_surround(ctl: Ctl, prefix: &str, suffix: &str) {
     let Some(ta) = ta_el(ctl) else { return };
+    history_commit(ctl);
     let _ = ta.focus();
     let start = ta.selection_start().ok().flatten().unwrap_or(0);
     let end = ta.selection_end().ok().flatten().unwrap_or(0);
@@ -741,11 +918,13 @@ fn ta_surround(ctl: Ctl, prefix: &str, suffix: &str) {
     ctl.source.set(ta.value());
     mark_dirty(ctl);
     recount(ctl);
+    history_sync(ctl);
 }
 
 /// Apply a transformation to every line touched by the selection.
 fn ta_lines(ctl: Ctl, f: &dyn Fn(usize, &str) -> String) {
     let Some(ta) = ta_el(ctl) else { return };
+    history_commit(ctl);
     let _ = ta.focus();
     let value = ta.value();
     let chars: Vec<char> = value.chars().collect();
@@ -790,6 +969,7 @@ fn ta_lines(ctl: Ctl, f: &dyn Fn(usize, &str) -> String) {
     ctl.source.set(ta.value());
     mark_dirty(ctl);
     recount(ctl);
+    history_sync(ctl);
 }
 
 fn strip_block_prefix(l: &str) -> &str {
@@ -816,9 +996,22 @@ const TABLE_MD: &str = "\n| Col 1 | Col 2 | Col 3 |\n| --- | --- | --- |\n|  |  
 const TABLE_HTML: &str = "<table><thead><tr><th>Col 1</th><th>Col 2</th><th>Col 3</th></tr></thead><tbody><tr><td><br></td><td><br></td><td><br></td></tr><tr><td><br></td><td><br></td><td><br></td></tr></tbody></table><p><br></p>";
 
 fn fmt_action(ctl: Ctl, action: &str) {
+    // Modal-opening actions mutate nothing yet; they commit on confirm.
+    if matches!(action, "fmt_link" | "fmt_image") {
+        open_url_modal(
+            ctl,
+            if action == "fmt_image" {
+                UrlKind::Image
+            } else {
+                UrlKind::Link
+            },
+        );
+        return;
+    }
     let wys = ctl.mode.get_untracked() == Mode::Wysiwyg;
     if wys {
         focus_current(ctl);
+        history_commit(ctl);
         match action {
             "fmt_bold" => exec("bold"),
             "fmt_italic" => exec("italic"),
@@ -841,20 +1034,13 @@ fn fmt_action(ctl: Ctl, action: &str) {
             ),
             "fmt_quote" => exec_val("formatBlock", "<blockquote>"),
             "fmt_codeblock" => exec_val("formatBlock", "<pre>"),
-            "fmt_link" => {
-                open_url_modal(ctl, UrlKind::Link);
-                return;
-            }
-            "fmt_image" => {
-                open_url_modal(ctl, UrlKind::Image);
-                return;
-            }
             "fmt_table" => exec_val("insertHTML", TABLE_HTML),
             "fmt_hr" => exec("insertHorizontalRule"),
             _ => return,
         }
         mark_dirty(ctl);
         recount(ctl);
+        history_sync(ctl);
     } else {
         match action {
             "fmt_bold" => ta_surround(ctl, "**", "**"),
@@ -870,8 +1056,6 @@ fn fmt_action(ctl: Ctl, action: &str) {
             "fmt_task" => ta_lines(ctl, &|_, l| format!("- [ ] {}", strip_block_prefix(l))),
             "fmt_quote" => ta_lines(ctl, &|_, l| format!("> {l}")),
             "fmt_codeblock" => ta_surround(ctl, "```\n", "\n```"),
-            "fmt_link" => open_url_modal(ctl, UrlKind::Link),
-            "fmt_image" => open_url_modal(ctl, UrlKind::Image),
             "fmt_table" => ta_replace_selection(ctl, TABLE_MD),
             "fmt_hr" => ta_replace_selection(ctl, "\n\n---\n\n"),
             _ => {}
@@ -942,12 +1126,14 @@ fn new_cell(tag: &str) -> Option<Element> {
 fn table_changed(ctl: Ctl) {
     mark_dirty(ctl);
     recount(ctl);
+    history_sync(ctl);
 }
 
 fn table_insert_row(ctl: Ctl, below: bool) {
     let Some((_, row, table)) = active_cell(ctl) else {
         return;
     };
+    history_commit(ctl);
     let cols = row_cells(&row).len().max(1);
     let Ok(tr) = document().create_element("tr") else {
         return;
@@ -985,6 +1171,7 @@ fn table_insert_col(ctl: Ctl, right: bool) {
     let Some(idx) = cells.iter().position(|c| c == &cell) else {
         return;
     };
+    history_commit(ctl);
     let insert_at = if right { idx + 1 } else { idx };
     let Ok(rows) = table.query_selector_all("tr") else {
         return;
@@ -1022,6 +1209,7 @@ fn table_delete_row(ctl: Ctl) {
     if row.closest("thead").ok().flatten().is_some() {
         return; // a GFM table cannot lose its header row
     }
+    history_commit(ctl);
     row.remove();
     table_changed(ctl);
 }
@@ -1032,6 +1220,7 @@ fn table_delete_col(ctl: Ctl) {
     };
     let cells = row_cells(&row);
     if cells.len() <= 1 {
+        history_commit(ctl);
         table.remove();
         table_changed(ctl);
         return;
@@ -1042,6 +1231,7 @@ fn table_delete_col(ctl: Ctl) {
     let Ok(rows) = table.query_selector_all("tr") else {
         return;
     };
+    history_commit(ctl);
     for i in 0..rows.length() {
         let Some(tr) = rows.item(i).and_then(|n| n.dyn_into::<Element>().ok()) else {
             continue;
@@ -1058,6 +1248,7 @@ fn table_delete_table(ctl: Ctl) {
     let Some((_, _, table)) = active_cell(ctl) else {
         return;
     };
+    history_commit(ctl);
     table.remove();
     table_changed(ctl);
 }
@@ -1128,16 +1319,8 @@ fn do_action(ctl: Ctl, action: &str) {
         "import_html" => guarded(ctl, Pending::ImportHtml),
         "save" => do_save(ctl, false, None),
         "save_as" => do_save(ctl, true, None),
-        "undo" => {
-            focus_current(ctl);
-            exec("undo");
-            recount(ctl);
-        }
-        "redo" => {
-            focus_current(ctl);
-            exec("redo");
-            recount(ctl);
-        }
+        "undo" => history_undo(ctl),
+        "redo" => history_redo(ctl),
         "select_all" => {
             focus_current(ctl);
             exec("selectAll");
@@ -1207,6 +1390,9 @@ pub fn App() -> impl IntoView {
         saved_range: StoredValue::new_local(None),
         ctx_cell: StoredValue::new_local(None),
         plain_paste: StoredValue::new(false),
+        hist: StoredValue::new(Hist::default()),
+        can_undo: RwSignal::new(false),
+        can_redo: RwSignal::new(false),
     };
 
     // Track whether the caret sits inside a table (drives the table toolbar
@@ -1223,8 +1409,9 @@ pub fn App() -> impl IntoView {
         if let Some(el) = ctl.editor_ref.get() {
             exec_val("defaultParagraphSeparator", "p");
             exec_val("styleWithCSS", "false");
-            if el.inner_html().is_empty() {
+            if el.child_element_count() == 0 {
                 el.set_inner_html("<p><br></p>");
+                history_reset(ctl);
             }
             let _ = el.focus();
         }
@@ -1296,12 +1483,22 @@ pub fn App() -> impl IntoView {
             ("o", false, false) => "open",
             ("s", false, false) => "save",
             ("s", true, false) => "save_as",
+            ("z", false, false) => "undo",
+            ("z", true, false) => "redo",
+            ("y", false, false) => "redo",
             ("f", false, false) => "find",
             ("f", false, true) => "replace",
             ("h", false, false) => "replace",
             ("m", true, false) => "toggle_mode",
             ("b", false, false) => "fmt_bold",
             ("i", false, false) => "fmt_italic",
+            ("e", false, false) => "fmt_code",
+            ("k", false, false) => "fmt_link",
+            ("x", true, false) => "fmt_strike",
+            ("1", false, false) => "fmt_h1",
+            ("2", false, false) => "fmt_h2",
+            ("3", false, false) => "fmt_h3",
+            ("0", false, false) => "fmt_p",
             ("u", false, false) => {
                 // no underline in markdown
                 e.prevent_default();
@@ -1314,13 +1511,32 @@ pub fn App() -> impl IntoView {
     });
 
     let on_editor_input = move |_| {
+        history_on_input(ctl);
         mark_dirty(ctl);
         recount(ctl);
+        history_sync(ctl);
+    };
+
+    // The webview keeps its own history; reroute it to ours (context-menu
+    // Undo, macOS gesture undo, etc.).
+    let on_before_input = move |e: web_sys::InputEvent| {
+        match e.input_type().as_str() {
+            "historyUndo" => {
+                e.prevent_default();
+                do_action(ctl, "undo");
+            }
+            "historyRedo" => {
+                e.prevent_default();
+                do_action(ctl, "redo");
+            }
+            _ => {}
+        }
     };
 
     let on_editor_keydown = move |e: web_sys::KeyboardEvent| {
         if e.key() == "Tab" {
             e.prevent_default();
+            history_commit(ctl);
             let in_li = selection_in("li");
             if e.shift_key() {
                 if in_li {
@@ -1338,6 +1554,7 @@ pub fn App() -> impl IntoView {
     let on_editor_paste = move |e: web_sys::ClipboardEvent| {
         e.prevent_default();
         if let Some(dt) = e.clipboard_data() {
+            history_commit(ctl);
             if let Some(md) = paste_markdown(ctl, &dt) {
                 let inline = insert_markdown_at_caret(&md);
                 if inline {
@@ -1368,9 +1585,13 @@ pub fn App() -> impl IntoView {
             if let Some(input) = t.dyn_ref::<web_sys::HtmlInputElement>() {
                 if input.type_() == "checkbox" {
                     e.prevent_default();
+                    history_commit(ctl);
                     let input = input.clone();
                     set_timeout(
-                        move || input.set_checked(!input.checked()),
+                        move || {
+                            input.set_checked(!input.checked());
+                            history_sync(ctl);
+                        },
                         std::time::Duration::ZERO,
                     );
                     mark_dirty(ctl);
@@ -1444,15 +1665,34 @@ pub fn App() -> impl IntoView {
     view! {
         <div class="app">
             <div class="toolbar">
+                <button
+                    class="tb-btn"
+                    title="Undo (Ctrl+Z)"
+                    prop:disabled=move || !ctl.can_undo.get()
+                    on:mousedown=|e| e.prevent_default()
+                    on:click=move |_| do_action(ctl, "undo")
+                >
+                    "↶"
+                </button>
+                <button
+                    class="tb-btn"
+                    title="Redo (Ctrl+Shift+Z)"
+                    prop:disabled=move || !ctl.can_redo.get()
+                    on:mousedown=|e| e.prevent_default()
+                    on:click=move |_| do_action(ctl, "redo")
+                >
+                    "↷"
+                </button>
+                <span class="tb-sep"></span>
                 {tb_btn(ctl, "fmt_bold", "tb-b", "B", "Bold (Ctrl+B)")}
                 {tb_btn(ctl, "fmt_italic", "tb-i", "I", "Italic (Ctrl+I)")}
-                {tb_btn(ctl, "fmt_strike", "tb-s", "S", "Strikethrough")}
-                {tb_btn(ctl, "fmt_code", "tb-mono", "</>", "Inline code")}
+                {tb_btn(ctl, "fmt_strike", "tb-s", "S", "Strikethrough (Ctrl+Shift+X)")}
+                {tb_btn(ctl, "fmt_code", "tb-mono", "</>", "Inline code (Ctrl+E)")}
                 <span class="tb-sep"></span>
-                {tb_btn(ctl, "fmt_h1", "", "H1", "Heading 1")}
-                {tb_btn(ctl, "fmt_h2", "", "H2", "Heading 2")}
-                {tb_btn(ctl, "fmt_h3", "", "H3", "Heading 3")}
-                {tb_btn(ctl, "fmt_p", "", "¶", "Paragraph")}
+                {tb_btn(ctl, "fmt_h1", "", "H1", "Heading 1 (Ctrl+1)")}
+                {tb_btn(ctl, "fmt_h2", "", "H2", "Heading 2 (Ctrl+2)")}
+                {tb_btn(ctl, "fmt_h3", "", "H3", "Heading 3 (Ctrl+3)")}
+                {tb_btn(ctl, "fmt_p", "", "¶", "Paragraph (Ctrl+0)")}
                 <span class="tb-sep"></span>
                 {tb_btn(ctl, "fmt_ul", "", "•", "Bullet list")}
                 {tb_btn(ctl, "fmt_ol", "", "1.", "Numbered list")}
@@ -1460,7 +1700,7 @@ pub fn App() -> impl IntoView {
                 <span class="tb-sep"></span>
                 {tb_btn(ctl, "fmt_quote", "", "❝", "Blockquote")}
                 {tb_btn(ctl, "fmt_codeblock", "tb-mono", "{ }", "Code block")}
-                {tb_btn(ctl, "fmt_link", "", "🔗", "Insert link")}
+                {tb_btn(ctl, "fmt_link", "", "🔗", "Insert link (Ctrl+K)")}
                 {tb_btn(ctl, "fmt_image", "", "🖼", "Insert image")}
                 {tb_btn(ctl, "fmt_table", "", "⊞", "Insert table")}
                 {tb_btn(ctl, "fmt_hr", "", "―", "Horizontal rule")}
@@ -1555,6 +1795,7 @@ pub fn App() -> impl IntoView {
                     spellcheck="true"
                     node_ref=ctl.editor_ref
                     on:input=on_editor_input
+                    on:beforeinput=on_before_input
                     on:keydown=on_editor_keydown
                     on:paste=on_editor_paste
                     on:click=on_editor_click
@@ -1570,10 +1811,13 @@ pub fn App() -> impl IntoView {
                     node_ref=ctl.ta_ref
                     prop:value=move || ctl.source.get()
                     on:input=move |e| {
+                        history_on_input(ctl);
                         ctl.source.set(event_target_value(&e));
                         mark_dirty(ctl);
                         recount(ctl);
+                        history_sync(ctl);
                     }
+                    on:beforeinput=on_before_input
                     on:keydown=on_ta_keydown
                     on:paste=on_ta_paste
                 ></textarea>

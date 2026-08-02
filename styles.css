@@ -101,6 +101,16 @@ body {
   border-color: var(--accent);
 }
 
+.tb-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.tb-btn:disabled:hover {
+  background: transparent;
+  border-color: transparent;
+}
+
 .tb-b {
   font-weight: 700;
 }

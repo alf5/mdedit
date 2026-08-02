@@ -23,6 +23,9 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
   the Insert menu, or a right-click context menu on any table cell.
 - **Find & replace** (`Ctrl+F` / `Ctrl+H`) with match count, case toggle,
   replace one / all.
+- **Undo/redo** with its own snapshot history (covers table edits, checkbox
+  toggles and replace-all, which browser-native undo can't see) — toolbar
+  buttons with live enabled state, menu items, `Ctrl+Z`/`Ctrl+Shift+Z`/`Ctrl+Y`.
 - Window title shows the current file (`notes.md - mdedit`, `*` when
   modified), unsaved-changes prompt on close, word/char count status bar,
   light + dark theme, open a file from the CLI: `mdedit notes.md`.
@@ -44,9 +47,16 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
 | `Ctrl/Cmd+O` | Open file |
 | `Ctrl/Cmd+S` | Save |
 | `Ctrl/Cmd+Shift+S` | Save As |
+| `Ctrl/Cmd+Z` | Undo |
+| `Ctrl/Cmd+Shift+Z` or `Ctrl+Y` | Redo |
 | `Ctrl/Cmd+F` | Find |
 | `Ctrl+H` (`Cmd+Alt+F` on macOS) | Replace |
 | `Ctrl/Cmd+B` / `I` | Bold / Italic |
+| `Ctrl/Cmd+Shift+X` | Strikethrough |
+| `Ctrl/Cmd+E` | Inline code |
+| `Ctrl/Cmd+K` | Insert link |
+| `Ctrl/Cmd+1/2/3` / `Ctrl/Cmd+0` | Heading 1–3 / paragraph |
+| `Ctrl/Cmd+V` / `Ctrl/Cmd+Shift+V` | Smart paste / plain paste |
 | `Ctrl/Cmd+Shift+M` | Toggle WYSIWYG / markdown source |
 | `Tab` / `Shift+Tab` | Indent / outdent list item |
 

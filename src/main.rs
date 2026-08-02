@@ -1,4 +1,5 @@
 mod app;
+mod history;
 mod markdown;
 mod serialize;
 mod tauri_api;

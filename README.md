@@ -30,6 +30,11 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
   unsaved-changes prompt), and installed bundles register a **file
   association** for `.md`/`.markdown`/`.mdown`/`.mkd`, so "Open With →
   mdedit" and double-click work on all three platforms.
+- **Smart paste**: pasting rich content (web pages, Word, Google Docs)
+  converts the clipboard's HTML to markdown — `Ctrl+Shift+V` pastes plain
+  text instead. **File → Import HTML…** converts an HTML file into a new
+  markdown document. Scripts/styles are stripped, `&nbsp;` normalized, and
+  embedded data-URI images degrade to their alt text.
 
 ## Keyboard shortcuts
 

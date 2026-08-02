@@ -4,8 +4,35 @@
 //! GFM alerts, footnotes, hr) plus the tags contenteditable editing inserts
 //! (`<div>` paragraphs, `<b>`/`<i>`, style spans).
 
+use std::cell::Cell;
+
 use wasm_bindgen::JsCast;
 use web_sys::{Element, HtmlInputElement, Node};
+
+thread_local! {
+    /// Set while converting foreign HTML (paste/import): embedded data-URI
+    /// images are dropped there, but preserved in normal editor round-trips.
+    static CONVERTING_FOREIGN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Convert arbitrary external HTML (clipboard, imported file) to markdown.
+/// DOMParser produces an inert document — scripts never execute and
+/// resources never load — so hostile input can't touch the app.
+pub fn html_to_markdown(html: &str) -> String {
+    let Ok(parser) = web_sys::DomParser::new() else {
+        return String::new();
+    };
+    let Ok(doc) = parser.parse_from_string(html, web_sys::SupportedType::TextHtml) else {
+        return String::new();
+    };
+    let Some(body) = doc.body() else {
+        return String::new();
+    };
+    CONVERTING_FOREIGN.with(|f| f.set(true));
+    let md = dom_to_markdown(body.unchecked_ref());
+    CONVERTING_FOREIGN.with(|f| f.set(false));
+    md
+}
 
 pub fn dom_to_markdown(root: &Element) -> String {
     let node: &Node = root.unchecked_ref();
@@ -390,6 +417,9 @@ fn inline(node: &Node) -> String {
     };
     let tag = el.tag_name().to_uppercase();
     match tag.as_str() {
+        // Non-content elements that appear in foreign HTML.
+        "STYLE" | "SCRIPT" | "TEMPLATE" | "TITLE" | "META" | "LINK" | "IFRAME" | "OBJECT"
+        | "SVG" | "BUTTON" | "SELECT" => String::new(),
         "BR" => "\\\n".to_string(),
         "STRONG" | "B" => wrap_nonempty(&inline_children(el), "**"),
         "EM" | "I" => wrap_nonempty(&inline_children(el), "*"),
@@ -410,6 +440,10 @@ fn inline(node: &Node) -> String {
         "IMG" => {
             let alt = el.get_attribute("alt").unwrap_or_default();
             let src = el.get_attribute("src").unwrap_or_default();
+            if src.starts_with("data:") && CONVERTING_FOREIGN.with(|f| f.get()) {
+                // Embedded images don't translate to useful markdown.
+                return escape_text(&alt);
+            }
             match el.get_attribute("title") {
                 Some(t) if !t.is_empty() => format!("![{alt}]({src} \"{t}\")"),
                 _ => format!("![{alt}]({src})"),
@@ -454,6 +488,11 @@ fn inline(node: &Node) -> String {
 fn escape_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
+        if c == '\u{a0}' {
+            // contenteditable and Word HTML pepper text with &nbsp;
+            out.push(' ');
+            continue;
+        }
         if matches!(c, '\\' | '`' | '*' | '_' | '[' | ']' | '~' | '<' | '&') {
             out.push('\\');
         }

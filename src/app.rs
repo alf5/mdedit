@@ -8,7 +8,7 @@ use wasm_bindgen::JsCast;
 use web_sys::{Element, HtmlTextAreaElement};
 
 use crate::markdown::to_html;
-use crate::serialize::dom_to_markdown;
+use crate::serialize::{dom_to_markdown, html_to_markdown};
 use crate::tauri_api::{self, ContentArgs, DirtyArgs};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -22,6 +22,7 @@ enum Pending {
     New,
     Open,
     OpenPath(String),
+    ImportHtml,
     Close,
 }
 
@@ -58,6 +59,8 @@ struct Ctl {
     url_ref: NodeRef<html::Input>,
     saved_range: StoredValue<Option<web_sys::Range>, LocalStorage>,
     ctx_cell: StoredValue<Option<Element>, LocalStorage>,
+    /// Set by Ctrl+Shift+V just before the paste event it triggers.
+    plain_paste: StoredValue<bool>,
 }
 
 thread_local! {
@@ -385,11 +388,35 @@ fn do_open_path(ctl: Ctl, path: String) {
     });
 }
 
+fn do_import_html(ctl: Ctl) {
+    spawn_local(async move {
+        match tauri_api::invoke_no_args("import_html").await {
+            Ok(v) => {
+                let Ok(Some(html)) = serde_wasm_bindgen::from_value::<Option<String>>(v) else {
+                    return; // dialog cancelled
+                };
+                let md = html_to_markdown(&html);
+                let _ = tauri_api::invoke_no_args("new_doc").await;
+                ctl.doc_name.set("Untitled".to_string());
+                ctl.doc_path.set(String::new());
+                load_markdown(ctl, &md);
+                ctl.dirty.set(false); // force the dirty transition below
+                mark_dirty(ctl); // imported content is unsaved
+            }
+            Err(e) => {
+                let msg = e.as_string().unwrap_or_else(|| "unknown error".into());
+                let _ = window().alert_with_message(&format!("Could not import file: {msg}"));
+            }
+        }
+    });
+}
+
 fn perform_pending(ctl: Ctl, p: Pending) {
     match p {
         Pending::New => do_new(ctl),
         Pending::Open => do_open(ctl),
         Pending::OpenPath(path) => do_open_path(ctl, path),
+        Pending::ImportHtml => do_import_html(ctl),
         Pending::Close => spawn_local(async move {
             let _ = tauri_api::invoke_no_args("force_close").await;
         }),
@@ -1048,6 +1075,47 @@ fn close_ctx_menu(ctl: Ctl) {
     ctl.ctx_cell.set_value(None);
 }
 
+// ---------- smart paste ----------
+
+/// Insert markdown at the caret of the WYSIWYG editor, rendering it first.
+/// A single inline-only block is unwrapped so small pastes don't split the
+/// current paragraph. Returns true for that inline case.
+fn insert_markdown_at_caret(md: &str) -> bool {
+    let html = to_html(md);
+    let trimmed = html.trim();
+    let single_paragraph = !md.trim().contains("\n\n")
+        && trimmed.starts_with("<p>")
+        && trimmed.ends_with("</p>")
+        && trimmed.matches("<p>").count() == 1;
+    let insert = if single_paragraph {
+        &trimmed[3..trimmed.len() - 4]
+    } else {
+        trimmed
+    };
+    exec_val("insertHTML", insert);
+    single_paragraph
+}
+
+/// Returns the markdown conversion of the clipboard's HTML flavor, unless
+/// plain paste was requested or there is no usable HTML.
+fn paste_markdown(ctl: Ctl, dt: &web_sys::DataTransfer) -> Option<String> {
+    let plain = ctl.plain_paste.get_value();
+    ctl.plain_paste.set_value(false);
+    if plain {
+        return None;
+    }
+    let html = dt.get_data("text/html").ok()?;
+    if html.trim().is_empty() {
+        return None;
+    }
+    let md = html_to_markdown(&html);
+    let trimmed = md.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
 // ---------- action dispatch ----------
 
 fn do_action(ctl: Ctl, action: &str) {
@@ -1057,6 +1125,7 @@ fn do_action(ctl: Ctl, action: &str) {
     match action {
         "new" => guarded(ctl, Pending::New),
         "open" => guarded(ctl, Pending::Open),
+        "import_html" => guarded(ctl, Pending::ImportHtml),
         "save" => do_save(ctl, false, None),
         "save_as" => do_save(ctl, true, None),
         "undo" => {
@@ -1137,6 +1206,7 @@ pub fn App() -> impl IntoView {
         url_ref: NodeRef::new(),
         saved_range: StoredValue::new_local(None),
         ctx_cell: StoredValue::new_local(None),
+        plain_paste: StoredValue::new(false),
     };
 
     // Track whether the caret sits inside a table (drives the table toolbar
@@ -1215,6 +1285,12 @@ pub fn App() -> impl IntoView {
             return;
         }
         let k = key.to_lowercase();
+        if k == "v" && e.shift_key() && !e.alt_key() {
+            // Ctrl+Shift+V: the paste event this keystroke triggers should
+            // insert plain text. Don't prevent default.
+            ctl.plain_paste.set_value(true);
+            return;
+        }
         let action = match (k.as_str(), e.shift_key(), e.alt_key()) {
             ("n", false, false) => "new",
             ("o", false, false) => "open",
@@ -1262,7 +1338,18 @@ pub fn App() -> impl IntoView {
     let on_editor_paste = move |e: web_sys::ClipboardEvent| {
         e.prevent_default();
         if let Some(dt) = e.clipboard_data() {
-            if let Ok(text) = dt.get_data("text/plain") {
+            if let Some(md) = paste_markdown(ctl, &dt) {
+                let inline = insert_markdown_at_caret(&md);
+                if inline {
+                    // Markdown conversion trims edges; restore a trailing
+                    // space so words don't get glued together.
+                    let plain = dt.get_data("text/plain").unwrap_or_default();
+                    if plain.ends_with(' ') || plain.ends_with('\u{a0}') {
+                        exec_val("insertText", " ");
+                    }
+                }
+                enable_checkboxes(ctl);
+            } else if let Ok(text) = dt.get_data("text/plain") {
                 if !text.is_empty() {
                     exec_val("insertText", &text);
                 }
@@ -1302,6 +1389,16 @@ pub fn App() -> impl IntoView {
         if e.key() == "Tab" && !e.shift_key() {
             e.prevent_default();
             ta_replace_selection(ctl, "  ");
+        }
+    };
+
+    let on_ta_paste = move |e: web_sys::ClipboardEvent| {
+        if let Some(dt) = e.clipboard_data() {
+            if let Some(md) = paste_markdown(ctl, &dt) {
+                e.prevent_default();
+                ta_replace_selection(ctl, &md);
+            }
+            // otherwise: let the native plain-text paste happen
         }
     };
 
@@ -1478,6 +1575,7 @@ pub fn App() -> impl IntoView {
                         recount(ctl);
                     }
                     on:keydown=on_ta_keydown
+                    on:paste=on_ta_paste
                 ></textarea>
             </div>
 

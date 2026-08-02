@@ -26,6 +26,8 @@ web-sys = { version = "0.3", features = [
     "Selection",
     "Range",
     "DomTokenList",
+    "DomParser",
+    "SupportedType",
     "ClipboardEvent",
     "DataTransfer",
     "KeyboardEvent",

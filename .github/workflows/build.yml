@@ -7,6 +7,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Needed to create releases and upload their assets on tag builds.
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
 

@@ -1,0 +1,57 @@
+# Maintainer: alf5 <atascon@gmail.com>
+#
+# Repackages the .deb bundle that `cargo tauri build` produces in this
+# repository — nothing is downloaded and no AUR remote is involved:
+#
+#   cd ../..            # repository root
+#   cargo tauri build
+#   cd packaging/aur
+#   makepkg -f          # add -i to install the result
+#
+# Keep pkgver in sync with src-tauri/tauri.conf.json and the Cargo.toml files.
+pkgname=mdedit
+pkgver=0.1.7
+pkgrel=1
+pkgdesc="A WYSIWYG Markdown editor built with Tauri and Leptos"
+arch=('x86_64' 'aarch64')
+url="https://github.com/alf5/mdedit"
+license=('MIT')
+depends=('cairo' 'desktop-file-utils' 'gdk-pixbuf2' 'glib2' 'gtk3'
+         'hicolor-icon-theme' 'libsoup3' 'pango' 'webkit2gtk-4.1')
+# The bundled binary is already stripped by the release profile.
+options=('!strip' '!debug')
+install=${pkgname}.install
+
+# makepkg only resolves local sources that sit next to the PKGBUILD, so the
+# bundle is read straight out of the build tree by package() instead. Nothing
+# is copied into this directory, which also means a rebuilt bundle of the same
+# version is always picked up rather than a cached one.
+source=()
+sha256sums=()
+
+_repodir="${startdir}/../.."
+_bundledir="${_repodir}/target/release/bundle/deb"
+
+package() {
+  local _debarch
+  case "$CARCH" in
+    x86_64)  _debarch=amd64 ;;
+    aarch64) _debarch=arm64 ;;
+    *)       error "unsupported architecture: $CARCH"; return 1 ;;
+  esac
+
+  local _deb="${_bundledir}/${pkgname}_${pkgver}_${_debarch}.deb"
+  if [[ ! -f $_deb ]]; then
+    error "bundle not found: %s" "$_deb"
+    msg2 "Run 'cargo tauri build' from the repository root first."
+    return 1
+  fi
+
+  # A .deb is an ar archive; data.tar.gz holds the installed tree.
+  bsdtar -xOf "$_deb" data.tar.gz | tar -xz -C "$pkgdir"
+
+  # MIT is not among the licenses shipped by the licenses package, and the
+  # bundle carries no copy of it, so install it from the repository.
+  install -Dm644 "${_repodir}/LICENSE" \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

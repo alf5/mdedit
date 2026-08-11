@@ -4,6 +4,7 @@ version = "0.1.7"
 description = "A WYSIWYG Markdown editor built with Tauri and Leptos"
 authors = ["alf5"]
 edition = "2021"
+license = "MIT"
 
 [lib]
 # The `_lib` suffix may seem redundant but it is necessary

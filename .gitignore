@@ -1,2 +1,7 @@
 /dist/
 /target/
+
+# makepkg leftovers
+/packaging/aur/src/
+/packaging/aur/pkg/
+/packaging/aur/*.pkg.tar.zst

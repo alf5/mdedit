@@ -327,6 +327,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
             &MenuItem::with_id(app, "fmt_link", "Link…", true, Some("CmdOrCtrl+K"))?,
             &MenuItem::with_id(app, "fmt_image", "Image…", true, None::<&str>)?,
             &MenuItem::with_id(app, "fmt_table", "Table", true, None::<&str>)?,
+            &MenuItem::with_id(app, "fmt_mermaid", "Mermaid Diagram", true, None::<&str>)?,
             &MenuItem::with_id(app, "fmt_hr", "Horizontal Rule", true, None::<&str>)?,
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(app, "tbl_row_above", "Row Above", true, None::<&str>)?,

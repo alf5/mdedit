@@ -12,6 +12,20 @@
   --danger: #d1242f;
   --shadow: 0 8px 24px rgba(31, 35, 40, 0.15);
   color-scheme: light dark;
+
+  /* Mermaid diagram palette — read by the SVG's presentation attributes,
+     so a diagram re-colors on a scheme change without being re-rendered. */
+  --mmd-fg: #1f2328;
+  --mmd-fg-muted: #59636e;
+  --mmd-bg: transparent;
+  --mmd-node-fill: #ececff;
+  --mmd-node-stroke: #9370db;
+  --mmd-edge: #59636e;
+  --mmd-label-bg: #f0f1f3;
+  --mmd-note-fill: #fff5ad;
+  --mmd-note-stroke: #aaaa33;
+  --mmd-cluster-fill: #f6f8fa;
+  --mmd-cluster-stroke: #d1d9e0;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -28,6 +42,18 @@
     --quote-border: #3d444d;
     --danger: #f85149;
     --shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+
+    --mmd-fg: #f0f6fc;
+    --mmd-fg-muted: #9198a1;
+    --mmd-bg: transparent;
+    --mmd-node-fill: #2b2b45;
+    --mmd-node-stroke: #a780e0;
+    --mmd-edge: #9198a1;
+    --mmd-label-bg: #1c2129;
+    --mmd-note-fill: #3b3b22;
+    --mmd-note-stroke: #aaaa55;
+    --mmd-cluster-fill: #151b23;
+    --mmd-cluster-stroke: #3d444d;
   }
 }
 
@@ -305,6 +331,65 @@ body {
   background: transparent;
   padding: 0;
   font-size: 100%;
+}
+
+/* ---------- mermaid diagrams ---------- */
+
+.markdown-body .mermaid-diagram {
+  margin: 0 0 16px 0;
+  padding: 12px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  text-align: center;
+  overflow-x: auto;
+  /* The caret must not land inside the SVG; the block is edited by clicking
+     it, which swaps in a source textarea. */
+  user-select: none;
+  cursor: pointer;
+}
+
+.markdown-body .mermaid-diagram:hover {
+  border-color: var(--border);
+  background: var(--bg-soft);
+}
+
+.markdown-body .mermaid-diagram svg {
+  max-width: 100%;
+  height: auto;
+  font-family: inherit;
+}
+
+.markdown-body .mermaid-error {
+  text-align: left;
+  cursor: pointer;
+  border-color: var(--danger);
+}
+
+.markdown-body .mermaid-error-msg {
+  margin: 0 0 8px 0;
+  color: var(--danger);
+  font-size: 90%;
+}
+
+.markdown-body .mermaid-error pre {
+  margin-bottom: 0;
+}
+
+/* The source editor swapped in when a diagram is clicked. */
+.markdown-body .mermaid-source {
+  display: block;
+  width: 100%;
+  margin: 0 0 16px 0;
+  padding: 16px;
+  background: var(--bg-soft);
+  color: var(--text);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    monospace;
+  font-size: 85%;
+  line-height: 1.45;
+  resize: vertical;
 }
 
 .markdown-body blockquote {

@@ -12,12 +12,20 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
   a raw **markdown source** mode any time (`Ctrl+Shift+M`).
 - **GitHub-flavored markdown**: tables, task lists (clickable checkboxes),
   strikethrough, footnotes, alerts (`> [!NOTE]` …), fenced code blocks.
+- **Mermaid diagrams**: a ```` ```mermaid ```` fence renders inline as SVG —
+  flowcharts, sequence, state, class, ER, gantt, pie and the rest of the 23
+  diagram types, drawn by the pure-Rust `mermaid-svg` crate (no `mermaid.js`,
+  no Node). Click a diagram to edit its source, click away to re-render;
+  colors follow the light/dark theme. A diagram that fails to parse shows the
+  error above its source instead of disappearing. (Gantt charts draw no
+  "today" marker: reading the clock means `SystemTime::now()`, which is a
+  hard panic on `wasm32-unknown-unknown`.)
 - **Formatting toolbar**: bold, italic, strikethrough, inline code, headings,
   bullet/numbered/task lists, blockquote, code block, links, images, tables,
   horizontal rules — works in both WYSIWYG and source mode.
 - **Native menus**: File (New / Open / Save / Save As / Quit), Edit (undo,
-  redo, clipboard, Find / Replace), View, Insert (link, image, table, hr,
-  table rows/columns), Format, Help.
+  redo, clipboard, Find / Replace), View, Insert (link, image, table, mermaid
+  diagram, hr, table rows/columns), Format, Help.
 - **Table editing**: insert row above/below and column left/right, delete
   row/column/table — from the toolbar (shown while the caret is in a table),
   the Insert menu, or a right-click context menu on any table cell.

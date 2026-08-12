@@ -1,6 +1,7 @@
 mod app;
 mod history;
 mod markdown;
+mod mermaid;
 mod serialize;
 mod tauri_api;
 

@@ -100,6 +100,14 @@ fn serialize_blocks(node: &Node, skip: &dyn Fn(&Element) -> bool) -> Vec<String>
             if skip(el) {
                 continue;
             }
+            // A diagram serializes from its stashed source, never from the
+            // rendered SVG. Checked ahead of the tag test because a diagram
+            // being edited is a <textarea>, which isn't a block tag.
+            if let Some(md) = mermaid_to_md(el) {
+                flush(&mut run, &mut blocks);
+                blocks.push(md);
+                continue;
+            }
             let tag = el.tag_name().to_uppercase();
             if is_block_tag(&tag) {
                 flush(&mut run, &mut blocks);
@@ -139,6 +147,26 @@ fn block_to_md(el: &Element, tag: &str) -> String {
         }
         _ => serialize_blocks(el.unchecked_ref(), &|_| false).join("\n\n"),
     }
+}
+
+/// A diagram back to its ```` ```mermaid ```` fence: from the `data-mermaid`
+/// attribute the renderer stashed on the wrapper, or — while the diagram is
+/// open for editing — from the live value of its source textarea.
+fn mermaid_to_md(el: &Element) -> Option<String> {
+    let classes = el.class_list();
+    let src = if classes.contains(crate::mermaid::WRAPPER_CLASS) {
+        el.get_attribute(crate::mermaid::SOURCE_ATTR)?
+    } else if classes.contains("mermaid-source") {
+        el.dyn_ref::<web_sys::HtmlTextAreaElement>()?.value()
+    } else {
+        return None;
+    };
+    let src = src.trim_end_matches('\n');
+    if src.trim().is_empty() {
+        return None;
+    }
+    let fence = if src.contains("```") { "````" } else { "```" };
+    Some(format!("{fence}mermaid\n{src}\n{fence}"))
 }
 
 fn pre_to_md(el: &Element) -> String {

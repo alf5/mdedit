@@ -264,10 +264,35 @@ fn visible_text(ctl: Ctl) -> String {
     }
 }
 
+/// The text content of every rendered diagram in the WYSIWYG editor.
+fn diagram_texts(ctl: Ctl) -> Vec<String> {
+    let Some(el) = editor_el(ctl) else {
+        return Vec::new();
+    };
+    let sel = format!(".{}", crate::mermaid::WRAPPER_CLASS);
+    let Ok(list) = el.query_selector_all(&sel) else {
+        return Vec::new();
+    };
+    (0..list.length())
+        .filter_map(|i| list.item(i).and_then(|n| n.text_content()))
+        .collect()
+}
+
 fn recount(ctl: Ctl) {
     let text = visible_text(ctl);
-    ctl.words.set(text.split_whitespace().count());
-    ctl.chars.set(text.chars().count());
+    let mut words = text.split_whitespace().count();
+    let mut chars = text.chars().count();
+    // A rendered diagram contributes its node labels to the editor's
+    // textContent. Those aren't prose, so take them back out (approximate at
+    // the edges, where a label can run into adjacent text).
+    if ctl.mode.get_untracked() == Mode::Wysiwyg {
+        for t in diagram_texts(ctl) {
+            words = words.saturating_sub(t.split_whitespace().count());
+            chars = chars.saturating_sub(t.chars().count());
+        }
+    }
+    ctl.words.set(words);
+    ctl.chars.set(chars);
     let q = ctl.find_q.get_untracked();
     if ctl.find_open.get_untracked() && !q.is_empty() {
         ctl.match_count
@@ -1016,6 +1041,9 @@ fn strip_block_prefix(l: &str) -> &str {
     s
 }
 
+/// Starter diagram for Insert → Mermaid Diagram.
+const MERMAID_MD: &str = "graph TD\n  A[Start] --> B{Choice}\n  B -->|yes| C[Do it]\n  B -->|no| D[Stop]\n";
+
 const TABLE_MD: &str = "\n| Col 1 | Col 2 | Col 3 |\n| --- | --- | --- |\n|  |  |  |\n|  |  |  |\n";
 const TABLE_HTML: &str = "<table><thead><tr><th>Col 1</th><th>Col 2</th><th>Col 3</th></tr></thead><tbody><tr><td><br></td><td><br></td><td><br></td></tr><tr><td><br></td><td><br></td><td><br></td></tr></tbody></table><p><br></p>";
 
@@ -1059,6 +1087,10 @@ fn fmt_action(ctl: Ctl, action: &str) {
             "fmt_quote" => exec_val("formatBlock", "<blockquote>"),
             "fmt_codeblock" => exec_val("formatBlock", "<pre>"),
             "fmt_table" => exec_val("insertHTML", TABLE_HTML),
+            "fmt_mermaid" => exec_val(
+                "insertHTML",
+                &format!("{}<p><br></p>", crate::mermaid::render_block(MERMAID_MD)),
+            ),
             "fmt_hr" => exec("insertHorizontalRule"),
             _ => return,
         }
@@ -1081,10 +1113,79 @@ fn fmt_action(ctl: Ctl, action: &str) {
             "fmt_quote" => ta_lines(ctl, &|_, l| format!("> {l}")),
             "fmt_codeblock" => ta_surround(ctl, "```\n", "\n```"),
             "fmt_table" => ta_replace_selection(ctl, TABLE_MD),
+            "fmt_mermaid" => {
+                ta_replace_selection(ctl, &format!("\n```mermaid\n{MERMAID_MD}```\n"))
+            }
             "fmt_hr" => ta_replace_selection(ctl, "\n\n---\n\n"),
             _ => {}
         }
     }
+}
+
+// ---------- mermaid diagrams ----------
+
+/// Class on the textarea a diagram is swapped for while being edited.
+const MERMAID_SOURCE_CLASS: &str = "mermaid-source";
+/// The source that textarea opened with, for change detection on close.
+const MERMAID_ORIG_ATTR: &str = "data-mermaid-orig";
+
+/// The open diagram-source textarea, if one has focus.
+fn focused_mermaid_source() -> Option<HtmlTextAreaElement> {
+    let el = document().active_element()?;
+    if !el.class_list().contains(MERMAID_SOURCE_CLASS) {
+        return None;
+    }
+    el.dyn_into::<HtmlTextAreaElement>().ok()
+}
+
+/// Swap a rendered diagram for a textarea holding its markdown source.
+/// Clicking the diagram is the way in; losing focus puts the diagram back.
+fn open_mermaid_source(ctl: Ctl, wrapper: &Element) -> Option<()> {
+    let src = wrapper.get_attribute(crate::mermaid::SOURCE_ATTR)?;
+    let src = src.trim_end_matches('\n');
+    let parent = wrapper.parent_node()?;
+    // Snapshot the diagram as it stands — this is what undo returns to.
+    history_sync(ctl);
+    let ta = document()
+        .create_element("textarea")
+        .ok()?
+        .dyn_into::<HtmlTextAreaElement>()
+        .ok()?;
+    ta.set_class_name(MERMAID_SOURCE_CLASS);
+    // Keep the surrounding contenteditable from treating this as text.
+    let _ = ta.set_attribute("contenteditable", "false");
+    // Kept so closing an untouched diagram doesn't push a dead undo step.
+    let _ = ta.set_attribute(MERMAID_ORIG_ATTR, src);
+    let _ = ta.set_attribute("rows", &(src.lines().count() + 1).max(4).to_string());
+    ta.set_spellcheck(false);
+    ta.set_value(src);
+    parent.replace_child(ta.unchecked_ref(), wrapper).ok()?;
+    let _ = ta.focus();
+    Some(())
+}
+
+/// Render the open textarea back into a diagram. Blanking the source deletes
+/// the block, which is the only way to remove a diagram from WYSIWYG mode.
+fn close_mermaid_source(ctl: Ctl, ta: &HtmlTextAreaElement) -> Option<()> {
+    let src = ta.value();
+    let changed = ta.get_attribute(MERMAID_ORIG_ATTR).as_deref() != Some(src.as_str());
+    let parent = ta.parent_node()?;
+    if src.trim().is_empty() {
+        parent.remove_child(ta).ok()?;
+    } else {
+        let holder = document().create_element("div").ok()?;
+        holder.set_inner_html(&crate::mermaid::render_block(&src));
+        let node = holder.first_child()?;
+        parent.replace_child(&node, ta).ok()?;
+    }
+    if !changed {
+        return Some(());
+    }
+    history_commit(ctl);
+    mark_dirty(ctl);
+    recount(ctl);
+    history_sync(ctl);
+    Some(())
 }
 
 // ---------- table operations ----------
@@ -1486,6 +1587,22 @@ pub fn App() -> impl IntoView {
     // dedup guard collapses double-fires).
     window_event_listener(leptos::ev::keydown, move |e| {
         let key = e.key();
+        // While a diagram's source is open, formatting and mode shortcuts
+        // would act on the document behind it. Escape commits and closes;
+        // the file actions below stay live (the serializer reads an open
+        // textarea as its fence, so saving mid-edit is still correct).
+        if let Some(ta) = focused_mermaid_source() {
+            if key == "Escape" {
+                e.prevent_default();
+                let _ = ta.blur();
+                return;
+            }
+            let ctrl = e.ctrl_key() || e.meta_key();
+            let k = key.to_lowercase();
+            if !ctrl || !matches!(k.as_str(), "n" | "o" | "s") {
+                return;
+            }
+        }
         if key == "Escape" {
             if close_overlays(ctl) {
                 e.prevent_default();
@@ -1559,6 +1676,11 @@ pub fn App() -> impl IntoView {
     };
 
     let on_editor_keydown = move |e: web_sys::KeyboardEvent| {
+        // Inside a diagram's source the textarea owns the keyboard; Tab there
+        // means "indent this line", not "indent the surrounding list".
+        if focused_mermaid_source().is_some() {
+            return;
+        }
         if e.key() == "Tab" {
             e.prevent_default();
             history_commit(ctl);
@@ -1624,9 +1746,30 @@ pub fn App() -> impl IntoView {
                 }
             }
             if let Some(el) = t.dyn_ref::<Element>() {
+                // Clicking a diagram opens its source for editing. The target
+                // may be an SVG shape, so match on the nearest wrapper.
+                let sel = format!(".{}", crate::mermaid::WRAPPER_CLASS);
+                if let Some(w) = el.closest(&sel).ok().flatten() {
+                    e.prevent_default();
+                    open_mermaid_source(ctl, &w);
+                    return;
+                }
                 if el.closest("a").ok().flatten().is_some() {
                     e.prevent_default();
                 }
+            }
+        }
+    };
+
+    // A diagram's source textarea re-renders when it loses focus. `focusout`
+    // bubbles (unlike `blur`), so one handler on the editor covers it.
+    let on_editor_focusout = move |e: web_sys::FocusEvent| {
+        if let Some(ta) = e
+            .target()
+            .and_then(|t| t.dyn_into::<HtmlTextAreaElement>().ok())
+        {
+            if ta.class_name().contains(MERMAID_SOURCE_CLASS) {
+                close_mermaid_source(ctl, &ta);
             }
         }
     };
@@ -1824,6 +1967,7 @@ pub fn App() -> impl IntoView {
                     on:keydown=on_editor_keydown
                     on:paste=on_editor_paste
                     on:click=on_editor_click
+                    on:focusout=on_editor_focusout
                     on:contextmenu=on_editor_ctxmenu
                     on:change=move |_| {
                         mark_dirty(ctl);

@@ -518,15 +518,27 @@ fn do_new(ctl: Ctl) {
     });
 }
 
+/// Report a failed backend command. These are expected failures — a bad path,
+/// a permission error — so they use the styled dialog rather than the fatal
+/// one, and the app stays usable afterwards.
+fn report_backend_error(what: &str, e: &JsValue) {
+    let msg = e.as_string().unwrap_or_else(|| "unknown error".into());
+    crate::error_dialog::show_error(what, &msg);
+}
+
 fn do_open(ctl: Ctl) {
     spawn_local(async move {
-        if let Ok(v) = tauri_api::invoke_no_args("open_doc").await {
-            if let Some(info) = tauri_api::parse_file_info(v) {
-                load_markdown(ctl, &info.content);
-                mark_clean(ctl);
-                ctl.doc_name.set(info.name);
-                ctl.doc_path.set(info.path);
+        match tauri_api::invoke_no_args("open_doc").await {
+            Ok(v) => {
+                if let Some(info) = tauri_api::parse_file_info(v) {
+                    load_markdown(ctl, &info.content);
+                    mark_clean(ctl);
+                    ctl.doc_name.set(info.name);
+                    ctl.doc_path.set(info.path);
+                }
+                // None: user cancelled the file dialog — stay put.
             }
+            Err(e) => report_backend_error("Could not open file", &e),
         }
     });
 }
@@ -548,10 +560,7 @@ fn do_save(ctl: Ctl, save_as: bool, then: Option<Pending>) {
                 }
                 // None: user cancelled the save dialog — stay put.
             }
-            Err(e) => {
-                let msg = e.as_string().unwrap_or_else(|| "unknown error".into());
-                let _ = window().alert_with_message(&format!("Could not save file: {msg}"));
-            }
+            Err(e) => report_backend_error("Could not save file", &e),
         }
     });
 }
@@ -568,10 +577,7 @@ fn do_open_path(ctl: Ctl, path: String) {
                     ctl.doc_path.set(info.path);
                 }
             }
-            Err(e) => {
-                let msg = e.as_string().unwrap_or_else(|| "unknown error".into());
-                let _ = window().alert_with_message(&format!("Could not open file: {msg}"));
-            }
+            Err(e) => report_backend_error("Could not open file", &e),
         }
     });
 }
@@ -591,10 +597,7 @@ fn do_import_html(ctl: Ctl) {
                 ctl.dirty.set(false); // force the dirty transition below
                 mark_dirty(ctl); // imported content is unsaved
             }
-            Err(e) => {
-                let msg = e.as_string().unwrap_or_else(|| "unknown error".into());
-                let _ = window().alert_with_message(&format!("Could not import file: {msg}"));
-            }
+            Err(e) => report_backend_error("Could not import file", &e),
         }
     });
 }
@@ -613,10 +616,7 @@ fn do_import_docx(ctl: Ctl) {
                 ctl.dirty.set(false);
                 mark_dirty(ctl); // imported content is unsaved
             }
-            Err(e) => {
-                let msg = e.as_string().unwrap_or_else(|| "unknown error".into());
-                let _ = window().alert_with_message(&format!("Could not import file: {msg}"));
-            }
+            Err(e) => report_backend_error("Could not import file", &e),
         }
     });
 }
@@ -1545,12 +1545,17 @@ pub fn App() -> impl IntoView {
 
     // Load a CLI-passed file and hook up backend events.
     spawn_local(async move {
-        if let Ok(v) = tauri_api::invoke_no_args("init_doc").await {
-            if let Some(info) = tauri_api::parse_file_info(v) {
-                load_markdown(ctl, &info.content);
-                ctl.doc_name.set(info.name);
-                ctl.doc_path.set(info.path);
+        match tauri_api::invoke_no_args("init_doc").await {
+            Ok(v) => {
+                if let Some(info) = tauri_api::parse_file_info(v) {
+                    load_markdown(ctl, &info.content);
+                    ctl.doc_name.set(info.name);
+                    ctl.doc_path.set(info.path);
+                }
             }
+            // A file named on the command line that can't be read would
+            // otherwise open as a blank Untitled document.
+            Err(e) => report_backend_error("Could not open file", &e),
         }
         let menu_cb = Closure::<dyn FnMut(JsValue)>::new(move |ev: JsValue| {
             if let Ok(p) = js_sys::Reflect::get(&ev, &JsValue::from_str("payload")) {

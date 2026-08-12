@@ -23,6 +23,44 @@
           (listeners[evt] || []).forEach((cb) => cb({ event: evt, payload }));
       }
     </script>
+    <script>
+      // Last-resort net. src/error_dialog.rs installs a Rust panic hook and
+      // publishes window.__MDEDIT_FATAL__; this catches what it can't reach —
+      // a WASM module that fails to fetch or instantiate, so no Rust ever
+      // runs. Kept deliberately tiny: the styled dialog lives in Rust.
+      (function () {
+        var reported = false;
+        function fatal(detail) {
+          if (window.__MDEDIT_FATAL__) {
+            window.__MDEDIT_FATAL__("mdedit hit an internal error", detail);
+            return;
+          }
+          if (reported) return;
+          reported = true;
+          // Rust never booted, so styles.css may be all we have.
+          var d = document.createElement("div");
+          d.className = "overlay error-overlay";
+          var m = document.createElement("div");
+          m.className = "modal error-modal";
+          var t = document.createElement("p");
+          t.className = "modal-title";
+          t.textContent = "mdedit failed to start";
+          var p = document.createElement("pre");
+          p.className = "error-detail";
+          p.textContent = detail;
+          m.appendChild(t);
+          m.appendChild(p);
+          d.appendChild(m);
+          (document.body || document.documentElement).appendChild(d);
+        }
+        window.addEventListener("error", function (e) {
+          fatal(String((e && (e.message || e.error)) || "unknown error"));
+        });
+        window.addEventListener("unhandledrejection", function (e) {
+          fatal("Unhandled rejection: " + String((e && e.reason) || "unknown"));
+        });
+      })();
+    </script>
     <link data-trunk rel="css" href="styles.css" />
     <link
       data-trunk

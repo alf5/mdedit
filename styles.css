@@ -677,6 +677,34 @@ body {
   background: var(--bg-raised);
 }
 
+/* The fatal dialog outranks every other overlay — it reports the reason the
+   rest of the app stopped working. */
+.error-overlay {
+  z-index: 1000;
+}
+
+.error-modal {
+  max-width: 620px;
+  border-color: var(--danger);
+}
+
+.error-detail {
+  margin: 0;
+  padding: 12px;
+  max-height: 40vh;
+  overflow: auto;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  /* Selectable so the reason can be pasted into a bug report. */
+  user-select: text;
+}
+
 .btn.primary {
   background: var(--accent);
   border-color: var(--accent);

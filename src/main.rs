@@ -1,4 +1,5 @@
 mod app;
+mod error_dialog;
 mod history;
 mod markdown;
 mod mermaid;
@@ -9,7 +10,8 @@ use app::*;
 use leptos::prelude::*;
 
 fn main() {
-    console_error_panic_hook::set_once();
+    // Before anything else, so a panic during mount still gets reported.
+    error_dialog::install();
     mount_to_body(|| {
         view! {
             <App/>

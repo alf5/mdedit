@@ -2389,7 +2389,7 @@ dependencies = [
 
 [[package]]
 name = "mdedit"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "roxmltree",
  "serde",
@@ -2403,7 +2403,7 @@ dependencies = [
 
 [[package]]
 name = "mdedit-ui"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "console_error_panic_hook",
  "js-sys",

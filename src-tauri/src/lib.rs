@@ -3,18 +3,34 @@ mod docx;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
-use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
 use tauri_plugin_dialog::DialogExt;
 
+const RECENT_MAX: usize = 10;
+
+/// The frontend owns the tab list, so almost nothing about "the document"
+/// lives here any more. What remains is what the close guard needs to answer
+/// *synchronously* — it runs inside the window event handler and cannot await
+/// the webview — plus files the OS handed us before the UI existed.
 #[derive(Default)]
 struct DocState {
-    path: Option<PathBuf>,
-    dirty: bool,
-    /// File handed to us by the OS (macOS open event) before the frontend
+    /// True when any tab has unsaved changes. Pushed by the frontend.
+    any_dirty: bool,
+    /// Set once the frontend has drained `pending_open`; before that, OS open
+    /// events must be stashed rather than emitted into the void.
+    ready: bool,
+    /// Files handed to us by the OS (macOS open event) before the frontend
     /// was ready to receive events.
-    pending_open: Option<PathBuf>,
+    pending_open: Vec<PathBuf>,
+    /// Canonical paths, most-recent-first, capped at `RECENT_MAX`.
+    recent: Vec<String>,
+    /// Live handle to File ▸ Open Recent, repopulated in place at runtime.
+    recent_menu: Option<Submenu<Wry>>,
+    /// Menu entries that mean nothing with no document open.
+    doc_items: Vec<MenuItem<Wry>>,
+    doc_menus: Vec<Submenu<Wry>>,
 }
 
 fn is_markdown_file(path: &Path) -> bool {
@@ -44,34 +60,13 @@ fn file_name_of(path: &Path) -> String {
         .unwrap_or_else(|| "Untitled".to_string())
 }
 
-fn update_title(app: &AppHandle) {
-    let state = app.state::<AppState>();
-    let (name, dirty) = {
-        let s = state.0.lock().unwrap();
-        (
-            s.path
-                .as_deref()
-                .map(file_name_of)
-                .unwrap_or_else(|| "Untitled".to_string()),
-            s.dirty,
-        )
-    };
-    if let Some(w) = app.get_webview_window("main") {
-        let marker = if dirty { "*" } else { "" };
-        let _ = w.set_title(&format!("{marker}{name} - mdedit"));
-    }
-}
-
-fn load_into_state(app: &AppHandle, path: PathBuf) -> Result<FileInfo, String> {
+/// Read a file for the frontend. The path is canonicalized so the frontend
+/// can recognise "this file is already open in a tab" by string comparison —
+/// without it, the same file reached by two routes would open twice, and the
+/// two tabs would race to write it.
+fn read_file(path: PathBuf) -> Result<FileInfo, String> {
     let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let path = path.canonicalize().unwrap_or(path);
-    {
-        let state = app.state::<AppState>();
-        let mut s = state.0.lock().unwrap();
-        s.path = Some(path.clone());
-        s.dirty = false;
-    }
-    update_title(app);
     Ok(FileInfo {
         name: file_name_of(&path),
         path: path.display().to_string(),
@@ -79,19 +74,43 @@ fn load_into_state(app: &AppHandle, path: PathBuf) -> Result<FileInfo, String> {
     })
 }
 
-/// File passed on the command line (or via a macOS open event that arrived
-/// before the frontend was up), loaded once at startup.
+/// Files named on the command line (or handed over by macOS before the
+/// frontend was up), loaded once at startup. Unreadable paths are skipped,
+/// as they were when this returned a single optional document.
 #[tauri::command]
-fn init_doc(app: AppHandle, state: State<AppState>) -> Option<FileInfo> {
-    let pending = { state.0.lock().unwrap().pending_open.take() };
-    let path = std::env::args().nth(1).map(PathBuf::from).or(pending)?;
-    load_into_state(&app, path).ok()
+fn init_doc(app: AppHandle, state: State<AppState>) -> Vec<FileInfo> {
+    let pending = {
+        let mut s = state.0.lock().unwrap();
+        s.ready = true;
+        std::mem::take(&mut s.pending_open)
+    };
+    let loaded: Vec<FileInfo> = std::env::args()
+        .skip(1)
+        // macOS passes -psn_… on some launches.
+        .filter(|a| !a.starts_with('-'))
+        .map(PathBuf::from)
+        .chain(pending)
+        .filter_map(|p| read_file(p).ok())
+        .collect();
+    let paths: Vec<PathBuf> = loaded.iter().map(|f| PathBuf::from(&f.path)).collect();
+    push_recent(&app, &paths);
+    loaded
 }
 
-/// Open a concrete path (drag & drop, OS file association).
+/// Open a concrete path (drag & drop, OS file association, recent files).
 #[tauri::command]
 fn open_path(app: AppHandle, path: String) -> Result<Option<FileInfo>, String> {
-    load_into_state(&app, PathBuf::from(path)).map(Some)
+    match read_file(PathBuf::from(&path)) {
+        Ok(info) => {
+            push_recent(&app, &[PathBuf::from(&info.path)]);
+            Ok(Some(info))
+        }
+        Err(e) => {
+            // Covers permission changes that a bare `exists()` cannot see.
+            forget_recent(&app, &path);
+            Err(e)
+        }
+    }
 }
 
 /// Pick an HTML file and return its raw contents; the frontend converts it
@@ -125,104 +144,97 @@ async fn import_docx(app: AppHandle) -> Result<Option<String>, String> {
     docx::docx_to_markdown(&bytes).map(Some)
 }
 
+/// The dialog is multi-select: a selection of five files becomes five tabs.
+/// An empty Vec means the user cancelled.
 #[tauri::command]
-fn new_doc(app: AppHandle, state: State<AppState>) {
-    {
-        let mut s = state.0.lock().unwrap();
-        s.path = None;
-        s.dirty = false;
-    }
-    update_title(&app);
-}
-
-#[tauri::command]
-async fn open_doc(app: AppHandle) -> Result<Option<FileInfo>, String> {
+async fn open_doc(app: AppHandle) -> Result<Vec<FileInfo>, String> {
     let picked = app
         .dialog()
         .file()
         .add_filter("Markdown", &["md", "markdown", "mdown", "mkd", "txt"])
         .add_filter("All files", &["*"])
-        .blocking_pick_file();
-    let Some(fp) = picked else { return Ok(None) };
-    let path = fp.into_path().map_err(|e| e.to_string())?;
-    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let state = app.state::<AppState>();
-    {
-        let mut s = state.0.lock().unwrap();
-        s.path = Some(path.clone());
-        s.dirty = false;
-    }
-    update_title(&app);
-    Ok(Some(FileInfo {
-        name: file_name_of(&path),
-        path: path.display().to_string(),
-        content,
-    }))
+        .blocking_pick_files();
+    let Some(files) = picked else {
+        return Ok(Vec::new());
+    };
+    let loaded: Vec<FileInfo> = files
+        .into_iter()
+        .map(|fp| fp.into_path().map_err(|e| e.to_string()).and_then(read_file))
+        .collect::<Result<Vec<_>, _>>()?;
+    let paths: Vec<PathBuf> = loaded.iter().map(|f| PathBuf::from(&f.path)).collect();
+    push_recent(&app, &paths);
+    Ok(loaded)
 }
 
 fn write_doc(app: &AppHandle, path: &Path, content: &str) -> Result<FileInfo, String> {
     std::fs::write(path, content).map_err(|e| e.to_string())?;
-    let state = app.state::<AppState>();
-    {
-        let mut s = state.0.lock().unwrap();
-        s.path = Some(path.to_path_buf());
-        s.dirty = false;
-    }
-    update_title(app);
+    // Canonicalize *after* the write: a Save As target need not have existed.
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    // Covers Save As creating a new path, and move-to-front on a plain Save.
+    push_recent(app, std::slice::from_ref(&path));
     Ok(FileInfo {
-        name: file_name_of(path),
+        name: file_name_of(&path),
         path: path.display().to_string(),
         content: String::new(),
     })
 }
 
-/// Save to the current path, or fall through to Save As when the document
-/// has never been saved. Returns None when the user cancels the dialog.
+/// Save to `path`, or fall through to Save As when the tab has never been
+/// saved. Returns None when the user cancels the dialog.
 #[tauri::command]
-async fn save_doc(app: AppHandle, content: String) -> Result<Option<FileInfo>, String> {
-    let existing = {
-        let state = app.state::<AppState>();
-        let s = state.0.lock().unwrap();
-        s.path.clone()
-    };
-    match existing {
-        Some(path) => write_doc(&app, &path, &content).map(Some),
-        None => save_doc_as(app, content).await,
+async fn save_doc(
+    app: AppHandle,
+    content: String,
+    path: Option<String>,
+) -> Result<Option<FileInfo>, String> {
+    match path.as_deref().filter(|p| !p.is_empty()) {
+        Some(p) => write_doc(&app, Path::new(p), &content).map(Some),
+        None => save_doc_as(app, content, None).await,
     }
 }
 
+/// `path` is the tab's current path, used only for the dialog's default
+/// filename and starting directory.
 #[tauri::command]
-async fn save_doc_as(app: AppHandle, content: String) -> Result<Option<FileInfo>, String> {
-    let current_name = {
-        let state = app.state::<AppState>();
-        let s = state.0.lock().unwrap();
-        s.path
-            .as_deref()
-            .map(file_name_of)
-            .unwrap_or_else(|| "Untitled.md".to_string())
-    };
-    let picked = app
+async fn save_doc_as(
+    app: AppHandle,
+    content: String,
+    path: Option<String>,
+) -> Result<Option<FileInfo>, String> {
+    let current = path.as_deref().filter(|p| !p.is_empty()).map(Path::new);
+    let name = current
+        .map(file_name_of)
+        .unwrap_or_else(|| "Untitled.md".to_string());
+    let mut dialog = app
         .dialog()
         .file()
         .add_filter("Markdown", &["md", "markdown"])
-        .set_file_name(&current_name)
-        .blocking_save_file();
-    let Some(fp) = picked else { return Ok(None) };
+        .set_file_name(&name);
+    if let Some(dir) = current.and_then(Path::parent) {
+        dialog = dialog.set_directory(dir);
+    }
+    let Some(fp) = dialog.blocking_save_file() else {
+        return Ok(None);
+    };
     let path = fp.into_path().map_err(|e| e.to_string())?;
     write_doc(&app, &path, &content).map(Some)
 }
 
+/// The frontend owns the tab list, so it drives the title: `name`/`dirty`
+/// describe the active tab, `any_dirty` covers every tab and gates the
+/// close-confirmation prompt. An empty `name` means no document is open.
 #[tauri::command]
-fn set_dirty(app: AppHandle, state: State<AppState>, dirty: bool) {
-    let changed = {
-        let mut s = state.0.lock().unwrap();
-        let changed = s.dirty != dirty;
-        s.dirty = dirty;
-        changed
-    };
-    if changed {
-        update_title(&app);
+fn set_title(app: AppHandle, state: State<AppState>, name: String, dirty: bool, any_dirty: bool) {
+    state.0.lock().unwrap().any_dirty = any_dirty;
+    if let Some(w) = app.get_webview_window("main") {
+        let title = if name.is_empty() {
+            "mdedit".to_string()
+        } else {
+            format!("{}{name} - mdedit", if dirty { "*" } else { "" })
+        };
+        let _ = w.set_title(&title);
     }
+    set_doc_menus_enabled(&app, !name.is_empty());
 }
 
 /// Close for real, bypassing the unsaved-changes check.
@@ -244,7 +256,228 @@ fn show_about(app: AppHandle) {
         .show(|_| {});
 }
 
-fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+// ---------- recent files ----------
+
+/// Wrapped in a struct rather than a bare array so later settings can join it
+/// without a format break.
+#[derive(Serialize, Deserialize, Default)]
+struct Prefs {
+    #[serde(default)]
+    recent: Vec<String>,
+}
+
+fn prefs_path(app: &AppHandle) -> Option<PathBuf> {
+    app.path().app_config_dir().ok().map(|d| d.join("recent.json"))
+}
+
+/// Never fails loudly: a missing, unreadable or corrupt file just means
+/// "no recent documents".
+fn load_recent(app: &AppHandle) -> Vec<String> {
+    let Some(p) = prefs_path(app) else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(p) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Prefs>(&text)
+        .map(|p| p.recent)
+        .unwrap_or_default()
+}
+
+/// Best effort — losing the recent list is never worth an error dialog, and a
+/// read-only or missing config dir must not break anything.
+fn save_recent(app: &AppHandle) {
+    let recent = {
+        let state = app.state::<AppState>();
+        let s = state.0.lock().unwrap();
+        s.recent.clone()
+    };
+    let Some(p) = prefs_path(app) else { return };
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&Prefs { recent }) {
+        let _ = std::fs::write(p, text);
+    }
+}
+
+/// Keep the tail: the last path components identify a file far better than
+/// the root does.
+fn elide_start(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    format!("…{}", chars[chars.len() - max + 1..].iter().collect::<String>())
+}
+
+/// A native menu offers exactly one text run per item — there is no dimmed
+/// parent directory to be had — so the directory rides along with the
+/// basename. Five `README.md` entries have to stay distinguishable.
+fn recent_label(path: &str) -> String {
+    let p = Path::new(path);
+    let name = file_name_of(p);
+    let mut dir = p
+        .parent()
+        .map(|d| d.display().to_string())
+        .unwrap_or_default();
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        let home = home.to_string_lossy().into_owned();
+        if !home.is_empty() && dir.starts_with(&home) {
+            dir = format!("~{}", &dir[home.len()..]);
+        }
+    }
+    let dir = elide_start(&dir, 40);
+    let label = if dir.is_empty() {
+        name
+    } else {
+        format!("{name}   —   {dir}")
+    };
+    // muda uses `&` as the mnemonic marker on Windows and Linux; `&&` renders
+    // a literal one. Without this, "Q&A.md" shows up as "QA.md".
+    label.replace('&', "&&")
+}
+
+/// (Re)populate Open Recent.
+///
+/// Must NOT be called with the `AppState` lock held: these calls block on the
+/// main thread, which may itself be waiting for that lock inside
+/// `on_menu_event`.
+fn fill_recent_menu(app: &AppHandle, menu: &Submenu<Wry>, recent: &[String]) {
+    if let Ok(items) = menu.items() {
+        // Back to front: every removal shifts the indices after it.
+        for i in (0..items.len()).rev() {
+            let _ = menu.remove_at(i);
+        }
+    }
+    if recent.is_empty() {
+        // An empty submenu is a dead arrow on GTK; a disabled placeholder
+        // reads as intentional.
+        if let Ok(none) =
+            MenuItem::with_id(app, "recent_none", "No Recent Files", false, None::<&str>)
+        {
+            let _ = menu.append(&none);
+        }
+        return;
+    }
+    for (i, path) in recent.iter().enumerate() {
+        if let Ok(item) = MenuItem::with_id(
+            app,
+            format!("recent:{i}"),
+            recent_label(path),
+            true,
+            None::<&str>,
+        ) {
+            let _ = menu.append(&item);
+        }
+    }
+    if let (Ok(sep), Ok(clear)) = (
+        PredefinedMenuItem::separator(app),
+        MenuItem::with_id(app, "recent_clear", "Clear Recent", true, None::<&str>),
+    ) {
+        let _ = menu.append(&sep);
+        let _ = menu.append(&clear);
+    }
+}
+
+fn refresh_recent_menu(app: &AppHandle) {
+    let (menu, recent) = {
+        let state = app.state::<AppState>();
+        let s = state.0.lock().unwrap();
+        (s.recent_menu.clone(), s.recent.clone())
+    };
+    if let Some(menu) = menu {
+        fill_recent_menu(app, &menu, &recent);
+    }
+}
+
+/// Move-to-front, dedup by canonical path, cap at `RECENT_MAX`. Batched:
+/// opening ten files at startup would otherwise mean ten menu rebuilds and
+/// ten config writes.
+fn push_recent(app: &AppHandle, paths: &[PathBuf]) {
+    if paths.is_empty() {
+        return;
+    }
+    {
+        let state = app.state::<AppState>();
+        let mut s = state.0.lock().unwrap();
+        // In order, so the *last* path of a batch ends up most-recent — which
+        // is also the tab the frontend leaves focused after opening them.
+        for path in paths.iter() {
+            let key = path
+                .canonicalize()
+                .unwrap_or_else(|_| path.clone())
+                .display()
+                .to_string();
+            s.recent.retain(|p| p != &key);
+            s.recent.insert(0, key);
+        }
+        s.recent.truncate(RECENT_MAX);
+    }
+    save_recent(app);
+    refresh_recent_menu(app);
+}
+
+fn forget_recent(app: &AppHandle, path: &str) {
+    {
+        let state = app.state::<AppState>();
+        let mut s = state.0.lock().unwrap();
+        s.recent.retain(|p| p != path);
+    }
+    save_recent(app);
+    refresh_recent_menu(app);
+}
+
+/// Open a recent entry by index. Existence is checked here rather than at
+/// load time: stat-ing ten paths at startup stalls exactly the setups where
+/// it hurts (NFS, sshfs, an unplugged drive) and permanently forgets files
+/// that are only temporarily unreachable.
+fn open_recent(app: &AppHandle, idx: usize) {
+    let path = {
+        let state = app.state::<AppState>();
+        let s = state.0.lock().unwrap();
+        s.recent.get(idx).cloned()
+    };
+    let Some(path) = path else { return };
+    if !Path::new(&path).exists() {
+        forget_recent(app, &path);
+        // Non-blocking: this runs on the main thread, so a blocking dialog
+        // would freeze the event loop.
+        app.dialog()
+            .message(format!("{path}\n\nThe file no longer exists."))
+            .title("Could not open file")
+            .show(|_| {});
+        return;
+    }
+    let _ = app.emit("drop-open", vec![path]);
+}
+
+/// Save / Save As / Close Tab, and the Insert and Format menus, mean nothing
+/// with no document open. A disabled item does not fire its accelerator, so
+/// this makes Ctrl+S inert structurally rather than by convention.
+fn set_doc_menus_enabled(app: &AppHandle, enabled: bool) {
+    let (items, menus) = {
+        let state = app.state::<AppState>();
+        let s = state.0.lock().unwrap();
+        (s.doc_items.clone(), s.doc_menus.clone())
+    };
+    for it in &items {
+        let _ = it.set_enabled(enabled);
+    }
+    for m in &menus {
+        let _ = m.set_enabled(enabled);
+    }
+}
+
+/// The built menu plus the handles that get mutated at runtime.
+struct MenuHandles {
+    menu: Menu<Wry>,
+    recent: Submenu<Wry>,
+    doc_items: Vec<MenuItem<Wry>>,
+    doc_menus: Vec<Submenu<Wry>>,
+}
+
+fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<MenuHandles> {
     #[cfg(target_os = "macos")]
     let app_menu = Submenu::with_items(
         app,
@@ -261,18 +494,29 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         ],
     )?;
 
-    let file_menu = Submenu::with_items(
+    let recent_menu = Submenu::with_id_and_items(app, "open_recent", "Open Recent", true, &[])?;
+    fill_recent_menu(app, &recent_menu, recent);
+
+    let save = MenuItem::with_id(app, "save", "Save", true, Some("CmdOrCtrl+S"))?;
+    let save_as = MenuItem::with_id(app, "save_as", "Save As…", true, Some("CmdOrCtrl+Shift+S"))?;
+    let close_tab = MenuItem::with_id(app, "close_tab", "Close Tab", true, Some("CmdOrCtrl+W"))?;
+
+    let file_menu = Submenu::with_id_and_items(
         app,
+        "file",
         "File",
         true,
         &[
             &MenuItem::with_id(app, "new", "New", true, Some("CmdOrCtrl+N"))?,
             &MenuItem::with_id(app, "open", "Open…", true, Some("CmdOrCtrl+O"))?,
+            &recent_menu,
             &MenuItem::with_id(app, "import_html", "Import HTML…", true, None::<&str>)?,
             &MenuItem::with_id(app, "import_docx", "Import Word Document…", true, None::<&str>)?,
             &PredefinedMenuItem::separator(app)?,
-            &MenuItem::with_id(app, "save", "Save", true, Some("CmdOrCtrl+S"))?,
-            &MenuItem::with_id(app, "save_as", "Save As…", true, Some("CmdOrCtrl+Shift+S"))?,
+            &save,
+            &save_as,
+            &PredefinedMenuItem::separator(app)?,
+            &close_tab,
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(app, "quit", "Quit", true, Some("CmdOrCtrl+Q"))?,
         ],
@@ -306,17 +550,37 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         ],
     )?;
 
+    // Ctrl+Tab / Ctrl+Shift+Tab also cycle documents, but only via the
+    // in-page keydown handler: as a *native* accelerator it is unreliable on
+    // WebKitGTK, where focus traversal eats it first.
     let view_menu = Submenu::with_items(
         app,
         "View",
         true,
-        &[&MenuItem::with_id(
-            app,
-            "toggle_mode",
-            "Toggle Markdown Source",
-            true,
-            Some("CmdOrCtrl+Shift+M"),
-        )?],
+        &[
+            &MenuItem::with_id(
+                app,
+                "toggle_mode",
+                "Toggle Markdown Source",
+                true,
+                Some("CmdOrCtrl+Shift+M"),
+            )?,
+            &PredefinedMenuItem::separator(app)?,
+            &MenuItem::with_id(
+                app,
+                "next_tab",
+                "Next Document",
+                true,
+                Some("CmdOrCtrl+PageDown"),
+            )?,
+            &MenuItem::with_id(
+                app,
+                "prev_tab",
+                "Previous Document",
+                true,
+                Some("CmdOrCtrl+PageUp"),
+            )?,
+        ],
     )?;
 
     let insert_menu = Submenu::with_items(
@@ -372,7 +636,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         &[&MenuItem::with_id(app, "about", "About mdedit", true, None::<&str>)?],
     )?;
 
-    Menu::with_items(
+    let menu = Menu::with_items(
         app,
         &[
             #[cfg(target_os = "macos")]
@@ -384,7 +648,53 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
             &format_menu,
             &help_menu,
         ],
-    )
+    )?;
+
+    Ok(MenuHandles {
+        menu,
+        recent: recent_menu,
+        doc_items: vec![save, save_as, close_tab],
+        doc_menus: vec![insert_menu, format_menu],
+    })
+}
+
+/// A second launch forwarded its argv to us. Open the files as tabs and bring
+/// the window forward.
+#[cfg(desktop)]
+fn on_second_instance(app: &AppHandle, args: Vec<String>, cwd: String) {
+    // argv[0] is the executable, and relative paths are relative to the
+    // *second* process's cwd, not ours — joining against ours would resolve
+    // to the wrong file or to nothing.
+    let cwd = PathBuf::from(cwd);
+    let paths: Vec<PathBuf> = args
+        .iter()
+        .skip(1)
+        .filter(|a| !a.starts_with('-'))
+        .map(|a| {
+            let p = PathBuf::from(a);
+            if p.is_absolute() {
+                p
+            } else {
+                cwd.join(p)
+            }
+        })
+        .filter(|p| is_markdown_file(p))
+        .collect();
+
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.unminimize();
+        let _ = w.show();
+        // Best effort on Linux: Wayland and most compositors enforce
+        // focus-stealing prevention, so this may only raise an urgency hint.
+        let _ = w.set_focus();
+    }
+
+    if !paths.is_empty() {
+        // No push_recent here: the frontend answers "drop-open" with one
+        // `open_path` per file, and that already records them.
+        let strs: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+        let _ = app.emit("drop-open", strs);
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -396,16 +706,40 @@ pub fn run() {
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
     }
 
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+
+    // Must be registered before every other plugin: it aborts the second
+    // process before anything else has started up. On macOS the Finder route
+    // never spawns a second process (Launch Services sends an Apple event,
+    // handled by RunEvent::Opened below), so this only covers CLI launches
+    // there.
+    #[cfg(desktop)]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+            on_second_instance(app, args, cwd);
+        }));
+    }
+
+    builder
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState(Mutex::new(DocState::default())))
         .invoke_handler(tauri::generate_handler![
-            init_doc, new_doc, open_doc, open_path, import_html, import_docx, save_doc,
-            save_doc_as, set_dirty, force_close, show_about
+            init_doc, open_doc, open_path, import_html, import_docx, save_doc,
+            save_doc_as, set_title, force_close, show_about
         ])
         .setup(|app| {
-            let menu = build_menu(app.handle())?;
-            app.set_menu(menu)?;
+            let handle = app.handle();
+            // Loaded before the menu is built so Open Recent is born
+            // populated and nothing has to be mutated during setup.
+            let recent = load_recent(handle);
+            let h = build_menu(handle, &recent)?;
+            app.set_menu(h.menu)?;
+            let state = app.state::<AppState>();
+            let mut s = state.0.lock().unwrap();
+            s.recent = recent;
+            s.recent_menu = Some(h.recent);
+            s.doc_items = h.doc_items;
+            s.doc_menus = h.doc_menus;
             Ok(())
         })
         .on_menu_event(|app, event| {
@@ -417,6 +751,23 @@ pub fn run() {
                     }
                 }
                 "about" => show_about(app.clone()),
+                // Handled here rather than forwarded: the index→path table
+                // lives in AppState, and "drop-open" already means exactly
+                // "open these paths as tabs".
+                s if s.starts_with("recent:") => {
+                    if let Ok(i) = s["recent:".len()..].parse::<usize>() {
+                        open_recent(app, i);
+                    }
+                }
+                "recent_clear" => {
+                    {
+                        let state = app.state::<AppState>();
+                        state.0.lock().unwrap().recent.clear();
+                    }
+                    save_recent(app);
+                    refresh_recent_menu(app);
+                }
+                "recent_none" => {}
                 _ => {
                     let _ = app.emit("menu", id.to_string());
                 }
@@ -427,7 +778,7 @@ pub fn run() {
                 let dirty = {
                     let state = window.app_handle().state::<AppState>();
                     let s = state.0.lock().unwrap();
-                    s.dirty
+                    s.any_dirty
                 };
                 if dirty {
                     api.prevent_close();
@@ -435,10 +786,15 @@ pub fn run() {
                 }
             }
             WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => {
-                // The frontend decides what to do with it (it may need to
-                // prompt about unsaved changes first).
-                if let Some(p) = paths.iter().find(|p| is_markdown_file(p)) {
-                    let _ = window.emit("drop-open", p.display().to_string());
+                // Every markdown file in the drop becomes a tab. The frontend
+                // decides what to do with them.
+                let md: Vec<String> = paths
+                    .iter()
+                    .filter(|p| is_markdown_file(p))
+                    .map(|p| p.display().to_string())
+                    .collect();
+                if !md.is_empty() {
+                    let _ = window.emit("drop-open", md);
                 }
             }
             _ => {}
@@ -452,14 +808,28 @@ pub fn run() {
             // init_doc).
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Opened { urls } = &_event {
-                if let Some(path) = urls
+                let paths: Vec<PathBuf> = urls
                     .iter()
                     .filter_map(|u| u.to_file_path().ok())
-                    .find(|p| is_markdown_file(p))
-                {
-                    let _ = _app.emit("drop-open", path.display().to_string());
+                    .filter(|p| is_markdown_file(p))
+                    .collect();
+                if !paths.is_empty() {
+                    // Either the frontend is up and handles the event, or it
+                    // isn't and `init_doc` will drain the stash — never both,
+                    // which is what the `ready` flag is for.
                     let state = _app.state::<AppState>();
-                    state.0.lock().unwrap().pending_open = Some(path);
+                    let ready = {
+                        let mut s = state.0.lock().unwrap();
+                        if !s.ready {
+                            s.pending_open.extend(paths.iter().cloned());
+                        }
+                        s.ready
+                    };
+                    if ready {
+                        let strs: Vec<String> =
+                            paths.iter().map(|p| p.display().to_string()).collect();
+                        let _ = _app.emit("drop-open", strs);
+                    }
                 }
             }
         });

@@ -7,6 +7,18 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
 
 ## Features
 
+- **Multiple documents in tabs** — a single row of tabs with a `»` menu on the
+  right when they no longer fit. New and Open always add a tab, so nothing is
+  ever discarded; opening a file that's already open just focuses its tab.
+  Each tab keeps its own undo history, view mode, caret and scroll position.
+  Close with `Ctrl+W`, the tab's `✕`, or a middle click; a modified tab asks
+  before it goes, and quitting walks the modified tabs one at a time. Closing
+  the last tab leaves an empty window rather than quitting.
+- **Recent files** — **File → Open Recent** keeps the last 10 documents,
+  remembered between runs in `recent.json` under your config directory.
+- **One instance** — opening a `.md` from the file manager (or a second
+  `mdedit file.md` in a terminal) adds a tab to the running window instead of
+  starting a second copy. Selecting several files at once opens them all.
 - **WYSIWYG editing** — markdown is rendered with `pulldown-cmark` into an
   editable view; edits are serialized back to clean markdown source. Toggle to
   a raw **markdown source** mode any time (`Ctrl+Shift+M`).
@@ -23,8 +35,9 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
 - **Formatting toolbar**: bold, italic, strikethrough, inline code, headings,
   bullet/numbered/task lists, blockquote, code block, links, images, tables,
   horizontal rules — works in both WYSIWYG and source mode.
-- **Native menus**: File (New / Open / Save / Save As / Quit), Edit (undo,
-  redo, clipboard, Find / Replace), View, Insert (link, image, table, mermaid
+- **Native menus**: File (New / Open / Open Recent / Save / Save As / Close
+  Tab / Quit), Edit (undo, redo, clipboard, Find / Replace), View (source
+  toggle, next/previous document), Insert (link, image, table, mermaid
   diagram, hr, table rows/columns), Format, Help.
 - **Table editing**: insert row above/below and column left/right, delete
   row/column/table — from the toolbar (shown while the caret is in a table),
@@ -34,13 +47,13 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
 - **Undo/redo** with its own snapshot history (covers table edits, checkbox
   toggles and replace-all, which browser-native undo can't see) — toolbar
   buttons with live enabled state, menu items, `Ctrl+Z`/`Ctrl+Shift+Z`/`Ctrl+Y`.
-- Window title shows the current file (`notes.md - mdedit`, `*` when
-  modified), unsaved-changes prompt on close, word/char count status bar,
-  light + dark theme, open a file from the CLI: `mdedit notes.md`.
-- **Drag & drop** a markdown file onto the window to open it (with the usual
-  unsaved-changes prompt), and installed bundles register a **file
-  association** for `.md`/`.markdown`/`.mdown`/`.mkd`, so "Open With →
-  mdedit" and double-click work on all three platforms.
+- Window title shows the active tab (`notes.md - mdedit`, `*` when modified),
+  word/char count status bar, light + dark theme, open files from the CLI:
+  `mdedit notes.md draft.md`.
+- **Drag & drop** markdown files onto the window to open them as tabs, and
+  installed bundles register a **file association** for
+  `.md`/`.markdown`/`.mdown`/`.mkd`, so "Open With → mdedit" and double-click
+  work on all three platforms.
 - **Smart paste**: pasting rich content (web pages, Word, Google Docs)
   converts the clipboard's HTML to markdown — `Ctrl+Shift+V` pastes plain
   text instead. **File → Import HTML…** converts an HTML file into a new
@@ -55,10 +68,13 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
 
 | Shortcut | Action |
 | --- | --- |
-| `Ctrl/Cmd+N` | New file |
-| `Ctrl/Cmd+O` | Open file |
+| `Ctrl/Cmd+N` | New file (in a new tab) |
+| `Ctrl/Cmd+O` | Open file (in a new tab) |
 | `Ctrl/Cmd+S` | Save |
 | `Ctrl/Cmd+Shift+S` | Save As |
+| `Ctrl/Cmd+W` | Close tab |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous document |
+| `Ctrl/Cmd+PageDown` / `PageUp` | Next / previous document |
 | `Ctrl/Cmd+Z` | Undo |
 | `Ctrl/Cmd+Shift+Z` or `Ctrl+Y` | Redo |
 | `Ctrl/Cmd+F` | Find |

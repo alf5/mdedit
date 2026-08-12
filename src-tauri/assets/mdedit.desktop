@@ -4,7 +4,7 @@ Categories=Office;TextEditor;
 # WebKitGTK's DMA-BUF renderer draws a blank window under some Wayland
 # compositors and drivers; the launcher cannot inherit the workaround from a
 # shell profile, so set it here.
-Exec=env WEBKIT_DISABLE_DMABUF_RENDERER=1 {{exec}} %f
+Exec=env WEBKIT_DISABLE_DMABUF_RENDERER=1 {{exec}} %F
 Icon={{icon}}
 Name={{name}}
 Terminal=false

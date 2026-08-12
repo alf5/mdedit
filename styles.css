@@ -220,6 +220,188 @@ body {
   margin-left: 8px;
 }
 
+/* ---------- tab bar ---------- */
+
+.tabbar {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  padding: 0 6px;
+  background: var(--bg-soft);
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* One line, never wraps. min-width:0 is what lets it shrink inside the flex
+   row instead of shoving the "»" button out of the window. position:relative
+   makes it the offsetParent, so a tab's offsetLeft is already a strip-content
+   coordinate and compares directly against scrollLeft. */
+.tabstrip {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  gap: 2px;
+}
+
+/* Scrolls programmatically and by trackpad, but shows no bar: the global
+   10px horizontal scrollbar would eat a third of a 34px strip. */
+.tabstrip::-webkit-scrollbar {
+  height: 0;
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 1 auto;
+  min-width: 84px;
+  max-width: 200px;
+  height: 30px;
+  margin-top: 3px;
+  padding: 0 4px 0 10px;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 6px 6px 0 0;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.tab:hover {
+  background: var(--bg-raised);
+}
+
+/* The active tab carries the editor's own background so it reads as the front
+   sheet; the accent edge is what survives against the 1px hairline below. */
+.tab.active {
+  background: var(--bg);
+  border-color: var(--border);
+  border-top: 2px solid var(--accent);
+  color: var(--text);
+}
+
+.tab-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* .tb-btn is 30x28 — it would fill the whole tab. This is a fifth of it. */
+.tab-x {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.55;
+}
+
+.tab:hover .tab-x,
+.tab.active .tab-x,
+.tab.dirty .tab-x {
+  opacity: 1;
+}
+
+.tab-x:hover {
+  background: var(--border);
+}
+
+/* A dirty tab shows a dot where the ✕ lives; pointing anywhere at the tab
+   turns it back into the ✕, so the close target never moves and the space is
+   never reserved twice. */
+.tab-x::before {
+  content: "✕";
+}
+
+.tab.dirty .tab-x::before {
+  content: "•";
+  font-size: 15px;
+}
+
+.tab.dirty:hover .tab-x::before {
+  content: "✕";
+  font-size: 11px;
+}
+
+.tab-more {
+  align-self: center;
+  flex: 0 0 auto;
+  min-width: 26px;
+  height: 26px;
+  padding: 0 5px;
+  font-size: 15px;
+}
+
+/* Reserved, not removed: hiding it with display:none would widen the strip,
+   which can un-overflow it, which would show the button again — a flicker
+   loop at a knife-edge window width. */
+.tab-more.invisible {
+  visibility: hidden;
+}
+
+.tabmenu {
+  max-width: min(420px, 60vw);
+}
+
+.tabmenu .ctx-item {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Not the accent fill — that reads as hover. */
+.tabmenu .ctx-item.active {
+  font-weight: 600;
+}
+
+/* ---------- empty state ---------- */
+
+.empty-state {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  background: var(--bg);
+  color: var(--text-muted);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.empty-hint {
+  margin: 0;
+  font-size: 15px;
+}
+
+.empty-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.empty-sub {
+  margin: 0;
+  font-size: 12.5px;
+  opacity: 0.75;
+}
+
 /* ---------- editor ---------- */
 
 .editor-wrap {

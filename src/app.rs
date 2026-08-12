@@ -10,7 +10,7 @@ use web_sys::{Element, HtmlTextAreaElement};
 use crate::history::{self, Snap};
 use crate::markdown::to_html;
 use crate::serialize::{dom_to_markdown, html_to_markdown};
-use crate::tauri_api::{self, ContentArgs, DirtyArgs};
+use crate::tauri_api::{self, SaveArgs, TitleArgs};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
@@ -18,14 +18,13 @@ enum Mode {
     Source,
 }
 
+/// The only two operations that can still destroy unsaved work. Opening and
+/// importing never discard anything — they open a new tab.
 #[derive(Clone, PartialEq)]
 enum Pending {
-    New,
-    Open,
-    OpenPath(String),
-    ImportHtml,
-    ImportDocx,
-    Close,
+    /// Doc id, not index: indices shift when a tab closes.
+    CloseTab(u32),
+    CloseWindow,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -66,6 +65,67 @@ struct Ctl {
     hist: StoredValue<Hist>,
     can_undo: RwSignal<bool>,
     can_redo: RwSignal<bool>,
+    /// Last (name, dirty, any_dirty) pushed to the backend; suppresses
+    /// redundant title IPC.
+    last_status: StoredValue<Option<(String, bool, bool)>>,
+    /// Every open document, in tab order. Index-addressed by `active`.
+    ///
+    /// Two rules, both of which bite silently when broken:
+    /// never write a signal while a `docs` borrow is live (`StoredValue` is a
+    /// `RefCell`, and a synchronous notification that reads `docs` panics on
+    /// double-borrow); and never reorder `docs` without `publish_tabs`.
+    docs: StoredValue<Vec<Doc>>,
+    /// Reactive projection of `docs` for the tab strip. Republished on
+    /// open / close / reorder only — renaming a tab repaints one span.
+    tabs: RwSignal<Vec<TabView>>,
+    /// `None` = no document open, i.e. the empty frame.
+    active: RwSignal<Option<usize>>,
+    next_id: StoredValue<u32>,
+    /// Bumped by every `activate`; a queued frame that finds a stale
+    /// generation drops its caret/scroll restore.
+    switch_gen: StoredValue<u32>,
+    tab_menu: RwSignal<Option<(f64, f64)>>,
+    tabs_overflow: RwSignal<bool>,
+    tabstrip_ref: NodeRef<html::Div>,
+    /// The app's root reactive owner. A `Doc`'s signals must be created under
+    /// it rather than under whatever owner happens to be current: a tab
+    /// opened from the empty-state button would otherwise belong to that
+    /// `<Show>` branch, and be disposed the instant a document exists.
+    owner: StoredValue<Option<Owner>, LocalStorage>,
+}
+
+/// The stashed state of one document. The *active* document's live state
+/// stays in the plain `Ctl` fields, so every existing `fn foo(ctl: Ctl)` keeps
+/// working on "the current document" unchanged; `stash_active` / `activate`
+/// move it here and back.
+///
+/// `snap`, `scroll` and `hist` of the active entry are stale by definition —
+/// only `stash_active` writes them.
+struct Doc {
+    /// Stable across close and reorder. Keys the `<For>` and names a tab in
+    /// `Pending::CloseTab`.
+    id: u32,
+    name: RwSignal<String>,
+    /// Empty for a never-saved document; the save target.
+    path: RwSignal<String>,
+    dirty: RwSignal<bool>,
+    /// Content, mode and caret as verbatim HTML — never markdown. Round-
+    /// tripping through `dom_to_markdown` would quietly rewrite the document
+    /// on every tab switch.
+    snap: Snap,
+    scroll: i32,
+    hist: Hist,
+}
+
+/// The cheap `Copy` projection the tab strip iterates over. `Doc` itself can
+/// never live in a signal: `RwSignal::get` requires `Clone`, and cloning
+/// `Vec<Doc>` on every repaint would copy every document's HTML and its
+/// entire undo stack.
+#[derive(Clone, Copy, PartialEq)]
+struct TabView {
+    id: u32,
+    name: RwSignal<String>,
+    dirty: RwSignal<bool>,
 }
 
 #[derive(Default)]
@@ -90,7 +150,11 @@ thread_local! {
 /// keypress (platform-dependent); collapse duplicates within a short window.
 /// Undo/redo use a tighter window so held-key repeats still get through.
 fn dedup_ok(action: &str) -> bool {
-    let window_ms = if matches!(action, "undo" | "redo") {
+    // Holding Ctrl and tapping Tab is a deliberate sub-200ms repeat, so tab
+    // cycling shares undo/redo's tighter window. `close_tab` deliberately
+    // stays at 200ms: it is the one action where a double-fire would destroy
+    // a second document.
+    let window_ms = if matches!(action, "undo" | "redo" | "next_tab" | "prev_tab") {
         75.0
     } else {
         200.0
@@ -332,18 +396,47 @@ fn load_markdown(ctl: Ctl, md: &str) {
     history_reset(ctl);
 }
 
+/// Push the window title and the global unsaved flag to the backend. The
+/// frontend owns the tab list, so it owns both.
+///
+/// This has to fire on tab switches and closes, not just on a local dirty
+/// transition: closing the only dirty tab lowers `any_dirty` without any
+/// single document changing, and missing that means the app either prompts on
+/// quit forever or quits with unsaved work.
+fn push_status(ctl: Ctl) {
+    let name = ctl.doc_name.get_untracked();
+    let dirty = ctl.dirty.get_untracked();
+    let any_dirty = dirty
+        || ctl
+            .docs
+            .with_value(|d| d.iter().any(|doc| doc.dirty.get_untracked()));
+    // Redundant IPC on every keystroke is pointless; the tuple is cheap.
+    let next = (name.clone(), dirty, any_dirty);
+    if ctl.last_status.get_value().as_ref() == Some(&next) {
+        return;
+    }
+    ctl.last_status.set_value(Some(next));
+    spawn_local(async move {
+        let args = serde_wasm_bindgen::to_value(&TitleArgs {
+            name,
+            dirty,
+            any_dirty,
+        })
+        .unwrap();
+        let _ = tauri_api::invoke("set_title", args).await;
+    });
+}
+
 fn mark_dirty(ctl: Ctl) {
     if !ctl.dirty.get_untracked() {
         ctl.dirty.set(true);
-        spawn_local(async move {
-            let args = serde_wasm_bindgen::to_value(&DirtyArgs { dirty: true }).unwrap();
-            let _ = tauri_api::invoke("set_dirty", args).await;
-        });
     }
+    sync_active_doc(ctl);
 }
 
 fn mark_clean(ctl: Ctl) {
     ctl.dirty.set(false);
+    sync_active_doc(ctl);
 }
 
 fn toggle_mode(ctl: Ctl) {
@@ -443,42 +536,87 @@ fn history_reset(ctl: Ctl) {
     history_flags(ctl);
 }
 
-fn restore_snap(ctl: Ctl, snap: Snap) {
-    match &snap {
-        Snap::Wys { html, caret } => {
+/// Put a snapshot's mode and content into the live editor. The synchronous
+/// half of a restore; the caret needs a frame of its own, see
+/// [`restore_caret_from`].
+fn apply_snap_now(ctl: Ctl, snap: &Snap) {
+    match snap {
+        Snap::Wys { html, .. } => {
             if ctl.mode.get_untracked() != Mode::Wysiwyg {
                 ctl.mode.set(Mode::Wysiwyg);
             }
             if let Some(el) = editor_el(ctl) {
                 el.set_inner_html(html);
                 enable_checkboxes(ctl);
-                let caret = *caret;
-                request_animation_frame(move || {
-                    let _ = el.focus();
-                    history::restore_caret_at(el.unchecked_ref::<Element>(), caret);
-                });
             }
         }
-        Snap::Src {
-            text,
-            sel_start,
-            sel_end,
-        } => {
+        Snap::Src { text, .. } => {
             if ctl.mode.get_untracked() != Mode::Source {
                 ctl.mode.set(Mode::Source);
             }
             ctl.source.set(text.clone());
             if let Some(ta) = ta_el(ctl) {
                 ta.set_value(text);
-                let (s, e) = (*sel_start, *sel_end);
-                request_animation_frame(move || {
-                    let _ = ta.focus();
-                    let _ = ta.set_selection_range(s, e);
-                });
             }
         }
     }
+}
+
+/// Focus the right surface and put the caret back. Must run inside a
+/// `request_animation_frame`: `class:hidden` is applied by a queued render
+/// effect and `focus()` on a `display:none` element is a no-op, and assigning
+/// a textarea's value resets its selection. A frame lands after both.
+fn restore_caret_from(ctl: Ctl, snap: &Snap) {
+    match snap {
+        Snap::Wys { caret, .. } => {
+            if let Some(el) = editor_el(ctl) {
+                let _ = el.focus();
+                history::restore_caret_at(el.unchecked_ref::<Element>(), *caret);
+            }
+        }
+        Snap::Src {
+            sel_start, sel_end, ..
+        } => {
+            if let Some(ta) = ta_el(ctl) {
+                let _ = ta.focus();
+                let _ = ta.set_selection_range(*sel_start, *sel_end);
+            }
+        }
+    }
+}
+
+/// Scroll offset of whichever surface is showing. Captured per document so a
+/// tab comes back where it was left.
+fn scroll_top(ctl: Ctl) -> i32 {
+    match ctl.mode.get_untracked() {
+        Mode::Wysiwyg => editor_el(ctl).map(|e| e.scroll_top()).unwrap_or(0),
+        Mode::Source => ta_el(ctl).map(|t| t.scroll_top()).unwrap_or(0),
+    }
+}
+
+fn set_scroll_top(ctl: Ctl, top: i32) {
+    match ctl.mode.get_untracked() {
+        Mode::Wysiwyg => {
+            if let Some(e) = editor_el(ctl) {
+                e.set_scroll_top(top);
+            }
+        }
+        Mode::Source => {
+            if let Some(t) = ta_el(ctl) {
+                t.set_scroll_top(top);
+            }
+        }
+    }
+}
+
+fn restore_snap(ctl: Ctl, snap: Snap) {
+    apply_snap_now(ctl, &snap);
+    let queued = snap.clone();
+    request_animation_frame(move || restore_caret_from(ctl, &queued));
     ctl.hist.update_value(|h| h.shadow = Some(snap));
+    // Undo/redo always leaves the document modified. A tab switch reuses the
+    // machinery above but must *not* come through here, or looking at a tab
+    // would dirty it.
     mark_dirty(ctl);
     recount(ctl);
     update_in_table(ctl);
@@ -509,13 +647,7 @@ fn history_redo(ctl: Ctl) {
 // ---------- file operations ----------
 
 fn do_new(ctl: Ctl) {
-    spawn_local(async move {
-        let _ = tauri_api::invoke_no_args("new_doc").await;
-        load_markdown(ctl, "");
-        mark_clean(ctl);
-        ctl.doc_name.set("Untitled".to_string());
-        ctl.doc_path.set(String::new());
-    });
+    new_tab(ctl, "Untitled", "", "", false);
 }
 
 /// Report a failed backend command. These are expected failures — a bad path,
@@ -530,13 +662,10 @@ fn do_open(ctl: Ctl) {
     spawn_local(async move {
         match tauri_api::invoke_no_args("open_doc").await {
             Ok(v) => {
-                if let Some(info) = tauri_api::parse_file_info(v) {
-                    load_markdown(ctl, &info.content);
-                    mark_clean(ctl);
-                    ctl.doc_name.set(info.name);
-                    ctl.doc_path.set(info.path);
+                // Empty: user cancelled the file dialog — stay put.
+                for info in tauri_api::parse_file_infos(v) {
+                    open_document(ctl, info);
                 }
-                // None: user cancelled the file dialog — stay put.
             }
             Err(e) => report_backend_error("Could not open file", &e),
         }
@@ -546,14 +675,19 @@ fn do_open(ctl: Ctl) {
 fn do_save(ctl: Ctl, save_as: bool, then: Option<Pending>) {
     spawn_local(async move {
         let content = current_markdown(ctl);
-        let args = serde_wasm_bindgen::to_value(&ContentArgs { content }).unwrap();
+        // The backend no longer tracks "the current document", so the target
+        // comes from the tab.
+        let path = Some(ctl.doc_path.get_untracked()).filter(|p| !p.is_empty());
+        let args = serde_wasm_bindgen::to_value(&SaveArgs { content, path }).unwrap();
         let cmd = if save_as { "save_doc_as" } else { "save_doc" };
         match tauri_api::invoke(cmd, args).await {
             Ok(v) => {
                 if let Some(info) = tauri_api::parse_file_info(v) {
-                    mark_clean(ctl);
+                    // Name and path first: `mark_clean` pushes the title, and
+                    // Save As renames the tab.
                     ctl.doc_name.set(info.name);
                     ctl.doc_path.set(info.path);
+                    mark_clean(ctl);
                     if let Some(p) = then {
                         perform_pending(ctl, p);
                     }
@@ -571,15 +705,37 @@ fn do_open_path(ctl: Ctl, path: String) {
         match tauri_api::invoke("open_path", args).await {
             Ok(v) => {
                 if let Some(info) = tauri_api::parse_file_info(v) {
-                    load_markdown(ctl, &info.content);
-                    mark_clean(ctl);
-                    ctl.doc_name.set(info.name);
-                    ctl.doc_path.set(info.path);
+                    open_document(ctl, info);
                 }
             }
             Err(e) => report_backend_error("Could not open file", &e),
         }
     });
+}
+
+/// Show a loaded file, reusing an existing tab where that is the right thing.
+/// Opening never discards anything now, so there is no unsaved-changes gate.
+fn open_document(ctl: Ctl, info: tauri_api::FileInfo) {
+    if !info.path.is_empty() {
+        if let Some(i) = ctl.docs.with_value(|d| {
+            d.iter()
+                .position(|doc| doc.path.get_untracked() == info.path)
+        }) {
+            // Deliberately does *not* reload from disk: that tab may hold
+            // unsaved edits, and silently discarding them is the exact
+            // failure this design exists to prevent.
+            switch_to(ctl, i);
+            return;
+        }
+    }
+    if is_pristine(ctl) {
+        load_markdown(ctl, &info.content);
+        ctl.doc_name.set(info.name);
+        ctl.doc_path.set(info.path);
+        mark_clean(ctl);
+        return;
+    }
+    new_tab(ctl, &info.name, &info.path, &info.content, false);
 }
 
 fn do_import_html(ctl: Ctl) {
@@ -589,13 +745,8 @@ fn do_import_html(ctl: Ctl) {
                 let Ok(Some(html)) = serde_wasm_bindgen::from_value::<Option<String>>(v) else {
                     return; // dialog cancelled
                 };
-                let md = html_to_markdown(&html);
-                let _ = tauri_api::invoke_no_args("new_doc").await;
-                ctl.doc_name.set("Untitled".to_string());
-                ctl.doc_path.set(String::new());
-                load_markdown(ctl, &md);
-                ctl.dirty.set(false); // force the dirty transition below
-                mark_dirty(ctl); // imported content is unsaved
+                // Imported content is unsaved, hence dirty from the start.
+                new_tab(ctl, "Untitled", "", &html_to_markdown(&html), true);
             }
             Err(e) => report_backend_error("Could not import file", &e),
         }
@@ -609,12 +760,7 @@ fn do_import_docx(ctl: Ctl) {
                 let Ok(Some(md)) = serde_wasm_bindgen::from_value::<Option<String>>(v) else {
                     return; // dialog cancelled
                 };
-                let _ = tauri_api::invoke_no_args("new_doc").await;
-                ctl.doc_name.set("Untitled".to_string());
-                ctl.doc_path.set(String::new());
-                load_markdown(ctl, &md);
-                ctl.dirty.set(false);
-                mark_dirty(ctl); // imported content is unsaved
+                new_tab(ctl, "Untitled", "", &md, true);
             }
             Err(e) => report_backend_error("Could not import file", &e),
         }
@@ -623,22 +769,411 @@ fn do_import_docx(ctl: Ctl) {
 
 fn perform_pending(ctl: Ctl, p: Pending) {
     match p {
-        Pending::New => do_new(ctl),
-        Pending::Open => do_open(ctl),
-        Pending::OpenPath(path) => do_open_path(ctl, path),
-        Pending::ImportHtml => do_import_html(ctl),
-        Pending::ImportDocx => do_import_docx(ctl),
-        Pending::Close => spawn_local(async move {
+        Pending::CloseTab(id) => close_tab_forced(ctl, id),
+        Pending::CloseWindow => close_window_step(ctl),
+    }
+}
+
+// ---------- tabs ----------
+
+/// Reactive — for the view.
+fn has_doc(ctl: Ctl) -> bool {
+    ctl.active.get().is_some()
+}
+
+/// Non-reactive — for handlers.
+fn has_doc_now(ctl: Ctl) -> bool {
+    ctl.active.get_untracked().is_some()
+}
+
+fn publish_tabs(ctl: Ctl) {
+    // Build outside the borrow, then set. Writing a signal inside
+    // `with_value` risks a synchronous read back into `docs`.
+    let tabs = ctl.docs.with_value(|d| {
+        d.iter()
+            .map(|doc| TabView {
+                id: doc.id,
+                name: doc.name,
+                dirty: doc.dirty,
+            })
+            .collect::<Vec<_>>()
+    });
+    ctl.tabs.set(tabs);
+}
+
+fn index_of(ctl: Ctl, id: u32) -> Option<usize> {
+    ctl.docs.with_value(|d| d.iter().position(|x| x.id == id))
+}
+
+fn active_id(ctl: Ctl) -> Option<u32> {
+    let i = ctl.active.get()?;
+    ctl.tabs.with(|t| t.get(i).map(|x| x.id))
+}
+
+/// Write the live per-document signals through to the active tab, then push
+/// the title. Every writer of `doc_name`, `doc_path` or `dirty` ends here.
+///
+/// Deliberately synchronous rather than an `Effect`: Leptos effects are
+/// queued, so a rename and a tab switch in the same tick would flush once
+/// with the *new* `active` and write the old name into the new document.
+fn sync_active_doc(ctl: Ctl) {
+    let Some(i) = ctl.active.get_untracked() else {
+        push_status(ctl);
+        return;
+    };
+    let Some((name, path, dirty)) = ctl
+        .docs
+        .with_value(|d| d.get(i).map(|x| (x.name, x.path, x.dirty)))
+    else {
+        return;
+    };
+    // Borrow dropped: safe to write signals now.
+    let (n, p, dt) = (
+        ctl.doc_name.get_untracked(),
+        ctl.doc_path.get_untracked(),
+        ctl.dirty.get_untracked(),
+    );
+    if name.get_untracked() != n {
+        name.set(n);
+    }
+    if path.get_untracked() != p {
+        path.set(p);
+    }
+    if dirty.get_untracked() != dt {
+        dirty.set(dt);
+    }
+    push_status(ctl);
+}
+
+/// Bring the live DOM to rest so it can be handed to another document.
+fn quiesce(ctl: Ctl) {
+    // A diagram open for editing keeps its source in the textarea's *value
+    // property*, and `inner_html()` serializes a textarea's initial child
+    // text, not its value. Stashing over an open diagram would silently blank
+    // it. Rendering it back first also runs its history commit.
+    if let Some(el) = editor_el(ctl) {
+        if let Ok(list) = el.query_selector_all("textarea.mermaid-source") {
+            for i in 0..list.length() {
+                if let Some(ta) = list
+                    .item(i)
+                    .and_then(|n| n.dyn_into::<HtmlTextAreaElement>().ok())
+                {
+                    close_mermaid_source(ctl, &ta);
+                }
+            }
+        }
+    }
+    // These hold live handles into the DOM we are about to replace.
+    close_ctx_menu(ctl);
+    ctl.saved_range.set_value(None);
+    ctl.url_modal.set(None);
+}
+
+fn stash_active(ctl: Ctl) {
+    let Some(i) = ctl.active.get_untracked() else {
+        return;
+    };
+    quiesce(ctl);
+    let snap = capture_current(ctl).unwrap_or(Snap::Wys {
+        html: String::new(),
+        caret: 0,
+    });
+    let scroll = scroll_top(ctl);
+    // `Hist` is not Clone: move it out and leave a default behind.
+    let mut hist = Hist::default();
+    ctl.hist.update_value(|h| hist = std::mem::take(h));
+
+    ctl.docs.update_value(|docs| {
+        if let Some(d) = docs.get_mut(i) {
+            d.snap = snap;
+            d.scroll = scroll;
+            d.hist = hist;
+            // name / path / dirty are already current: `sync_active_doc`
+            // writes them through on every change.
+        }
+    });
+
+    // Ends any IME composition, and stops the outgoing document's `focusout`
+    // from firing after the incoming one is installed.
+    if let Some(el) = editor_el(ctl) {
+        let _ = el.blur();
+    }
+}
+
+fn activate(ctl: Ctl, i: usize) {
+    // Pull everything out under one borrow; the signal handles are Copy, so
+    // they are read after the borrow is dropped.
+    let Some((snap, scroll, hist, name, path, dirty)) = ctl
+        .docs
+        .try_update_value(|docs| {
+            let d = docs.get_mut(i)?;
+            Some((
+                d.snap.clone(),
+                d.scroll,
+                std::mem::take(&mut d.hist),
+                d.name,
+                d.path,
+                d.dirty,
+            ))
+        })
+        .flatten()
+    else {
+        return;
+    };
+
+    ctl.active.set(Some(i));
+    ctl.doc_name.set(name.get_untracked());
+    ctl.doc_path.set(path.get_untracked());
+    ctl.dirty.set(dirty.get_untracked());
+    ctl.hist.set_value(hist);
+
+    // Deliberately not `restore_snap`: that dirties unconditionally, which
+    // would mark every tab you merely look at as modified.
+    apply_snap_now(ctl, &snap);
+    ctl.hist.update_value(|h| h.shadow = Some(snap.clone()));
+
+    recount(ctl);
+    history_flags(ctl);
+    push_status(ctl);
+
+    let generation = ctl.switch_gen.get_value().wrapping_add(1);
+    ctl.switch_gen.set_value(generation);
+    request_animation_frame(move || {
+        // A second switch may have overtaken this frame.
+        if ctl.switch_gen.get_value() != generation {
+            return;
+        }
+        restore_caret_from(ctl, &snap);
+        // Last: focusing and restoring the caret can scroll the container.
+        set_scroll_top(ctl, scroll);
+        update_in_table(ctl);
+    });
+}
+
+fn switch_to(ctl: Ctl, i: usize) {
+    if ctl.active.get_untracked() == Some(i) || i >= ctl.docs.with_value(Vec::len) {
+        return;
+    }
+    stash_active(ctl);
+    activate(ctl, i);
+}
+
+fn switch_to_id(ctl: Ctl, id: u32) {
+    if let Some(i) = index_of(ctl, id) {
+        switch_to(ctl, i);
+    }
+}
+
+/// Build a `Doc` whose signals belong to the app's root owner. Creating them
+/// under the ambient owner is a trap: a tab opened from a handler inside a
+/// `<Show>` or `<For>` gets signals that are disposed when that branch
+/// unmounts, and every later read panics with "already disposed".
+fn make_doc(ctl: Ctl, id: u32, name: &str, path: &str, dirty: bool) -> Doc {
+    let build = || Doc {
+        id,
+        name: RwSignal::new(name.to_string()),
+        path: RwSignal::new(path.to_string()),
+        dirty: RwSignal::new(dirty),
+        snap: Snap::Wys {
+            html: String::new(),
+            caret: 0,
+        },
+        scroll: 0,
+        hist: Hist::default(),
+    };
+    match ctl.owner.get_value() {
+        Some(o) => o.with(build),
+        None => build(),
+    }
+}
+
+/// Open a document in a new tab and focus it.
+fn new_tab(ctl: Ctl, name: &str, path: &str, md: &str, dirty: bool) {
+    stash_active(ctl);
+    let id = {
+        let n = ctl.next_id.get_value();
+        ctl.next_id.set_value(n + 1);
+        n
+    };
+    let doc = make_doc(ctl, id, name, path, dirty);
+    let i = ctl.docs.with_value(Vec::len);
+    ctl.docs.update_value(|d| d.push(doc));
+    publish_tabs(ctl);
+
+    ctl.active.set(Some(i));
+    ctl.doc_name.set(name.to_string());
+    ctl.doc_path.set(path.to_string());
+    ctl.hist.set_value(Hist::default());
+    // Mode is inherited: someone working in Markdown gets a Markdown tab.
+    // `load_markdown` is mode-aware and resets history.
+    if ctl.mode.get_untracked() == Mode::Source {
+        if let Some(el) = editor_el(ctl) {
+            el.set_inner_html("<p><br></p>");
+        }
+    }
+    load_markdown(ctl, md);
+    ctl.dirty.set(false);
+    if dirty {
+        mark_dirty(ctl); // imports arrive unsaved
+    }
+    sync_active_doc(ctl);
+    set_scroll_top(ctl, 0);
+    history_flags(ctl);
+    focus_current(ctl);
+}
+
+/// A single untouched blank document is a slot to fill, not a document to
+/// keep — this is what makes `mdedit file.md` land in tab 0 rather than
+/// leaving an empty tab beside it.
+fn is_pristine(ctl: Ctl) -> bool {
+    ctl.docs.with_value(Vec::len) == 1
+        && !ctl.dirty.get_untracked()
+        && ctl.doc_path.get_untracked().is_empty()
+        && visible_text(ctl).trim().is_empty()
+}
+
+/// Close a tab, asking first if it has unsaved changes.
+fn close_tab(ctl: Ctl, id: u32) {
+    let Some(i) = index_of(ctl, id) else { return };
+    let is_dirty = ctl
+        .docs
+        .with_value(|d| d.get(i).map(|x| x.dirty))
+        .map(|s| s.get_untracked())
+        .unwrap_or(false);
+    if is_dirty {
+        // The prompt names the *active* document and Save writes it, so make
+        // it active before asking.
+        switch_to(ctl, i);
+        ctl.pending.set(Some(Pending::CloseTab(id)));
+    } else {
+        close_tab_forced(ctl, id);
+    }
+}
+
+fn close_tab_forced(ctl: Ctl, id: u32) {
+    let Some(i) = index_of(ctl, id) else { return };
+    let was_active = ctl.active.get_untracked() == Some(i);
+    if was_active {
+        // No stash: the state is being discarded.
+        quiesce(ctl);
+    }
+    ctl.docs.update_value(|d| {
+        d.remove(i);
+    });
+    publish_tabs(ctl);
+
+    let n = ctl.docs.with_value(Vec::len);
+    if n == 0 {
+        enter_empty_state(ctl);
+        return;
+    }
+    let cur = ctl.active.get_untracked().unwrap_or(0);
+    if was_active {
+        let next = i.min(n - 1);
+        ctl.active.set(Some(next));
+        activate(ctl, next);
+    } else {
+        if cur > i {
+            ctl.active.set(Some(cur - 1)); // indices shifted under us
+        }
+        // `any_dirty` may have changed even though the active tab didn't.
+        sync_active_doc(ctl);
+    }
+}
+
+/// The window with nothing in it. Every per-document signal goes back to its
+/// zero value so no scrap of the closed document can leak into the title, the
+/// status bar, the undo buttons or the next save.
+fn enter_empty_state(ctl: Ctl) {
+    ctl.active.set(None);
+    ctl.doc_name.set(String::new());
+    ctl.doc_path.set(String::new());
+    ctl.dirty.set(false);
+    ctl.source.set(String::new());
+    // Not "<p><br></p>": there is no paragraph, because there is no document.
+    if let Some(el) = editor_el(ctl) {
+        el.set_inner_html("");
+    }
+    ctl.hist.set_value(Hist::default());
+    ctl.can_undo.set(false);
+    ctl.can_redo.set(false);
+    ctl.words.set(0);
+    ctl.chars.set(0);
+    ctl.in_table.set(false);
+    // `window.find` searches the whole page, so leaving find open here would
+    // let Enter start selecting toolbar chrome.
+    ctl.find_open.set(false);
+    ctl.replace_open.set(false);
+    ctl.match_count.set(0);
+    push_status(ctl);
+}
+
+/// One step of the quit sequence. The backend emits a single
+/// `close-requested` however many documents are dirty, so the frontend walks
+/// them one at a time, re-entering through `perform_pending`.
+fn close_window_step(ctl: Ctl) {
+    let next = ctl
+        .docs
+        .with_value(|d| d.iter().position(|doc| doc.dirty.get_untracked()));
+    match next {
+        Some(i) => {
+            switch_to(ctl, i);
+            ctl.pending.set(Some(Pending::CloseWindow));
+        }
+        None => spawn_local(async move {
             let _ = tauri_api::invoke_no_args("force_close").await;
         }),
     }
 }
 
-fn guarded(ctl: Ctl, p: Pending) {
-    if ctl.dirty.get_untracked() {
-        ctl.pending.set(Some(p));
-    } else {
-        perform_pending(ctl, p);
+/// Wraps around; a single tab is a no-op.
+fn cycle_tab(ctl: Ctl, delta: isize) {
+    let n = ctl.docs.with_value(Vec::len);
+    if n < 2 {
+        return;
+    }
+    let cur = ctl.active.get_untracked().unwrap_or(0) as isize;
+    let n = n as isize;
+    let next = ((cur + delta) % n + n) % n;
+    switch_to(ctl, next as usize);
+}
+
+/// Show the `»` button only when the strip actually overflows. The button's
+/// width is permanently reserved in CSS (`visibility`, not `display`), so
+/// revealing it cannot shrink the strip and create the overflow that
+/// justified it — that feedback loop flickers at a knife-edge window width.
+fn recompute_overflow(ctl: Ctl) {
+    let Some(strip) = ctl.tabstrip_ref.get_untracked() else {
+        return;
+    };
+    let el: &Element = strip.unchecked_ref();
+    let over = el.scroll_width() > el.client_width();
+    if ctl.tabs_overflow.get_untracked() != over {
+        ctl.tabs_overflow.set(over);
+    }
+}
+
+/// Keep the active tab in view, scrolling only when it is actually outside
+/// the strip (`scroll_into_view` re-aligns even when it is already visible).
+fn scroll_active_tab_into_view(ctl: Ctl) {
+    let Some(strip) = ctl.tabstrip_ref.get_untracked() else {
+        return;
+    };
+    let Ok(Some(tab)) = strip.query_selector(".tab.active") else {
+        return;
+    };
+    let Some(tab) = tab.dyn_ref::<web_sys::HtmlElement>() else {
+        return;
+    };
+    // `.tabstrip` is `position: relative`, so offset_left is already a
+    // strip-content coordinate directly comparable to scroll_left.
+    let (l, w) = (tab.offset_left(), tab.offset_width());
+    let strip: &Element = strip.unchecked_ref();
+    let (sl, cw) = (strip.scroll_left(), strip.client_width());
+    if l < sl {
+        strip.set_scroll_left(l);
+    } else if l + w > sl + cw {
+        strip.set_scroll_left(l + w - cw);
     }
 }
 
@@ -1438,13 +1973,27 @@ fn do_action(ctl: Ctl, action: &str) {
     if !dedup_ok(action) {
         return;
     }
+    // With no document open, only the actions that *create* one are live.
+    // Everything else would act on an editor that isn't there: `save` would
+    // write an empty file over a real path, `select_all` would select the
+    // toolbar, `find` would run `window.find` over the app chrome.
+    if !has_doc_now(ctl) && !matches!(action, "new" | "open" | "import_html" | "import_docx") {
+        return;
+    }
     match action {
-        "new" => guarded(ctl, Pending::New),
-        "open" => guarded(ctl, Pending::Open),
-        "import_html" => guarded(ctl, Pending::ImportHtml),
-        "import_docx" => guarded(ctl, Pending::ImportDocx),
+        "new" => do_new(ctl),
+        "open" => do_open(ctl),
+        "import_html" => do_import_html(ctl),
+        "import_docx" => do_import_docx(ctl),
         "save" => do_save(ctl, false, None),
         "save_as" => do_save(ctl, true, None),
+        "close_tab" => {
+            if let Some(id) = active_id(ctl) {
+                close_tab(ctl, id);
+            }
+        }
+        "next_tab" => cycle_tab(ctl, 1),
+        "prev_tab" => cycle_tab(ctl, -1),
         "undo" => history_undo(ctl),
         "redo" => history_redo(ctl),
         "select_all" => {
@@ -1479,6 +2028,9 @@ fn tb_btn(
         <button
             class=format!("tb-btn {class}")
             title=tip
+            // One line disables all 20 format and table buttons in the empty
+            // frame.
+            prop:disabled=move || !has_doc(ctl)
             on:mousedown=|e| e.prevent_default()
             on:click=move |_| do_action(ctl, action)
         >
@@ -1519,38 +2071,83 @@ pub fn App() -> impl IntoView {
         hist: StoredValue::new(Hist::default()),
         can_undo: RwSignal::new(false),
         can_redo: RwSignal::new(false),
+        last_status: StoredValue::new(None),
+        docs: StoredValue::new(Vec::new()),
+        tabs: RwSignal::new(Vec::new()),
+        active: RwSignal::new(None),
+        next_id: StoredValue::new(0),
+        switch_gen: StoredValue::new(0),
+        tab_menu: RwSignal::new(None),
+        tabs_overflow: RwSignal::new(false),
+        tabstrip_ref: NodeRef::new(),
+        owner: StoredValue::new_local(Owner::current()),
     };
+
+    // The first document exists before the view does: `sync_active_doc`
+    // indexes `docs[active]`, and the editor's init effect must not run
+    // against an empty tab list.
+    let first = make_doc(ctl, 0, "Untitled", "", false);
+    ctl.docs.update_value(|d| d.push(first));
+    ctl.next_id.set_value(1);
+    ctl.active.set(Some(0));
+    publish_tabs(ctl);
 
     // Track whether the caret sits inside a table (drives the table toolbar
     // group).
     {
-        let cb = Closure::<dyn FnMut()>::new(move || update_in_table(ctl));
+        let cb = Closure::<dyn FnMut()>::new(move || {
+            if has_doc_now(ctl) {
+                update_in_table(ctl);
+            }
+        });
         let _ = document()
             .add_event_listener_with_callback("selectionchange", cb.as_ref().unchecked_ref());
         cb.forget();
     }
 
-    // Initialize the editor element once it exists.
+    // Per-webview execCommand defaults. Seeding "<p><br></p>" and resetting
+    // history used to live here; those are *document* concerns now and belong
+    // to `new_tab` -> `load_markdown` and to `activate`, which set the
+    // innerHTML themselves. Leaving them here would let a re-fire wipe the
+    // undo stack of whichever document was being installed.
     Effect::new(move |_| {
-        if let Some(el) = ctl.editor_ref.get() {
-            exec_val("defaultParagraphSeparator", "p");
-            exec_val("styleWithCSS", "false");
-            if el.child_element_count() == 0 {
-                el.set_inner_html("<p><br></p>");
-                history_reset(ctl);
-            }
+        let Some(el) = ctl.editor_ref.get() else {
+            return;
+        };
+        exec_val("defaultParagraphSeparator", "p");
+        exec_val("styleWithCSS", "false");
+        if el.child_element_count() == 0 {
+            el.set_inner_html("<p><br></p>");
+            history_reset(ctl);
+        }
+        if has_doc_now(ctl) {
             let _ = el.focus();
         }
+    });
+
+    // Keep the active tab in view, and re-measure the strip when the tab list
+    // or the window changes. Layout is only settled next frame.
+    Effect::new(move |_| {
+        let _ = ctl.tabs.get();
+        let _ = ctl.active.get();
+        request_animation_frame(move || {
+            scroll_active_tab_into_view(ctl);
+            recompute_overflow(ctl);
+        });
+    });
+    // A resize can push the active tab out of view without the tab list
+    // changing at all, so it re-runs both.
+    window_event_listener(leptos::ev::resize, move |_| {
+        scroll_active_tab_into_view(ctl);
+        recompute_overflow(ctl);
     });
 
     // Load a CLI-passed file and hook up backend events.
     spawn_local(async move {
         match tauri_api::invoke_no_args("init_doc").await {
             Ok(v) => {
-                if let Some(info) = tauri_api::parse_file_info(v) {
-                    load_markdown(ctl, &info.content);
-                    ctl.doc_name.set(info.name);
-                    ctl.doc_path.set(info.path);
+                for info in tauri_api::parse_file_infos(v) {
+                    open_document(ctl, info);
                 }
             }
             // A file named on the command line that can't be read would
@@ -1567,7 +2164,7 @@ pub fn App() -> impl IntoView {
         tauri_api::listen("menu", menu_cb.as_ref().unchecked_ref()).await;
         menu_cb.forget();
         let close_cb = Closure::<dyn FnMut(JsValue)>::new(move |_ev: JsValue| {
-            ctl.pending.set(Some(Pending::Close));
+            close_window_step(ctl);
         });
         tauri_api::listen("close-requested", close_cb.as_ref().unchecked_ref()).await;
         close_cb.forget();
@@ -1575,12 +2172,9 @@ pub fn App() -> impl IntoView {
         // file association while we're running.
         let drop_cb = Closure::<dyn FnMut(JsValue)>::new(move |ev: JsValue| {
             if let Ok(p) = js_sys::Reflect::get(&ev, &JsValue::from_str("payload")) {
-                if let Some(path) = p.as_string() {
-                    if ctl.dirty.get_untracked() {
-                        ctl.pending.set(Some(Pending::OpenPath(path)));
-                    } else {
-                        do_open_path(ctl, path);
-                    }
+                // Opening never discards anything now, so no dirty gate.
+                for path in tauri_api::parse_paths(p) {
+                    do_open_path(ctl, path);
                 }
             }
         });
@@ -1630,6 +2224,14 @@ pub fn App() -> impl IntoView {
             ("o", false, false) => "open",
             ("s", false, false) => "save",
             ("s", true, false) => "save_as",
+            ("w", false, false) => "close_tab",
+            // Ctrl+Tab is unreliable as a *native* accelerator on WebKitGTK
+            // (focus traversal eats it), so it lives here; the menu carries
+            // PageUp/PageDown for discoverability.
+            ("tab", false, false) => "next_tab",
+            ("tab", true, false) => "prev_tab",
+            ("pagedown", false, false) => "next_tab",
+            ("pageup", false, false) => "prev_tab",
             ("z", false, false) => "undo",
             ("z", true, false) => "redo",
             ("y", false, false) => "redo",
@@ -1686,7 +2288,9 @@ pub fn App() -> impl IntoView {
         if focused_mermaid_source().is_some() {
             return;
         }
-        if e.key() == "Tab" {
+        // The modifier check matters: without it Ctrl+Tab indents a list here
+        // and the window listener never sees the tab-cycling shortcut.
+        if e.key() == "Tab" && !e.ctrl_key() && !e.meta_key() {
             e.prevent_default();
             history_commit(ctl);
             let in_li = selection_in("li");
@@ -1780,7 +2384,7 @@ pub fn App() -> impl IntoView {
     };
 
     let on_ta_keydown = move |e: web_sys::KeyboardEvent| {
-        if e.key() == "Tab" && !e.shift_key() {
+        if e.key() == "Tab" && !e.shift_key() && !e.ctrl_key() && !e.meta_key() {
             e.prevent_default();
             ta_replace_selection(ctl, "  ");
         }
@@ -1891,6 +2495,7 @@ pub fn App() -> impl IntoView {
                     class="tb-btn tb-mode"
                     class:active=move || mode_is(Mode::Source)
                     title="Toggle markdown source (Ctrl+Shift+M)"
+                    prop:disabled=move || !has_doc(ctl)
                     on:mousedown=|e| e.prevent_default()
                     on:click=move |_| do_action(ctl, "toggle_mode")
                 >
@@ -1898,7 +2503,85 @@ pub fn App() -> impl IntoView {
                 </button>
             </div>
 
-            <div class="findbar" class:hidden=move || !ctl.find_open.get()>
+            <div class="tabbar" class:hidden=move || !has_doc(ctl)>
+                <div class="tabstrip" node_ref=ctl.tabstrip_ref>
+                    <For each=move || ctl.tabs.get() key=|t| t.id let(tab)>
+                        <div
+                            class="tab"
+                            class:active=move || active_id(ctl) == Some(tab.id)
+                            class:dirty=move || tab.dirty.get()
+                            title=move || {
+                                let p = index_of(ctl, tab.id)
+                                    .and_then(|i| ctl.docs.with_value(|d| d.get(i).map(|x| x.path)))
+                                    .map(|s| s.get())
+                                    .unwrap_or_default();
+                                if p.is_empty() {
+                                    format!("{} — unsaved", tab.name.get())
+                                } else {
+                                    p
+                                }
+                            }
+                            // Keep the selection inside the editor: it is the
+                            // caret we are about to stash, and a bare click on
+                            // the strip would collapse it to offset 0.
+                            on:mousedown=move |e: web_sys::MouseEvent| {
+                                match e.button() {
+                                    // Middle click closes. preventDefault here
+                                    // (not on auxclick) beats X11 autoscroll.
+                                    1 => {
+                                        e.prevent_default();
+                                        close_tab(ctl, tab.id);
+                                    }
+                                    0 => {
+                                        e.prevent_default();
+                                        switch_to_id(ctl, tab.id);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            on:auxclick=|e: web_sys::MouseEvent| e.prevent_default()
+                        >
+                            <span class="tab-name">{move || tab.name.get()}</span>
+                            <button
+                                class="tab-x"
+                                title="Close (Ctrl+W)"
+                                on:mousedown=move |e: web_sys::MouseEvent| {
+                                    e.stop_propagation();
+                                    e.prevent_default();
+                                }
+                                on:click=move |e: web_sys::MouseEvent| {
+                                    e.stop_propagation();
+                                    close_tab(ctl, tab.id);
+                                }
+                            ></button>
+                        </div>
+                    </For>
+                </div>
+                <button
+                    class="tb-btn tab-more"
+                    class:invisible=move || !ctl.tabs_overflow.get()
+                    title="All open documents"
+                    on:mousedown=|e: web_sys::MouseEvent| e.prevent_default()
+                    on:click=move |e: web_sys::MouseEvent| {
+                        let Some(el) = e
+                            .current_target()
+                            .and_then(|t| t.dyn_into::<Element>().ok()) else { return };
+                        let r = el.get_bounding_client_rect();
+                        let vw = window()
+                            .inner_width()
+                            .ok()
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(800.0);
+                        // Anchored from the right so the menu grows leftward
+                        // and can never spill off-screen.
+                        ctl.tab_menu.set(Some(((vw - r.right()).max(4.0), r.bottom() + 2.0)));
+                    }
+                >
+                    "»"
+                </button>
+            </div>
+
+            <div class="findbar" class:hidden=move || !ctl.find_open.get() || !has_doc(ctl)>
                 <input
                     type="text"
                     class="find-input"
@@ -1963,9 +2646,17 @@ pub fn App() -> impl IntoView {
             <div class="editor-wrap">
                 <div
                     class="editor wysiwyg markdown-body"
-                    class:hidden=move || !mode_is(Mode::Wysiwyg)
-                    contenteditable="true"
+                    class:hidden=move || !mode_is(Mode::Wysiwyg) || !has_doc(ctl)
+                    // Not merely hidden: an editor that is momentarily visible
+                    // or Tab-reachable must not accept typing into a document
+                    // that does not exist.
+                    contenteditable=move || if has_doc(ctl) { "true" } else { "false" }
                     spellcheck="true"
+                    // Never move this behind a <Show>. NodeRef has no unmount
+                    // hook (`load` is its only writer), so unmounting would
+                    // leave `editor_el` returning a *detached* element
+                    // forever, and every `if let Some(el)` guard in this file
+                    // would pass and then write into nothing.
                     node_ref=ctl.editor_ref
                     on:input=on_editor_input
                     on:beforeinput=on_before_input
@@ -1980,7 +2671,8 @@ pub fn App() -> impl IntoView {
                 ></div>
                 <textarea
                     class="editor source"
-                    class:hidden=move || !mode_is(Mode::Source)
+                    class:hidden=move || !mode_is(Mode::Source) || !has_doc(ctl)
+                    prop:disabled=move || !has_doc(ctl)
                     spellcheck="false"
                     node_ref=ctl.ta_ref
                     prop:value=move || ctl.source.get()
@@ -1995,21 +2687,50 @@ pub fn App() -> impl IntoView {
                     on:keydown=on_ta_keydown
                     on:paste=on_ta_paste
                 ></textarea>
+                <Show when=move || !has_doc(ctl)>
+                    <div class="empty-state">
+                        <p class="empty-hint">"No document open"</p>
+                        <div class="empty-actions">
+                            <button
+                                class="btn primary"
+                                on:mousedown=|e: web_sys::MouseEvent| e.prevent_default()
+                                on:click=move |_| do_action(ctl, "new")
+                            >
+                                "New document"
+                            </button>
+                            <button
+                                class="btn"
+                                on:mousedown=|e: web_sys::MouseEvent| e.prevent_default()
+                                on:click=move |_| do_action(ctl, "open")
+                            >
+                                "Open…"
+                            </button>
+                        </div>
+                        // Honest: DragDrop is a native window event, so it
+                        // fires over this div exactly as over the editor.
+                        <p class="empty-sub">"or drop a Markdown file here"</p>
+                    </div>
+                </Show>
             </div>
 
             <div class="statusbar">
                 <span class="status-path">
                     {move || {
+                        if !has_doc(ctl) {
+                            return "No document".to_string();
+                        }
                         let p = ctl.doc_path.get();
                         if p.is_empty() { "unsaved".to_string() } else { p }
                     }}
                 </span>
                 <span class="tb-spacer"></span>
-                <span>{move || format!("{} words", ctl.words.get())}</span>
-                <span class="status-sep">"·"</span>
-                <span>{move || format!("{} chars", ctl.chars.get())}</span>
-                <span class="status-sep">"·"</span>
-                <span>{move || if mode_is(Mode::Source) { "Markdown" } else { "WYSIWYG" }}</span>
+                <span class="status-metrics" class:hidden=move || !has_doc(ctl)>
+                    <span>{move || format!("{} words", ctl.words.get())}</span>
+                    <span class="status-sep">"·"</span>
+                    <span>{move || format!("{} chars", ctl.chars.get())}</span>
+                    <span class="status-sep">"·"</span>
+                    <span>{move || if mode_is(Mode::Source) { "Markdown" } else { "WYSIWYG" }}</span>
+                </span>
             </div>
 
             <Show when=move || ctl.ctx_menu.get().is_some()>
@@ -2039,6 +2760,43 @@ pub fn App() -> impl IntoView {
                 </div>
             </Show>
 
+            <Show when=move || ctl.tab_menu.get().is_some()>
+                <div
+                    class="ctx-backdrop"
+                    on:mousedown=move |_| ctl.tab_menu.set(None)
+                    on:contextmenu=move |e: web_sys::MouseEvent| {
+                        e.prevent_default();
+                        ctl.tab_menu.set(None);
+                    }
+                ></div>
+                <div
+                    class="ctxmenu tabmenu"
+                    style=move || {
+                        let (right, top) = ctl.tab_menu.get().unwrap_or((6.0, 75.0));
+                        format!("right:{right}px;top:{top}px")
+                    }
+                >
+                    <For each=move || ctl.tabs.get() key=|t| t.id let(tab)>
+                        <button
+                            class="ctx-item"
+                            class:active=move || active_id(ctl) == Some(tab.id)
+                            on:click=move |_| {
+                                ctl.tab_menu.set(None);
+                                switch_to_id(ctl, tab.id);
+                            }
+                        >
+                            {move || {
+                                format!(
+                                    "{}{}",
+                                    if tab.dirty.get() { "• " } else { "" },
+                                    tab.name.get(),
+                                )
+                            }}
+                        </button>
+                    </For>
+                </div>
+            </Show>
+
             <Show when=move || ctl.pending.get().is_some()>
                 <div class="overlay">
                     <div class="modal">
@@ -2064,8 +2822,16 @@ pub fn App() -> impl IntoView {
                                 on:click=move |_| {
                                     let p = ctl.pending.get_untracked();
                                     ctl.pending.set(None);
-                                    if let Some(p) = p {
-                                        perform_pending(ctl, p);
+                                    match p {
+                                        Some(Pending::CloseTab(id)) => close_tab_forced(ctl, id),
+                                        // Clearing dirty first is what ends
+                                        // the walk: otherwise the next step
+                                        // finds this same document forever.
+                                        Some(Pending::CloseWindow) => {
+                                            mark_clean(ctl);
+                                            close_window_step(ctl);
+                                        }
+                                        None => {}
                                     }
                                 }
                             >

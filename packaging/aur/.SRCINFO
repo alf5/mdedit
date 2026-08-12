@@ -1,6 +1,6 @@
 pkgbase = mdedit
 	pkgdesc = A WYSIWYG Markdown editor built with Tauri and Leptos
-	pkgver = 0.1.7
+	pkgver = 0.2.0
 	pkgrel = 1
 	url = https://github.com/alf5/mdedit
 	install = mdedit.install

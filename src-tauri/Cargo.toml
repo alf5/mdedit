@@ -1,6 +1,6 @@
 [package]
 name = "mdedit"
-version = "0.3.0"
+version = "0.4.0"
 description = "A WYSIWYG Markdown editor built with Tauri and Leptos"
 authors = ["alf5"]
 edition = "2021"

@@ -7,6 +7,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{Element, HtmlTextAreaElement};
 
+use crate::export;
 use crate::history::{self, Snap};
 use crate::markdown::to_html;
 use crate::serialize::{dom_to_markdown, html_to_markdown};
@@ -87,6 +88,13 @@ struct Ctl {
     tab_menu: RwSignal<Option<(f64, f64)>>,
     tabs_overflow: RwSignal<bool>,
     tabstrip_ref: NodeRef<html::Div>,
+    /// Id of the document whose "changed on disk" prompt is showing. An id
+    /// rather than a bool because the answer is applied asynchronously, by
+    /// which time the active tab may have moved.
+    disk_modal: RwSignal<Option<u32>>,
+    /// Last path set pushed to the watcher; suppresses redundant IPC the same
+    /// way `last_status` does.
+    last_watched: StoredValue<Vec<String>>,
     /// The app's root reactive owner. A `Doc`'s signals must be created under
     /// it rather than under whatever owner happens to be current: a tab
     /// opened from the empty-state button would otherwise belong to that
@@ -109,6 +117,14 @@ struct Doc {
     /// Empty for a never-saved document; the save target.
     path: RwSignal<String>,
     dirty: RwSignal<bool>,
+    /// The file changed on disk and the user hasn't answered for it yet. Only
+    /// the active document is ever prompted about, so a background tab carries
+    /// this until you switch to it.
+    stale: RwSignal<bool>,
+    /// The markdown this tab and its file last agreed on — set on open, save,
+    /// reload and merge. The common ancestor of a three-way merge, and
+    /// meaningless (empty) for a document with no path.
+    base: String,
     /// Content, mode and caret as verbatim HTML — never markdown. Round-
     /// tripping through `dom_to_markdown` would quietly rewrite the document
     /// on every tab switch.
@@ -126,6 +142,7 @@ struct TabView {
     id: u32,
     name: RwSignal<String>,
     dirty: RwSignal<bool>,
+    stale: RwSignal<bool>,
 }
 
 #[derive(Default)]
@@ -404,6 +421,10 @@ fn load_markdown(ctl: Ctl, md: &str) {
 /// single document changing, and missing that means the app either prompts on
 /// quit forever or quits with unsaved work.
 fn push_status(ctl: Ctl) {
+    // Ahead of the early return below, and self-deduping: every open, close,
+    // save and Save As passes through here, and those are exactly the moments
+    // the watched set changes.
+    sync_watched(ctl);
     let name = ctl.doc_name.get_untracked();
     let dirty = ctl.dirty.get_untracked();
     let any_dirty = dirty
@@ -678,16 +699,36 @@ fn do_save(ctl: Ctl, save_as: bool, then: Option<Pending>) {
         // The backend no longer tracks "the current document", so the target
         // comes from the tab.
         let path = Some(ctl.doc_path.get_untracked()).filter(|p| !p.is_empty());
-        let args = serde_wasm_bindgen::to_value(&SaveArgs { content, path }).unwrap();
+        let args = serde_wasm_bindgen::to_value(&SaveArgs {
+            content: content.clone(),
+            path,
+        })
+        .unwrap();
         let cmd = if save_as { "save_doc_as" } else { "save_doc" };
         match tauri_api::invoke(cmd, args).await {
             Ok(v) => {
-                if let Some(info) = tauri_api::parse_file_info(v) {
+                let Some(r) = tauri_api::parse::<tauri_api::SaveResult>(v) else {
+                    return;
+                };
+                if r.conflict {
+                    // Nothing was written: the file moved under us and the
+                    // watcher hadn't told us yet. Ask before anything is lost,
+                    // and drop `then` — a quit must not step past this.
+                    if let Some(id) = active_doc_id(ctl) {
+                        set_stale(ctl, id, true);
+                    }
+                    maybe_prompt_disk(ctl);
+                    return;
+                }
+                if let Some(info) = r.file {
                     // Name and path first: `mark_clean` pushes the title, and
                     // Save As renames the tab.
                     ctl.doc_name.set(info.name);
                     ctl.doc_path.set(info.path);
                     mark_clean(ctl);
+                    // Editor and file agree again — the baseline for any
+                    // later merge.
+                    set_doc_base(ctl, &content);
                     if let Some(p) = then {
                         perform_pending(ctl, p);
                     }
@@ -732,6 +773,7 @@ fn open_document(ctl: Ctl, info: tauri_api::FileInfo) {
         load_markdown(ctl, &info.content);
         ctl.doc_name.set(info.name);
         ctl.doc_path.set(info.path);
+        set_doc_base(ctl, &info.content);
         mark_clean(ctl);
         return;
     }
@@ -767,11 +809,302 @@ fn do_import_docx(ctl: Ctl) {
     });
 }
 
+/// Write the document out as a standalone HTML file.
+///
+/// The body comes from whichever half of the editor is live, so this exports
+/// what is on screen rather than what is on disk. In WYSIWYG mode that is the
+/// rendered DOM itself — no markdown round-trip, so nothing `dom_to_markdown`
+/// normalizes away can go missing on the way out.
+fn do_export_html(ctl: Ctl) {
+    // A diagram open for editing keeps its source in a textarea's value
+    // property, which `inner_html` does not serialize — the same reason
+    // `stash_active` quiesces before it snapshots.
+    quiesce(ctl);
+    let body = match ctl.mode.get_untracked() {
+        Mode::Wysiwyg => match editor_el(ctl) {
+            Some(el) => export::body_from_editor(el.unchecked_ref::<Element>()),
+            None => return,
+        },
+        Mode::Source => {
+            let md = ta_el(ctl).map(|t| t.value()).unwrap_or_default();
+            export::body_from_markdown(&md)
+        }
+    };
+    let content = export::build_document(&ctl.doc_name.get_untracked(), &body);
+    // The tab's path only seeds the dialog's directory and filename: an export
+    // never overwrites the markdown, and never becomes the tab's own path.
+    let path = Some(ctl.doc_path.get_untracked()).filter(|p| !p.is_empty());
+    spawn_local(async move {
+        let args = serde_wasm_bindgen::to_value(&SaveArgs { content, path }).unwrap();
+        if let Err(e) = tauri_api::invoke("export_html", args).await {
+            report_backend_error("Could not export file", &e);
+        }
+    });
+}
+
 fn perform_pending(ctl: Ctl, p: Pending) {
     match p {
         Pending::CloseTab(id) => close_tab_forced(ctl, id),
         Pending::CloseWindow => close_window_step(ctl),
     }
+}
+
+// ---------- changes on disk ----------
+
+/// Tell the backend which files to watch. Deduped like `push_status`: it rides
+/// on every status push, and most of those are keystrokes.
+fn sync_watched(ctl: Ctl) {
+    let paths: Vec<String> = ctl.docs.with_value(|d| {
+        d.iter()
+            .map(|x| x.path.get_untracked())
+            .filter(|p| !p.is_empty())
+            .collect()
+    });
+    if ctl.last_watched.with_value(|w| *w == paths) {
+        return;
+    }
+    ctl.last_watched.set_value(paths.clone());
+    spawn_local(async move {
+        let args = serde_wasm_bindgen::to_value(&tauri_api::PathsArgs { paths }).unwrap();
+        let _ = tauri_api::invoke("watch_paths", args).await;
+    });
+}
+
+/// The markdown the active tab and its file last agreed on.
+fn doc_base(ctl: Ctl) -> String {
+    let Some(i) = ctl.active.get_untracked() else {
+        return String::new();
+    };
+    ctl.docs
+        .with_value(|d| d.get(i).map(|x| x.base.clone()))
+        .unwrap_or_default()
+}
+
+/// Record a new agreement point: after an open, a save, a reload or a merge.
+fn set_doc_base(ctl: Ctl, md: &str) {
+    let Some(i) = ctl.active.get_untracked() else {
+        return;
+    };
+    ctl.docs.update_value(|d| {
+        if let Some(x) = d.get_mut(i) {
+            x.base = md.to_string();
+        }
+    });
+}
+
+fn set_stale(ctl: Ctl, id: u32, stale: bool) {
+    let Some(sig) = index_of(ctl, id).and_then(|i| {
+        ctl.docs
+            .with_value(|d| d.get(i).map(|x| x.stale))
+    }) else {
+        return;
+    };
+    if sig.get_untracked() != stale {
+        sig.set(stale);
+    }
+}
+
+fn active_doc_id(ctl: Ctl) -> Option<u32> {
+    let i = ctl.active.get_untracked()?;
+    ctl.docs.with_value(|d| d.get(i).map(|x| x.id))
+}
+
+/// A watched file changed underneath its tab.
+fn on_disk_changed(ctl: Ctl, path: String) {
+    let Some(i) = ctl
+        .docs
+        .with_value(|d| d.iter().position(|x| x.path.get_untracked() == path))
+    else {
+        return;
+    };
+    let Some(stale) = ctl.docs.with_value(|d| d.get(i).map(|x| x.stale)) else {
+        return;
+    };
+    // One unanswered question per file: a burst of filesystem events, or a
+    // second external save while the prompt is already up, is still one prompt.
+    if stale.get_untracked() {
+        return;
+    }
+    stale.set(true);
+    maybe_prompt_disk(ctl);
+}
+
+/// Prompt only about the document being looked at. A background tab keeps its
+/// marker and asks when you switch to it — yanking you to a tab you weren't
+/// editing, mid-keystroke, is worse than waiting.
+fn maybe_prompt_disk(ctl: Ctl) {
+    // One modal at a time, and never over an unanswered question about
+    // something else.
+    if ctl.disk_modal.get_untracked().is_some()
+        || ctl.pending.get_untracked().is_some()
+        || ctl.url_modal.get_untracked().is_some()
+    {
+        return;
+    }
+    let Some(i) = ctl.active.get_untracked() else {
+        return;
+    };
+    let Some((id, stale)) = ctl
+        .docs
+        .with_value(|d| d.get(i).map(|x| (x.id, x.stale)))
+    else {
+        return;
+    };
+    if stale.get_untracked() {
+        ctl.disk_modal.set(Some(id));
+    }
+}
+
+/// Close the prompt and hand back the document it was about, made active so
+/// the answer lands on it. `None` means there is nothing to do — the tab was
+/// closed while the prompt was up.
+fn take_disk_target(ctl: Ctl) -> Option<(u32, String)> {
+    let id = ctl.disk_modal.get_untracked()?;
+    let Some(i) = index_of(ctl, id) else {
+        ctl.disk_modal.set(None);
+        return None;
+    };
+    // Switch *before* clearing: `activate` re-prompts for a stale document,
+    // and the modal still being open is what stops it re-opening the very
+    // prompt being answered.
+    switch_to(ctl, i);
+    ctl.disk_modal.set(None);
+    let path = ctl.doc_path.get_untracked();
+    if path.is_empty() {
+        return None;
+    }
+    // Answered, so the marker goes now; it comes back if the answer fails.
+    set_stale(ctl, id, false);
+    Some((id, path))
+}
+
+/// Make `id` active again after an await, or report that it is gone. Every
+/// answer to the prompt is a round trip, and a tab switch can happen inside it.
+fn focus_doc(ctl: Ctl, id: u32) -> bool {
+    match index_of(ctl, id) {
+        Some(i) => {
+            switch_to(ctl, i);
+            true
+        }
+        None => false,
+    }
+}
+
+/// Swap the whole document's content, in place and undoably. Unlike
+/// `load_markdown` this keeps the undo stack, so a reload or a merge can be
+/// taken back.
+fn replace_document(ctl: Ctl, md: &str) {
+    // An open diagram's source lives in a textarea we are about to replace.
+    quiesce(ctl);
+    history_commit(ctl);
+    match ctl.mode.get_untracked() {
+        Mode::Wysiwyg => {
+            if let Some(el) = editor_el(ctl) {
+                let html = to_html(md);
+                el.set_inner_html(if html.is_empty() { "<p><br></p>" } else { &html });
+                enable_checkboxes(ctl);
+            }
+        }
+        Mode::Source => {
+            if let Some(ta) = ta_el(ctl) {
+                ta.set_value(md);
+            }
+            ctl.source.set(md.to_string());
+        }
+    }
+    recount(ctl);
+    history_sync(ctl);
+    history_flags(ctl);
+}
+
+/// Throw away the tab's version and take the file's.
+fn disk_reload(ctl: Ctl) {
+    let Some((id, path)) = take_disk_target(ctl) else {
+        return;
+    };
+    spawn_local(async move {
+        let args = serde_wasm_bindgen::to_value(&tauri_api::PathArgs { path }).unwrap();
+        match tauri_api::invoke("reload_doc", args).await {
+            Ok(v) => {
+                let Some(info) = tauri_api::parse_file_info(v) else {
+                    return;
+                };
+                if !focus_doc(ctl, id) {
+                    return;
+                }
+                replace_document(ctl, &info.content);
+                set_doc_base(ctl, &info.content);
+                mark_clean(ctl);
+            }
+            Err(e) => {
+                set_stale(ctl, id, true);
+                report_backend_error("Could not reload file", &e);
+            }
+        }
+    });
+}
+
+/// Combine both versions against the content they last had in common.
+fn disk_merge(ctl: Ctl) {
+    let Some((id, path)) = take_disk_target(ctl) else {
+        return;
+    };
+    let args = tauri_api::MergeArgs {
+        path,
+        base: doc_base(ctl),
+        mine: current_markdown(ctl),
+    };
+    spawn_local(async move {
+        let args = serde_wasm_bindgen::to_value(&args).unwrap();
+        match tauri_api::invoke("merge_doc", args).await {
+            Ok(v) => {
+                let Some(r) = tauri_api::parse::<tauri_api::MergeResult>(v) else {
+                    return;
+                };
+                if !focus_doc(ctl, id) {
+                    return;
+                }
+                // Conflict markers are line noise in a rendered view, and
+                // resolving them is a text edit — so hand over the text.
+                if r.conflicted && ctl.mode.get_untracked() == Mode::Wysiwyg {
+                    toggle_mode(ctl);
+                }
+                replace_document(ctl, &r.text);
+                // The file's content is what the two now have in common: a
+                // later change on disk merges against this, not against what
+                // the tab was opened with.
+                set_doc_base(ctl, &r.disk);
+                mark_dirty(ctl);
+            }
+            Err(e) => {
+                set_stale(ctl, id, true);
+                report_backend_error("Could not merge file", &e);
+            }
+        }
+    });
+}
+
+/// Leave the tab alone. The file's new contents become the baseline anyway, so
+/// this same change is never raised twice — and the tab goes dirty, because it
+/// no longer matches the file and saving it will overwrite.
+fn disk_keep(ctl: Ctl) {
+    let Some((id, path)) = take_disk_target(ctl) else {
+        return;
+    };
+    spawn_local(async move {
+        let args = serde_wasm_bindgen::to_value(&tauri_api::PathArgs { path }).unwrap();
+        match tauri_api::invoke("ack_disk_change", args).await {
+            Ok(_) => {
+                if focus_doc(ctl, id) {
+                    mark_dirty(ctl);
+                }
+            }
+            Err(e) => {
+                set_stale(ctl, id, true);
+                report_backend_error("Could not re-check file", &e);
+            }
+        }
+    });
 }
 
 // ---------- tabs ----------
@@ -795,6 +1128,7 @@ fn publish_tabs(ctl: Ctl) {
                 id: doc.id,
                 name: doc.name,
                 dirty: doc.dirty,
+                stale: doc.stale,
             })
             .collect::<Vec<_>>()
     });
@@ -935,6 +1269,8 @@ fn activate(ctl: Ctl, i: usize) {
     recount(ctl);
     history_flags(ctl);
     push_status(ctl);
+    // A tab whose file changed while it sat in the background asks now.
+    maybe_prompt_disk(ctl);
 
     let generation = ctl.switch_gen.get_value().wrapping_add(1);
     ctl.switch_gen.set_value(generation);
@@ -974,6 +1310,8 @@ fn make_doc(ctl: Ctl, id: u32, name: &str, path: &str, dirty: bool) -> Doc {
         name: RwSignal::new(name.to_string()),
         path: RwSignal::new(path.to_string()),
         dirty: RwSignal::new(dirty),
+        stale: RwSignal::new(false),
+        base: String::new(),
         snap: Snap::Wys {
             html: String::new(),
             caret: 0,
@@ -1003,6 +1341,9 @@ fn new_tab(ctl: Ctl, name: &str, path: &str, md: &str, dirty: bool) {
     ctl.active.set(Some(i));
     ctl.doc_name.set(name.to_string());
     ctl.doc_path.set(path.to_string());
+    // What this tab and its file agree on right now. An import or a new
+    // document has no file, and the empty baseline is never consulted.
+    set_doc_base(ctl, md);
     ctl.hist.set_value(Hist::default());
     // Mode is inherited: someone working in Markdown gets a Markdown tab.
     // `load_markdown` is mode-aware and resets history.
@@ -1205,6 +1546,11 @@ fn close_overlays(ctl: Ctl) -> bool {
         closed = true;
     } else if ctl.pending.get_untracked().is_some() {
         ctl.pending.set(None);
+        closed = true;
+    } else if ctl.disk_modal.get_untracked().is_some() {
+        // Dismissed, not answered: the tab keeps its marker and asks again
+        // when you come back to it.
+        ctl.disk_modal.set(None);
         closed = true;
     } else if ctl.find_open.get_untracked() {
         ctl.find_open.set(false);
@@ -1987,6 +2333,7 @@ fn do_action(ctl: Ctl, action: &str) {
         "import_docx" => do_import_docx(ctl),
         "save" => do_save(ctl, false, None),
         "save_as" => do_save(ctl, true, None),
+        "export_html" => do_export_html(ctl),
         "close_tab" => {
             if let Some(id) = active_id(ctl) {
                 close_tab(ctl, id);
@@ -2080,6 +2427,8 @@ pub fn App() -> impl IntoView {
         tab_menu: RwSignal::new(None),
         tabs_overflow: RwSignal::new(false),
         tabstrip_ref: NodeRef::new(),
+        disk_modal: RwSignal::new(None),
+        last_watched: StoredValue::new(Vec::new()),
         owner: StoredValue::new_local(Owner::current()),
     };
 
@@ -2180,6 +2529,16 @@ pub fn App() -> impl IntoView {
         });
         tauri_api::listen("drop-open", drop_cb.as_ref().unchecked_ref()).await;
         drop_cb.forget();
+        // A file open in a tab was changed by something else.
+        let disk_cb = Closure::<dyn FnMut(JsValue)>::new(move |ev: JsValue| {
+            if let Ok(p) = js_sys::Reflect::get(&ev, &JsValue::from_str("payload")) {
+                if let Some(path) = p.as_string() {
+                    on_disk_changed(ctl, path);
+                }
+            }
+        });
+        tauri_api::listen("disk-changed", disk_cb.as_ref().unchecked_ref()).await;
+        disk_cb.forget();
     });
 
     // Global shortcuts (also reachable via native menu accelerators; the
@@ -2224,6 +2583,7 @@ pub fn App() -> impl IntoView {
             ("o", false, false) => "open",
             ("s", false, false) => "save",
             ("s", true, false) => "save_as",
+            ("e", true, false) => "export_html",
             ("w", false, false) => "close_tab",
             // Ctrl+Tab is unreliable as a *native* accelerator on WebKitGTK
             // (focus traversal eats it), so it lives here; the menu carries
@@ -2510,15 +2870,21 @@ pub fn App() -> impl IntoView {
                             class="tab"
                             class:active=move || active_id(ctl) == Some(tab.id)
                             class:dirty=move || tab.dirty.get()
+                            class:stale=move || tab.stale.get()
                             title=move || {
                                 let p = index_of(ctl, tab.id)
                                     .and_then(|i| ctl.docs.with_value(|d| d.get(i).map(|x| x.path)))
                                     .map(|s| s.get())
                                     .unwrap_or_default();
-                                if p.is_empty() {
+                                let base = if p.is_empty() {
                                     format!("{} — unsaved", tab.name.get())
                                 } else {
                                     p
+                                };
+                                if tab.stale.get() {
+                                    format!("{base}\nChanged on disk")
+                                } else {
+                                    base
                                 }
                             }
                             // Keep the selection inside the editor: it is the
@@ -2839,6 +3205,43 @@ pub fn App() -> impl IntoView {
                             </button>
                             <button class="btn" on:click=move |_| ctl.pending.set(None)>
                                 "Cancel"
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </Show>
+
+            <Show when=move || ctl.disk_modal.get().is_some()>
+                <div class="overlay">
+                    <div class="modal">
+                        <p class="modal-title">
+                            {move || format!("{} changed on disk", ctl.doc_name.get())}
+                        </p>
+                        <p class="modal-sub">
+                            {move || {
+                                if ctl.dirty.get() {
+                                    "Another program wrote to this file while you had \
+                                     unsaved changes. Reloading discards yours; merging \
+                                     combines both and marks any clashes."
+                                } else {
+                                    "Another program wrote to this file. Reloading picks \
+                                     up its contents."
+                                }
+                            }}
+                        </p>
+                        <div class="modal-btns">
+                            <button class="btn primary" on:click=move |_| disk_reload(ctl)>
+                                "Reload"
+                            </button>
+                            // Nothing to merge in a document with no local
+                            // edits: the merge would just be the reload.
+                            <Show when=move || ctl.dirty.get()>
+                                <button class="btn" on:click=move |_| disk_merge(ctl)>
+                                    "Merge"
+                                </button>
+                            </Show>
+                            <button class="btn" on:click=move |_| disk_keep(ctl)>
+                                "Keep Mine"
                             </button>
                         </div>
                     </div>

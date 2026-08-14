@@ -61,6 +61,9 @@
         });
       })();
     </script>
+    <!-- document.css first: it defines the color variables styles.css uses,
+         and it is the same file src/export.rs embeds into exported HTML. -->
+    <link data-trunk rel="css" href="document.css" />
     <link data-trunk rel="css" href="styles.css" />
     <link
       data-trunk

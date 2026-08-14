@@ -1,61 +1,7 @@
-:root {
-  --bg: #ffffff;
-  --bg-soft: #f6f8fa;
-  --bg-raised: #ffffff;
-  --border: #d1d9e0;
-  --text: #1f2328;
-  --text-muted: #59636e;
-  --accent: #0969da;
-  --accent-text: #ffffff;
-  --code-bg: #f0f1f3;
-  --quote-border: #d1d9e0;
-  --danger: #d1242f;
-  --shadow: 0 8px 24px rgba(31, 35, 40, 0.15);
-  color-scheme: light dark;
 
-  /* Mermaid diagram palette — read by the SVG's presentation attributes,
-     so a diagram re-colors on a scheme change without being re-rendered. */
-  --mmd-fg: #1f2328;
-  --mmd-fg-muted: #59636e;
-  --mmd-bg: transparent;
-  --mmd-node-fill: #ececff;
-  --mmd-node-stroke: #9370db;
-  --mmd-edge: #59636e;
-  --mmd-label-bg: #f0f1f3;
-  --mmd-note-fill: #fff5ad;
-  --mmd-note-stroke: #aaaa33;
-  --mmd-cluster-fill: #f6f8fa;
-  --mmd-cluster-stroke: #d1d9e0;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0d1117;
-    --bg-soft: #151b23;
-    --bg-raised: #1c2129;
-    --border: #3d444d;
-    --text: #f0f6fc;
-    --text-muted: #9198a1;
-    --accent: #4493f8;
-    --accent-text: #0d1117;
-    --code-bg: #1c2129;
-    --quote-border: #3d444d;
-    --danger: #f85149;
-    --shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
-
-    --mmd-fg: #f0f6fc;
-    --mmd-fg-muted: #9198a1;
-    --mmd-bg: transparent;
-    --mmd-node-fill: #2b2b45;
-    --mmd-node-stroke: #a780e0;
-    --mmd-edge: #9198a1;
-    --mmd-label-bg: #1c2129;
-    --mmd-note-fill: #3b3b22;
-    --mmd-note-stroke: #aaaa55;
-    --mmd-cluster-fill: #151b23;
-    --mmd-cluster-stroke: #3d444d;
-  }
-}
+/* App chrome only. The color variables and the rendered-document styles live
+   in `document.css`, which is linked first and is also embedded into exported
+   HTML — so don't move anything the export needs in here. */
 
 * {
   box-sizing: border-box;
@@ -340,6 +286,21 @@ body {
   font-size: 11px;
 }
 
+/* A file that changed underneath its tab. Only the tab you are on gets the
+   prompt, so a background tab has to show that it is holding a question — and
+   it goes on the left, because the right-hand slot is the dirty dot and a
+   document can easily be both. "≠" over something more pictorial because it
+   is a WGL4 character: the symbol-font fallback that rescues an arrow glyph
+   in Chromium is not a given in WebKitGTK. */
+.tab.stale::before {
+  content: "≠";
+  flex: 0 0 auto;
+  color: var(--danger);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+}
+
 .tab-more {
   align-self: center;
   flex: 0 0 auto;
@@ -429,136 +390,23 @@ body {
   white-space: pre-wrap;
 }
 
-/* ---------- markdown typography (GitHub-flavored) ---------- */
-
-.markdown-body {
-  max-width: 860px;
-  margin: 0 auto;
-  width: 100%;
-  line-height: 1.6;
-  word-wrap: break-word;
-}
-
-.markdown-body h1,
-.markdown-body h2,
-.markdown-body h3,
-.markdown-body h4,
-.markdown-body h5,
-.markdown-body h6 {
-  margin-top: 24px;
-  margin-bottom: 16px;
-  font-weight: 600;
-  line-height: 1.25;
-}
-
-.markdown-body h1 {
-  font-size: 2em;
-  padding-bottom: 0.3em;
-  border-bottom: 1px solid var(--border);
-}
-
-.markdown-body h2 {
-  font-size: 1.5em;
-  padding-bottom: 0.3em;
-  border-bottom: 1px solid var(--border);
-}
-
-.markdown-body h3 {
-  font-size: 1.25em;
-}
-
-.markdown-body h4 {
-  font-size: 1em;
-}
-
-.markdown-body h5 {
-  font-size: 0.875em;
-}
-
-.markdown-body h6 {
-  font-size: 0.85em;
-  color: var(--text-muted);
-}
-
-.markdown-body p,
-.markdown-body div {
-  margin-top: 0;
-  margin-bottom: 16px;
-}
-
-.markdown-body code {
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
-    monospace;
-  font-size: 85%;
-  background: var(--code-bg);
-  padding: 0.2em 0.4em;
-  border-radius: 6px;
-}
-
-.markdown-body pre {
-  background: var(--bg-soft);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 16px;
-  overflow-x: auto;
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
-    monospace;
-  font-size: 85%;
-  line-height: 1.45;
-  margin-bottom: 16px;
-  white-space: pre-wrap;
-}
-
-.markdown-body pre code {
-  background: transparent;
-  padding: 0;
-  font-size: 100%;
-}
-
-/* ---------- mermaid diagrams ---------- */
-
-.markdown-body .mermaid-diagram {
-  margin: 0 0 16px 0;
-  padding: 12px;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  text-align: center;
-  overflow-x: auto;
+/* Diagram editing affordances. Scoped to `.editor` rather than living beside
+   the diagram's own styles in `document.css`, so an exported document doesn't
+   invite clicks that do nothing. */
+.editor .mermaid-diagram {
   /* The caret must not land inside the SVG; the block is edited by clicking
      it, which swaps in a source textarea. */
   user-select: none;
   cursor: pointer;
 }
 
-.markdown-body .mermaid-diagram:hover {
+.editor .mermaid-diagram:hover {
   border-color: var(--border);
   background: var(--bg-soft);
 }
 
-.markdown-body .mermaid-diagram svg {
-  max-width: 100%;
-  height: auto;
-  font-family: inherit;
-}
-
-.markdown-body .mermaid-error {
-  text-align: left;
-  cursor: pointer;
-  border-color: var(--danger);
-}
-
-.markdown-body .mermaid-error-msg {
-  margin: 0 0 8px 0;
-  color: var(--danger);
-  font-size: 90%;
-}
-
-.markdown-body .mermaid-error pre {
-  margin-bottom: 0;
-}
-
 /* The source editor swapped in when a diagram is clicked. */
-.markdown-body .mermaid-source {
+.editor .mermaid-source {
   display: block;
   width: 100%;
   margin: 0 0 16px 0;
@@ -574,132 +422,6 @@ body {
   resize: vertical;
 }
 
-.markdown-body blockquote {
-  margin: 0 0 16px 0;
-  padding: 0 1em;
-  color: var(--text-muted);
-  border-left: 0.25em solid var(--quote-border);
-}
-
-.markdown-body blockquote > :last-child {
-  margin-bottom: 0;
-}
-
-/* GFM alerts */
-.markdown-body blockquote[class*="markdown-alert-"] {
-  color: var(--text);
-}
-
-.markdown-body .markdown-alert-note {
-  border-left-color: #0969da;
-}
-
-.markdown-body .markdown-alert-tip {
-  border-left-color: #1a7f37;
-}
-
-.markdown-body .markdown-alert-important {
-  border-left-color: #8250df;
-}
-
-.markdown-body .markdown-alert-warning {
-  border-left-color: #9a6700;
-}
-
-.markdown-body .markdown-alert-caution {
-  border-left-color: #d1242f;
-}
-
-.markdown-body ul,
-.markdown-body ol {
-  margin-top: 0;
-  margin-bottom: 16px;
-  padding-left: 2em;
-}
-
-.markdown-body li {
-  margin-top: 0.25em;
-}
-
-.markdown-body li > input[type="checkbox"] {
-  margin: 0 0.35em 0.25em -1.4em;
-  vertical-align: middle;
-  accent-color: var(--accent);
-}
-
-.markdown-body li:has(> input[type="checkbox"]) {
-  list-style-type: none;
-}
-
-.markdown-body table {
-  border-collapse: collapse;
-  border-spacing: 0;
-  margin-bottom: 16px;
-  display: block;
-  max-width: 100%;
-  overflow-x: auto;
-}
-
-.markdown-body table th,
-.markdown-body table td {
-  border: 1px solid var(--border);
-  padding: 6px 13px;
-  min-width: 40px;
-}
-
-.markdown-body table th {
-  font-weight: 600;
-  background: var(--bg-soft);
-}
-
-.markdown-body table tr:nth-child(2n) td {
-  background: var(--bg-soft);
-}
-
-.markdown-body img {
-  max-width: 100%;
-}
-
-.markdown-body a {
-  color: var(--accent);
-  text-decoration: none;
-}
-
-.markdown-body a:hover {
-  text-decoration: underline;
-}
-
-.markdown-body hr {
-  height: 0.25em;
-  padding: 0;
-  margin: 24px 0;
-  background-color: var(--border);
-  border: 0;
-  border-radius: 2px;
-}
-
-.markdown-body .footnote-definition {
-  font-size: 0.9em;
-  color: var(--text-muted);
-  border-top: 1px solid var(--border);
-  padding-top: 8px;
-  margin-bottom: 8px;
-}
-
-.markdown-body .footnote-definition p {
-  display: inline;
-  margin: 0;
-}
-
-.markdown-body .footnote-definition-label {
-  font-weight: 600;
-  margin-right: 6px;
-}
-
-.markdown-body sup.footnote-reference a {
-  font-size: 0.85em;
-  font-weight: 600;
-}
 
 /* ---------- status bar ---------- */
 

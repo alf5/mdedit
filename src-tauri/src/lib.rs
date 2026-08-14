@@ -1,4 +1,5 @@
 mod docx;
+mod watch;
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -64,9 +65,13 @@ fn file_name_of(path: &Path) -> String {
 /// can recognise "this file is already open in a tab" by string comparison —
 /// without it, the same file reached by two routes would open twice, and the
 /// two tabs would race to write it.
-fn read_file(path: PathBuf) -> Result<FileInfo, String> {
+///
+/// Every read is also a sync point: this is the moment the editor's copy and
+/// the file agree, so it is the moment to stamp for change detection.
+fn read_file(app: &AppHandle, path: PathBuf) -> Result<FileInfo, String> {
     let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let path = path.canonicalize().unwrap_or(path);
+    watch::record(app, &path, &content);
     Ok(FileInfo {
         name: file_name_of(&path),
         path: path.display().to_string(),
@@ -90,7 +95,7 @@ fn init_doc(app: AppHandle, state: State<AppState>) -> Vec<FileInfo> {
         .filter(|a| !a.starts_with('-'))
         .map(PathBuf::from)
         .chain(pending)
-        .filter_map(|p| read_file(p).ok())
+        .filter_map(|p| read_file(&app, p).ok())
         .collect();
     let paths: Vec<PathBuf> = loaded.iter().map(|f| PathBuf::from(&f.path)).collect();
     push_recent(&app, &paths);
@@ -100,7 +105,7 @@ fn init_doc(app: AppHandle, state: State<AppState>) -> Vec<FileInfo> {
 /// Open a concrete path (drag & drop, OS file association, recent files).
 #[tauri::command]
 fn open_path(app: AppHandle, path: String) -> Result<Option<FileInfo>, String> {
-    match read_file(PathBuf::from(&path)) {
+    match read_file(&app, PathBuf::from(&path)) {
         Ok(info) => {
             push_recent(&app, &[PathBuf::from(&info.path)]);
             Ok(Some(info))
@@ -159,7 +164,11 @@ async fn open_doc(app: AppHandle) -> Result<Vec<FileInfo>, String> {
     };
     let loaded: Vec<FileInfo> = files
         .into_iter()
-        .map(|fp| fp.into_path().map_err(|e| e.to_string()).and_then(read_file))
+        .map(|fp| {
+            fp.into_path()
+                .map_err(|e| e.to_string())
+                .and_then(|p| read_file(&app, p))
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let paths: Vec<PathBuf> = loaded.iter().map(|f| PathBuf::from(&f.path)).collect();
     push_recent(&app, &paths);
@@ -170,6 +179,9 @@ fn write_doc(app: &AppHandle, path: &Path, content: &str) -> Result<FileInfo, St
     std::fs::write(path, content).map_err(|e| e.to_string())?;
     // Canonicalize *after* the write: a Save As target need not have existed.
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    // Before `push_recent`, which touches the menu and can take a while: until
+    // this lands, the watcher would read our own write as an external change.
+    watch::record(app, &path, content);
     // Covers Save As creating a new path, and move-to-front on a plain Save.
     push_recent(app, std::slice::from_ref(&path));
     Ok(FileInfo {
@@ -179,28 +191,110 @@ fn write_doc(app: &AppHandle, path: &Path, content: &str) -> Result<FileInfo, St
     })
 }
 
+/// The outcome of a save. `file` is None when the user cancelled the dialog.
+#[derive(Serialize)]
+struct SaveResult {
+    file: Option<FileInfo>,
+    /// The file changed on disk since the editor last read or wrote it, and
+    /// **nothing was written**. The frontend prompts instead.
+    conflict: bool,
+}
+
+impl SaveResult {
+    fn saved(file: Option<FileInfo>) -> Self {
+        Self {
+            file,
+            conflict: false,
+        }
+    }
+}
+
 /// Save to `path`, or fall through to Save As when the tab has never been
-/// saved. Returns None when the user cancels the dialog.
+/// saved.
+///
+/// This is the quiet path — no dialog, no confirmation — so it is the one that
+/// can silently destroy someone else's work. It refuses to write over a file
+/// that changed underneath us; the frontend then offers reload / merge / keep,
+/// and whichever the user picks re-stamps the file so the next save goes
+/// through. Save As is deliberately not guarded: its dialog already asks
+/// before replacing an existing file.
 #[tauri::command]
 async fn save_doc(
     app: AppHandle,
     content: String,
     path: Option<String>,
-) -> Result<Option<FileInfo>, String> {
+) -> Result<SaveResult, String> {
     match path.as_deref().filter(|p| !p.is_empty()) {
-        Some(p) => write_doc(&app, Path::new(p), &content).map(Some),
+        Some(p) if watch::changed(&app, Path::new(p)) => Ok(SaveResult {
+            file: None,
+            conflict: true,
+        }),
+        Some(p) => write_doc(&app, Path::new(p), &content).map(|f| SaveResult::saved(Some(f))),
         None => save_doc_as(app, content, None).await,
     }
 }
 
+/// Re-read a file that changed on disk, discarding whatever the tab holds.
+#[tauri::command]
+fn reload_doc(app: AppHandle, path: String) -> Result<FileInfo, String> {
+    read_file(&app, PathBuf::from(path))
+}
+
+/// Accept the file's current contents as the new baseline without touching the
+/// editor: "keep mine". The tab stays as it is, but its unsaved state is now
+/// measured against what is on disk *now*, so the next save is not blocked by
+/// a change the user has already seen and decided about.
+#[tauri::command]
+fn ack_disk_change(app: AppHandle, path: String) -> Result<(), String> {
+    let path = PathBuf::from(path);
+    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    watch::record(&app, &path, &content);
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct MergeResult {
+    /// The merged document, with conflict markers if it came to that.
+    text: String,
+    /// The file's contents, which become the tab's new merge baseline.
+    disk: String,
+    conflicted: bool,
+}
+
+/// Three-way merge the editor's text with the file's, against `base` — the
+/// content both last agreed on. Merging accepts the file's current state as
+/// the new baseline, so this re-stamps it exactly as a reload would.
+#[tauri::command]
+fn merge_doc(app: AppHandle, path: String, base: String, mine: String) -> Result<MergeResult, String> {
+    let path = PathBuf::from(path);
+    let disk = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let (text, conflicted) = watch::merge(&base, &mine, &disk);
+    watch::record(&app, &path, &disk);
+    Ok(MergeResult {
+        text,
+        disk,
+        conflicted,
+    })
+}
+
+/// The set of files to watch — every tab that has one, replacing the previous
+/// set. Pushed by the frontend, which owns the tab list.
+#[tauri::command]
+fn watch_paths(app: AppHandle, paths: Vec<String>) {
+    let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+    watch::set_paths(&app, &paths);
+}
+
 /// `path` is the tab's current path, used only for the dialog's default
-/// filename and starting directory.
+/// filename and starting directory. Shares `SaveResult` with `save_doc` so the
+/// frontend reads one shape whichever it called; `conflict` is never set here,
+/// because the dialog has already asked about replacing the chosen file.
 #[tauri::command]
 async fn save_doc_as(
     app: AppHandle,
     content: String,
     path: Option<String>,
-) -> Result<Option<FileInfo>, String> {
+) -> Result<SaveResult, String> {
     let current = path.as_deref().filter(|p| !p.is_empty()).map(Path::new);
     let name = current
         .map(file_name_of)
@@ -214,10 +308,42 @@ async fn save_doc_as(
         dialog = dialog.set_directory(dir);
     }
     let Some(fp) = dialog.blocking_save_file() else {
+        return Ok(SaveResult::saved(None));
+    };
+    let path = fp.into_path().map_err(|e| e.to_string())?;
+    write_doc(&app, &path, &content).map(|f| SaveResult::saved(Some(f)))
+}
+
+/// Write the frontend's standalone HTML rendering of the document wherever the
+/// user points. `path` is the tab's markdown path, used only to seed the
+/// dialog: an export never touches the markdown file and never re-targets the
+/// tab, so — unlike `write_doc` — this deliberately stays out of the recent
+/// files list, which is a list of documents to *open*.
+#[tauri::command]
+async fn export_html(
+    app: AppHandle,
+    content: String,
+    path: Option<String>,
+) -> Result<Option<String>, String> {
+    let current = path.as_deref().filter(|p| !p.is_empty()).map(Path::new);
+    let name = current
+        .and_then(Path::file_stem)
+        .map(|s| format!("{}.html", s.to_string_lossy()))
+        .unwrap_or_else(|| "Untitled.html".to_string());
+    let mut dialog = app
+        .dialog()
+        .file()
+        .add_filter("HTML", &["html", "htm"])
+        .set_file_name(&name);
+    if let Some(dir) = current.and_then(Path::parent) {
+        dialog = dialog.set_directory(dir);
+    }
+    let Some(fp) = dialog.blocking_save_file() else {
         return Ok(None);
     };
     let path = fp.into_path().map_err(|e| e.to_string())?;
-    write_doc(&app, &path, &content).map(Some)
+    std::fs::write(&path, content).map_err(|e| e.to_string())?;
+    Ok(Some(path.display().to_string()))
 }
 
 /// The frontend owns the tab list, so it drives the title: `name`/`dirty`
@@ -500,6 +626,13 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<MenuHandles> 
     let save = MenuItem::with_id(app, "save", "Save", true, Some("CmdOrCtrl+S"))?;
     let save_as = MenuItem::with_id(app, "save_as", "Save As…", true, Some("CmdOrCtrl+Shift+S"))?;
     let close_tab = MenuItem::with_id(app, "close_tab", "Close Tab", true, Some("CmdOrCtrl+W"))?;
+    let export = MenuItem::with_id(
+        app,
+        "export_html",
+        "Export as HTML…",
+        true,
+        Some("CmdOrCtrl+Shift+E"),
+    )?;
 
     let file_menu = Submenu::with_id_and_items(
         app,
@@ -515,6 +648,7 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<MenuHandles> 
             &PredefinedMenuItem::separator(app)?,
             &save,
             &save_as,
+            &export,
             &PredefinedMenuItem::separator(app)?,
             &close_tab,
             &PredefinedMenuItem::separator(app)?,
@@ -653,7 +787,7 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<MenuHandles> 
     Ok(MenuHandles {
         menu,
         recent: recent_menu,
-        doc_items: vec![save, save_as, close_tab],
+        doc_items: vec![save, save_as, export, close_tab],
         doc_menus: vec![insert_menu, format_menu],
     })
 }
@@ -723,9 +857,11 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState(Mutex::new(DocState::default())))
+        .manage(watch::Watch::default())
         .invoke_handler(tauri::generate_handler![
-            init_doc, open_doc, open_path, import_html, import_docx, save_doc,
-            save_doc_as, set_title, force_close, show_about
+            init_doc, open_doc, open_path, import_html, import_docx, export_html, save_doc,
+            save_doc_as, set_title, force_close, show_about, watch_paths, reload_doc, merge_doc,
+            ack_disk_change
         ])
         .setup(|app| {
             let handle = app.handle();
@@ -784,6 +920,17 @@ pub fn run() {
                     api.prevent_close();
                     let _ = window.emit("close-requested", ());
                 }
+            }
+            // The safety net under the filesystem watcher: inotify and its
+            // equivalents miss changes on network and fuse mounts, and a
+            // directory that couldn't be armed sends nothing at all. Coming
+            // back to the window is exactly when someone has just finished
+            // editing the file somewhere else.
+            WindowEvent::Focused(true) => {
+                let app = window.app_handle().clone();
+                // Stat-ing every open file could block on a stalled mount, and
+                // this runs on the UI thread.
+                std::thread::spawn(move || watch::check_all(&app));
             }
             WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => {
                 // Every markdown file in the drop becomes a tab. The frontend

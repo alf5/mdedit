@@ -35,8 +35,8 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
 - **Formatting toolbar**: bold, italic, strikethrough, inline code, headings,
   bullet/numbered/task lists, blockquote, code block, links, images, tables,
   horizontal rules — works in both WYSIWYG and source mode.
-- **Native menus**: File (New / Open / Open Recent / Save / Save As / Close
-  Tab / Quit), Edit (undo, redo, clipboard, Find / Replace), View (source
+- **Native menus**: File (New / Open / Open Recent / Save / Save As / Export
+  as HTML / Close Tab / Quit), Edit (undo, redo, clipboard, Find / Replace), View (source
   toggle, next/previous document), Insert (link, image, table, mermaid
   diagram, hr, table rows/columns), Format, Help.
 - **Table editing**: insert row above/below and column left/right, delete
@@ -63,6 +63,25 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
   (pure-Rust OOXML parser — headings, bold/italic/strikethrough,
   hyperlinks, nested bullet/numbered lists, tables, quotes, line breaks;
   images, footnotes and TOC field machinery are skipped).
+- **External change detection**: if something else writes to an open file — a
+  `git pull`, another editor, a script — the tab says so and asks what to do:
+  **Reload** (take the file's version), **Merge** (three-way merge against
+  what the tab and the file last agreed on, with `<<<<<<<` conflict markers
+  and a drop into source mode when the two really clash), or **Keep Mine**.
+  Only the tab you are on is asked; a background tab carries a `≠` marker
+  until you switch to it, and `Esc` postpones the question. A plain **Save**
+  will not overwrite a file that changed underneath it — it asks the same
+  question instead. Rewrites that leave the content identical (`touch`, a
+  no-op save, a `git checkout` of the same bytes) are ignored.
+- **HTML export**: **File → Export as HTML…** (`Ctrl/Cmd+Shift+E`) writes one
+  self-contained `.html` file — the stylesheet is embedded and every mermaid
+  diagram is already inline SVG, so it opens offline in any browser with no
+  scripts, fonts or network fetches, and follows the reader's light/dark
+  preference. Diagrams keep their source in a `data-mermaid` attribute, so an
+  exported file re-imported through **Import HTML** comes back as
+  ```` ```mermaid ```` fences rather than unrecoverable SVG. Relative image
+  links are left as written, so they resolve when the `.html` is saved beside
+  the markdown it came from.
 
 ## Keyboard shortcuts
 
@@ -72,6 +91,7 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
 | `Ctrl/Cmd+O` | Open file (in a new tab) |
 | `Ctrl/Cmd+S` | Save |
 | `Ctrl/Cmd+Shift+S` | Save As |
+| `Ctrl/Cmd+Shift+E` | Export as HTML |
 | `Ctrl/Cmd+W` | Close tab |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous document |
 | `Ctrl/Cmd+PageDown` / `PageUp` | Next / previous document |

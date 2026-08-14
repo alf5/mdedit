@@ -46,12 +46,44 @@ pub struct PathArgs {
     pub path: String,
 }
 
+#[derive(Serialize)]
+pub struct PathsArgs {
+    pub paths: Vec<String>,
+}
+
+/// A three-way merge request: `base` is the content the tab and the file last
+/// agreed on, `mine` is the editor's.
+#[derive(Serialize)]
+pub struct MergeArgs {
+    pub path: String,
+    pub base: String,
+    pub mine: String,
+}
+
+#[derive(Deserialize)]
+pub struct MergeResult {
+    pub text: String,
+    pub disk: String,
+    pub conflicted: bool,
+}
+
+#[derive(Deserialize)]
+pub struct SaveResult {
+    pub file: Option<FileInfo>,
+    /// Nothing was written: the file changed on disk first.
+    pub conflict: bool,
+}
+
 pub async fn invoke_no_args(cmd: &str) -> Result<JsValue, JsValue> {
     invoke(cmd, JsValue::UNDEFINED).await
 }
 
 pub fn parse_file_info(v: JsValue) -> Option<FileInfo> {
     serde_wasm_bindgen::from_value::<Option<FileInfo>>(v).ok().flatten()
+}
+
+pub fn parse<T: serde::de::DeserializeOwned>(v: JsValue) -> Option<T> {
+    serde_wasm_bindgen::from_value::<T>(v).ok()
 }
 
 pub fn parse_file_infos(v: JsValue) -> Vec<FileInfo> {

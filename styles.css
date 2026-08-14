@@ -363,6 +363,242 @@ body {
   opacity: 0.75;
 }
 
+/* ---------- project pane ---------- */
+
+/* The row the pane and the editor share. min-height:0 is what lets both of
+   them scroll instead of stretching the page. */
+.body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+/* The tabs, the findbar and the editor, to the right of the pane. min-width:0
+   again: without it a long tab title would push the pane off-screen. */
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.project {
+  flex: 0 0 230px;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  background: var(--bg-soft);
+  border-right: 1px solid var(--border);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.project-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 34px;
+  padding: 0 4px 0 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+/* Its own class rather than `.tab-x`, which carries a ✕ in a pseudo-element. */
+.project-btn {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.project-btn:hover {
+  background: var(--border);
+  color: var(--text);
+}
+
+.project-root {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-tree {
+  flex: 1;
+  overflow: auto;
+  padding: 4px 0 12px;
+}
+
+.project-empty {
+  margin: 12px auto;
+  display: block;
+}
+
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding-right: 8px;
+  font-size: 13px;
+  line-height: 22px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.tree-row:hover {
+  background: var(--bg-raised);
+}
+
+/* The file that is open in the active tab. */
+.tree-row.active {
+  color: var(--text);
+  background: var(--bg);
+}
+
+.tree-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* A disclosure triangle for directories, and the same space kept empty for
+   files so that names at one depth line up. */
+.tree-mark {
+  flex: 0 0 10px;
+  font-size: 9px;
+  color: var(--text-muted);
+}
+
+.tree-row.dir > .tree-mark::before {
+  content: "▶";
+}
+
+.tree-row.dir.open > .tree-mark::before {
+  content: "▼";
+}
+
+.tree-row.dir > .tree-name {
+  font-weight: 600;
+}
+
+/* ---------- images, hex, and files too big to show ---------- */
+
+.asset-view {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: auto;
+  padding: 20px;
+  background: var(--bg);
+}
+
+/* Fits the pane without being blown up past its own size — a 16x16 favicon
+   stays a 16x16 favicon. */
+.asset-image {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.hex-view {
+  flex: 1;
+  overflow: auto;
+  outline: none;
+  padding: 8px 0 40vh;
+  background: var(--bg);
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    monospace;
+  font-size: 13px;
+  white-space: pre;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Holds the scrollbar open for the whole file; only the rows in view exist. */
+.hex-spacer {
+  position: relative;
+}
+
+.hex-rows {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  will-change: transform;
+}
+
+/* 20px must match HEX_ROW_H in app.rs: the visible window is found by
+   dividing the scroll offset by it, not by measuring 65536 rows. */
+.hex-row {
+  display: flex;
+  gap: 16px;
+  height: 20px;
+  line-height: 20px;
+  padding: 0 16px;
+}
+
+.hex-offset {
+  color: var(--text-muted);
+}
+
+.hex-bytes,
+.hex-ascii {
+  display: flex;
+}
+
+.hex-cell {
+  width: 22px;
+  text-align: center;
+  cursor: text;
+}
+
+/* A wider gap every eight bytes, the way a hex dump is always broken up. */
+.hex-cell.gap {
+  margin-right: 8px;
+}
+
+.hex-char {
+  width: 8px;
+  text-align: center;
+  color: var(--text-muted);
+  cursor: text;
+}
+
+/* The append position, one past the last byte. Nothing is there to highlight,
+   so it gets a caret of its own. */
+.hex-eof {
+  width: 2px;
+}
+
+.hex-cell.cursor,
+.hex-char.cursor,
+.hex-eof.cursor {
+  background: var(--accent);
+  color: var(--accent-text);
+  border-radius: 2px;
+}
+
+/* Only the focused pane shows a live cursor: a highlight on an unfocused
+   grid claims keystrokes it will not receive. */
+.hex-view:not(:focus) .hex-cell.cursor,
+.hex-view:not(:focus) .hex-char.cursor,
+.hex-view:not(:focus) .hex-eof.cursor {
+  background: var(--border);
+  color: var(--text);
+}
+
 /* ---------- editor ---------- */
 
 .editor-wrap {
@@ -448,6 +684,23 @@ body {
 
 .status-sep {
   opacity: 0.5;
+}
+
+/* The hex editor's insert/overwrite indicator, which is also the third way to
+   change it — after the Insert key and Ctrl+Shift+O. */
+.status-btn {
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-raised);
+  color: var(--text);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.status-btn:hover {
+  border-color: var(--accent);
 }
 
 /* ---------- table context menu ---------- */

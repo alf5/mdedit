@@ -1,4 +1,5 @@
 mod docx;
+mod project;
 mod watch;
 
 use std::path::{Path, PathBuf};
@@ -31,6 +32,10 @@ struct DocState {
     recent_menu: Option<Submenu<Wry>>,
     /// Menu entries that mean nothing with no document open.
     doc_items: Vec<MenuItem<Wry>>,
+    /// Enabled for a document held as text.
+    text_items: Vec<MenuItem<Wry>>,
+    /// Enabled for markdown only.
+    md_items: Vec<MenuItem<Wry>>,
     doc_menus: Vec<Submenu<Wry>>,
 }
 
@@ -83,39 +88,27 @@ fn read_file(app: &AppHandle, path: PathBuf) -> Result<FileInfo, String> {
 /// frontend was up), loaded once at startup. Unreadable paths are skipped,
 /// as they were when this returned a single optional document.
 #[tauri::command]
-fn init_doc(app: AppHandle, state: State<AppState>) -> Vec<FileInfo> {
+fn init_doc(app: AppHandle, state: State<AppState>) -> Vec<project::AnyFile> {
     let pending = {
         let mut s = state.0.lock().unwrap();
         s.ready = true;
         std::mem::take(&mut s.pending_open)
     };
-    let loaded: Vec<FileInfo> = std::env::args()
-        .skip(1)
-        // macOS passes -psn_… on some launches.
-        .filter(|a| !a.starts_with('-'))
-        .map(PathBuf::from)
-        .chain(pending)
-        .filter_map(|p| read_file(&app, p).ok())
-        .collect();
-    let paths: Vec<PathBuf> = loaded.iter().map(|f| PathBuf::from(&f.path)).collect();
-    push_recent(&app, &paths);
-    loaded
+    read_args(
+        &app,
+        std::env::args()
+            .skip(1)
+            // macOS passes -psn_… on some launches.
+            .filter(|a| !a.starts_with('-'))
+            .map(PathBuf::from)
+            .chain(pending),
+    )
 }
 
-/// Open a concrete path (drag & drop, OS file association, recent files).
-#[tauri::command]
-fn open_path(app: AppHandle, path: String) -> Result<Option<FileInfo>, String> {
-    match read_file(&app, PathBuf::from(&path)) {
-        Ok(info) => {
-            push_recent(&app, &[PathBuf::from(&info.path)]);
-            Ok(Some(info))
-        }
-        Err(e) => {
-            // Covers permission changes that a bare `exists()` cannot see.
-            forget_recent(&app, &path);
-            Err(e)
-        }
-    }
+/// Files named on the command line, whatever they are. Unreadable paths are
+/// skipped, as they were when this only knew about markdown.
+fn read_args(app: &AppHandle, paths: impl Iterator<Item = PathBuf>) -> Vec<project::AnyFile> {
+    paths.filter_map(|p| open_file(app.clone(), p.display().to_string()).ok()).collect()
 }
 
 /// Pick an HTML file and return its raw contents; the frontend converts it
@@ -234,10 +227,65 @@ async fn save_doc(
     }
 }
 
-/// Re-read a file that changed on disk, discarding whatever the tab holds.
+/// Read any path in the project tree — markdown, text, image or binary — and
+/// stamp it for change detection. Also serves reloads, so a file that changed
+/// on disk comes back through the same door it went in by, whatever it is.
 #[tauri::command]
-fn reload_doc(app: AppHandle, path: String) -> Result<FileInfo, String> {
-    read_file(&app, PathBuf::from(path))
+fn open_file(app: AppHandle, path: String) -> Result<project::AnyFile, String> {
+    let canonical = project::canonical(&path);
+    let file = match project::read_any(&canonical) {
+        Ok(f) => f,
+        Err(e) => {
+            // Covers a recent entry whose file has gone, and permission
+            // changes that a bare `exists()` cannot see.
+            forget_recent(&app, &path);
+            return Err(e);
+        }
+    };
+    match file.kind {
+        // Nothing was read, so there is nothing to stamp; an oversized file
+        // is not watched either, since it cannot be shown.
+        "oversized" => {}
+        "markdown" | "text" => {
+            watch::record(&app, &canonical, &file.text);
+            // Recents is a list of *documents*: things this is an editor for,
+            // which a picture and a binary are not.
+            push_recent(&app, std::slice::from_ref(&canonical));
+        }
+        _ => watch::record_bytes(&app, &canonical, &project::decode(&file.data)?),
+    }
+    Ok(file)
+}
+
+/// Write bytes back, for the hex editor. Same conflict guard as `save_doc`:
+/// the quiet path must not overwrite a file that moved underneath it.
+#[tauri::command]
+fn save_bytes(app: AppHandle, path: String, data: String) -> Result<SaveResult, String> {
+    let path = project::canonical(&path);
+    if watch::changed(&app, &path) {
+        return Ok(SaveResult {
+            file: None,
+            conflict: true,
+        });
+    }
+    let bytes = project::decode(&data)?;
+    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
+    watch::record_bytes(&app, &path, &bytes);
+    Ok(SaveResult::saved(Some(FileInfo {
+        name: file_name_of(&path),
+        path: path.display().to_string(),
+        content: String::new(),
+    })))
+}
+
+/// Choose the project tree's root. `None` when the dialog is cancelled.
+#[tauri::command]
+async fn pick_folder(app: AppHandle) -> Result<Option<String>, String> {
+    let Some(dir) = app.dialog().file().blocking_pick_folder() else {
+        return Ok(None);
+    };
+    let path = dir.into_path().map_err(|e| e.to_string())?;
+    Ok(Some(path.display().to_string()))
 }
 
 /// Accept the file's current contents as the new baseline without touching the
@@ -350,7 +398,16 @@ async fn export_html(
 /// describe the active tab, `any_dirty` covers every tab and gates the
 /// close-confirmation prompt. An empty `name` means no document is open.
 #[tauri::command]
-fn set_title(app: AppHandle, state: State<AppState>, name: String, dirty: bool, any_dirty: bool) {
+#[allow(clippy::too_many_arguments)]
+fn set_title(
+    app: AppHandle,
+    state: State<AppState>,
+    name: String,
+    dirty: bool,
+    any_dirty: bool,
+    markdown: bool,
+    text: bool,
+) {
     state.0.lock().unwrap().any_dirty = any_dirty;
     if let Some(w) = app.get_webview_window("main") {
         let title = if name.is_empty() {
@@ -360,7 +417,7 @@ fn set_title(app: AppHandle, state: State<AppState>, name: String, dirty: bool, 
         };
         let _ = w.set_title(&title);
     }
-    set_doc_menus_enabled(&app, !name.is_empty());
+    set_doc_menus_enabled(&app, !name.is_empty(), markdown, text);
 }
 
 /// Close for real, bypassing the unsaved-changes check.
@@ -581,17 +638,33 @@ fn open_recent(app: &AppHandle, idx: usize) {
 /// Save / Save As / Close Tab, and the Insert and Format menus, mean nothing
 /// with no document open. A disabled item does not fire its accelerator, so
 /// this makes Ctrl+S inert structurally rather than by convention.
-fn set_doc_menus_enabled(app: &AppHandle, enabled: bool) {
-    let (items, menus) = {
+/// A disabled menu item does not fire its accelerator, which is what makes
+/// this structural rather than a matter of convention: Ctrl+B cannot reach a
+/// PNG, and Ctrl+S cannot reach an empty frame.
+fn set_doc_menus_enabled(app: &AppHandle, has_doc: bool, markdown: bool, text: bool) {
+    let (items, text_items, md_items, menus) = {
         let state = app.state::<AppState>();
         let s = state.0.lock().unwrap();
-        (s.doc_items.clone(), s.doc_menus.clone())
+        (
+            s.doc_items.clone(),
+            s.text_items.clone(),
+            s.md_items.clone(),
+            s.doc_menus.clone(),
+        )
     };
     for it in &items {
-        let _ = it.set_enabled(enabled);
+        let _ = it.set_enabled(has_doc);
+    }
+    // Save As writes text through a dialog; the hex editor writes bytes back
+    // where it found them.
+    for it in &text_items {
+        let _ = it.set_enabled(text);
+    }
+    for it in &md_items {
+        let _ = it.set_enabled(markdown);
     }
     for m in &menus {
-        let _ = m.set_enabled(enabled);
+        let _ = m.set_enabled(markdown);
     }
 }
 
@@ -600,6 +673,10 @@ struct MenuHandles {
     menu: Menu<Wry>,
     recent: Submenu<Wry>,
     doc_items: Vec<MenuItem<Wry>>,
+    /// Enabled for a document held as text.
+    text_items: Vec<MenuItem<Wry>>,
+    /// Enabled for markdown only.
+    md_items: Vec<MenuItem<Wry>>,
     doc_menus: Vec<Submenu<Wry>>,
 }
 
@@ -642,6 +719,13 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<MenuHandles> 
         &[
             &MenuItem::with_id(app, "new", "New", true, Some("CmdOrCtrl+N"))?,
             &MenuItem::with_id(app, "open", "Open…", true, Some("CmdOrCtrl+O"))?,
+            &MenuItem::with_id(
+                app,
+                "open_folder",
+                "Open Folder…",
+                true,
+                Some("CmdOrCtrl+Shift+K"),
+            )?,
             &recent_menu,
             &MenuItem::with_id(app, "import_html", "Import HTML…", true, None::<&str>)?,
             &MenuItem::with_id(app, "import_docx", "Import Word Document…", true, None::<&str>)?,
@@ -694,10 +778,29 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<MenuHandles> 
         &[
             &MenuItem::with_id(
                 app,
+                "toggle_project",
+                "Project Pane",
+                true,
+                Some("CmdOrCtrl+Shift+P"),
+            )?,
+            &PredefinedMenuItem::separator(app)?,
+            &MenuItem::with_id(
+                app,
                 "toggle_mode",
                 "Toggle Markdown Source",
                 true,
                 Some("CmdOrCtrl+Shift+M"),
+            )?,
+            // The hex editor's insert/overwrite switch. `Insert` is the key
+            // everyone reaches for and is bound in the keymap, but Apple
+            // keyboards have not had one for twenty years, so it needs a
+            // second way in that exists on every machine.
+            &MenuItem::with_id(
+                app,
+                "toggle_overwrite",
+                "Overwrite Mode (Hex)",
+                true,
+                Some("CmdOrCtrl+Shift+O"),
             )?,
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(
@@ -787,7 +890,9 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<MenuHandles> 
     Ok(MenuHandles {
         menu,
         recent: recent_menu,
-        doc_items: vec![save, save_as, export, close_tab],
+        doc_items: vec![save, close_tab],
+        text_items: vec![save_as],
+        md_items: vec![export],
         doc_menus: vec![insert_menu, format_menu],
     })
 }
@@ -859,9 +964,9 @@ pub fn run() {
         .manage(AppState(Mutex::new(DocState::default())))
         .manage(watch::Watch::default())
         .invoke_handler(tauri::generate_handler![
-            init_doc, open_doc, open_path, import_html, import_docx, export_html, save_doc,
-            save_doc_as, set_title, force_close, show_about, watch_paths, reload_doc, merge_doc,
-            ack_disk_change
+            init_doc, open_doc, import_html, import_docx, export_html, save_doc,
+            save_doc_as, set_title, force_close, show_about, watch_paths, merge_doc,
+            ack_disk_change, open_file, save_bytes, pick_folder, project::list_dir
         ])
         .setup(|app| {
             let handle = app.handle();
@@ -875,6 +980,8 @@ pub fn run() {
             s.recent = recent;
             s.recent_menu = Some(h.recent);
             s.doc_items = h.doc_items;
+            s.text_items = h.text_items;
+            s.md_items = h.md_items;
             s.doc_menus = h.doc_menus;
             Ok(())
         })

@@ -51,18 +51,18 @@ struct Inner {
 #[derive(Default)]
 pub struct Watch(Mutex<Inner>);
 
-fn hash_of(content: &str) -> u64 {
+fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut h = DefaultHasher::new();
-    content.hash(&mut h);
+    bytes.hash(&mut h);
     h.finish()
 }
 
-fn stamp_of(path: &Path, content: &str) -> Stamp {
+fn stamp_of(path: &Path, bytes: &[u8]) -> Stamp {
     let meta = std::fs::metadata(path).ok();
     Stamp {
         mtime: meta.as_ref().and_then(|m| m.modified().ok()),
         size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
-        hash: hash_of(content),
+        hash: hash_bytes(bytes),
     }
 }
 
@@ -70,7 +70,12 @@ fn stamp_of(path: &Path, content: &str) -> Stamp {
 /// every write, which is what keeps the editor's own saves from looking like
 /// external changes.
 pub fn record(app: &AppHandle, path: &Path, content: &str) {
-    let stamp = stamp_of(path, content);
+    record_bytes(app, path, content.as_bytes());
+}
+
+/// The same, for the files the editor holds as bytes rather than text.
+pub fn record_bytes(app: &AppHandle, path: &Path, bytes: &[u8]) {
+    let stamp = stamp_of(path, bytes);
     let state = app.state::<Watch>();
     let mut inner = state.0.lock().unwrap();
     inner.files.insert(path.to_path_buf(), stamp);
@@ -89,16 +94,20 @@ pub fn changed(app: &AppHandle, path: &Path) -> bool {
     differs(path, &known).is_some()
 }
 
-/// The file's current content, if it differs from `known`. Reads the file only
+/// The file's current bytes, if they differ from `known`. Reads the file only
 /// when the stat already looks different.
-fn differs(path: &Path, known: &Stamp) -> Option<String> {
+///
+/// Bytes rather than text throughout: a binary open in the hex editor deserves
+/// the same protection as a document, and `read_to_string` would simply fail
+/// on it and report "unchanged" forever.
+fn differs(path: &Path, known: &Stamp) -> Option<Vec<u8>> {
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta.modified().ok();
     if mtime == known.mtime && meta.len() == known.size {
         return None;
     }
-    let content = std::fs::read_to_string(path).ok()?;
-    (hash_of(&content) != known.hash).then_some(content)
+    let bytes = std::fs::read(path).ok()?;
+    (hash_bytes(&bytes) != known.hash).then_some(bytes)
 }
 
 /// Point the watcher at exactly these files. Paths that are no longer open
@@ -123,8 +132,8 @@ pub fn set_paths(app: &AppHandle, paths: &[PathBuf]) {
     let seeded: Vec<(PathBuf, Stamp)> = missing
         .into_iter()
         .filter_map(|p| {
-            let content = std::fs::read_to_string(&p).ok()?;
-            let stamp = stamp_of(&p, &content);
+            let bytes = std::fs::read(&p).ok()?;
+            let stamp = stamp_of(&p, &bytes);
             Some((p, stamp))
         })
         .collect();
@@ -181,7 +190,7 @@ pub fn check_all(app: &AppHandle) {
             .collect()
     };
     for (path, stamp) in known {
-        let Some(content) = differs(&path, &stamp) else {
+        let Some(bytes) = differs(&path, &stamp) else {
             continue;
         };
         // Re-check under the lock before announcing. A save that landed while
@@ -191,7 +200,7 @@ pub fn check_all(app: &AppHandle) {
         {
             let inner = state.0.lock().unwrap();
             match inner.files.get(&path) {
-                Some(cur) if cur.hash == hash_of(&content) => continue,
+                Some(cur) if cur.hash == hash_bytes(&bytes) => continue,
                 Some(cur) if *cur != stamp => continue,
                 Some(_) => {}
                 None => continue,
@@ -249,8 +258,16 @@ mod tests {
 
     #[test]
     fn identical_content_hashes_identically() {
-        assert_eq!(hash_of("# Title\n"), hash_of("# Title\n"));
-        assert_ne!(hash_of("# Title\n"), hash_of("# Title \n"));
+        assert_eq!(hash_bytes(b"# Title\n"), hash_bytes(b"# Title\n"));
+        assert_ne!(hash_bytes(b"# Title\n"), hash_bytes(b"# Title \n"));
+    }
+
+    /// Text and bytes have to agree: a markdown file is stamped from a `&str`
+    /// and a binary from a `&[u8]`, and a document that switches hands between
+    /// the two must not look changed for it.
+    #[test]
+    fn text_and_bytes_hash_the_same_content_alike() {
+        assert_eq!(hash_bytes("hello".as_bytes()), hash_bytes(b"hello"));
     }
 
     /// A directory of this test's own, so the cases below can rename files
@@ -267,7 +284,7 @@ mod tests {
         let dir = scratch("untouched");
         let f = dir.join("a.md");
         std::fs::write(&f, "one\n").unwrap();
-        let stamp = stamp_of(&f, "one\n");
+        let stamp = stamp_of(&f, b"one\n");
         assert!(differs(&f, &stamp).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -280,7 +297,7 @@ mod tests {
         let dir = scratch("same-bytes");
         let f = dir.join("a.md");
         std::fs::write(&f, "one\n").unwrap();
-        let stamp = stamp_of(&f, "one\n");
+        let stamp = stamp_of(&f, b"one\n");
         std::fs::write(&f, "one\n").unwrap();
         filetime_bump(&f);
         assert!(differs(&f, &stamp).is_none());
@@ -292,9 +309,9 @@ mod tests {
         let dir = scratch("edited");
         let f = dir.join("a.md");
         std::fs::write(&f, "one\n").unwrap();
-        let stamp = stamp_of(&f, "one\n");
+        let stamp = stamp_of(&f, b"one\n");
         std::fs::write(&f, "one\ntwo\n").unwrap();
-        assert_eq!(differs(&f, &stamp).as_deref(), Some("one\ntwo\n"));
+        assert_eq!(differs(&f, &stamp).as_deref(), Some(&b"one\ntwo\n"[..]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -305,11 +322,11 @@ mod tests {
         let dir = scratch("atomic");
         let f = dir.join("a.md");
         std::fs::write(&f, "one\n").unwrap();
-        let stamp = stamp_of(&f, "one\n");
+        let stamp = stamp_of(&f, b"one\n");
         let tmp = dir.join("a.md.tmp");
         std::fs::write(&tmp, "replaced\n").unwrap();
         std::fs::rename(&tmp, &f).unwrap();
-        assert_eq!(differs(&f, &stamp).as_deref(), Some("replaced\n"));
+        assert_eq!(differs(&f, &stamp).as_deref(), Some(&b"replaced\n"[..]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -320,7 +337,7 @@ mod tests {
         let dir = scratch("deleted");
         let f = dir.join("a.md");
         std::fs::write(&f, "one\n").unwrap();
-        let stamp = stamp_of(&f, "one\n");
+        let stamp = stamp_of(&f, b"one\n");
         std::fs::remove_file(&f).unwrap();
         assert!(differs(&f, &stamp).is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -352,7 +369,7 @@ mod tests {
         let f = dir.join("a.md");
         std::fs::write(&f, "one\n").unwrap();
         // Stamped while the two still agree, as `record` does after a read.
-        let stamp = stamp_of(&f, "one\n");
+        let stamp = stamp_of(&f, b"one\n");
 
         let (tx, rx) = mpsc::channel();
         let mut watcher =
@@ -370,7 +387,7 @@ mod tests {
         assert!(got.is_ok(), "no filesystem event within 10s");
         // The event alone means nothing — this is what the handler does with
         // it, and what decides whether the user is asked.
-        assert_eq!(differs(&f, &stamp).as_deref(), Some("replaced\n"));
+        assert_eq!(differs(&f, &stamp).as_deref(), Some(&b"replaced\n"[..]));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -39,6 +39,10 @@ pub struct TitleArgs {
     pub name: String,
     pub dirty: bool,
     pub any_dirty: bool,
+    /// The active tab holds markdown, so the formatting menus mean something.
+    pub markdown: bool,
+    /// It holds text of some kind, so Save As does.
+    pub text: bool,
 }
 
 #[derive(Serialize)]
@@ -67,6 +71,38 @@ pub struct MergeResult {
     pub conflicted: bool,
 }
 
+/// One row of a directory listing.
+#[derive(Deserialize)]
+pub struct Entry {
+    pub path: String,
+    pub name: String,
+    pub dir: bool,
+}
+
+/// Whatever the backend made of a path: markdown, plain text, an image, a
+/// binary, or too big to show.
+#[derive(Deserialize)]
+pub struct AnyFile {
+    pub path: String,
+    pub name: String,
+    pub kind: String,
+    #[serde(default)]
+    pub text: String,
+    /// Base64 — the image's bytes or the binary's.
+    #[serde(default)]
+    pub data: String,
+    #[serde(default)]
+    pub mime: String,
+    pub size: u64,
+}
+
+#[derive(Serialize)]
+pub struct BytesArgs {
+    pub path: String,
+    /// Base64.
+    pub data: String,
+}
+
 #[derive(Deserialize)]
 pub struct SaveResult {
     pub file: Option<FileInfo>,
@@ -76,10 +112,6 @@ pub struct SaveResult {
 
 pub async fn invoke_no_args(cmd: &str) -> Result<JsValue, JsValue> {
     invoke(cmd, JsValue::UNDEFINED).await
-}
-
-pub fn parse_file_info(v: JsValue) -> Option<FileInfo> {
-    serde_wasm_bindgen::from_value::<Option<FileInfo>>(v).ok().flatten()
 }
 
 pub fn parse<T: serde::de::DeserializeOwned>(v: JsValue) -> Option<T> {

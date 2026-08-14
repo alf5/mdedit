@@ -1,0 +1,10 @@
+# The default wasm stack is 1 MB, and mounting the app overflows it in a debug
+# build: `view!` renders by recursing through one deeply nested type per
+# element, and an unoptimized frame per level adds up fast. A release build has
+# frames small enough to fit, so this only ever bit `trunk serve` — which is
+# exactly where a crash is least welcome.
+#
+# The pane components in app.rs exist partly to keep that nesting shallow;
+# this is the headroom underneath them.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=-zstack-size=4194304"]

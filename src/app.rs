@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 
+use base64::prelude::{Engine, BASE64_STANDARD};
 use leptos::html;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -8,6 +9,7 @@ use wasm_bindgen::JsCast;
 use web_sys::{Element, HtmlTextAreaElement};
 
 use crate::export;
+use crate::hex;
 use crate::history::{self, Snap};
 use crate::markdown::to_html;
 use crate::serialize::{dom_to_markdown, html_to_markdown};
@@ -17,6 +19,37 @@ use crate::tauri_api::{self, SaveArgs, TitleArgs};
 enum Mode {
     Wysiwyg,
     Source,
+}
+
+/// What a tab holds. mdedit is a markdown editor, so everything else it will
+/// show is deliberately narrow: a picture, some bytes, or plain text.
+#[derive(Clone, Copy, PartialEq)]
+enum DocKind {
+    Markdown,
+    Text,
+    Image,
+    Binary,
+    /// Past the size limit for its kind. Nothing was read; the tab explains
+    /// why rather than pretending the file is empty.
+    Oversized,
+}
+
+impl DocKind {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "text" => DocKind::Text,
+            "image" => DocKind::Image,
+            "binary" => DocKind::Binary,
+            "oversized" => DocKind::Oversized,
+            _ => DocKind::Markdown,
+        }
+    }
+
+    /// Held as text, and so served by the editor pair, undo history, find and
+    /// the three-way merge.
+    fn is_text(self) -> bool {
+        matches!(self, DocKind::Markdown | DocKind::Text)
+    }
 }
 
 /// The only two operations that can still destroy unsaved work. Opening and
@@ -68,7 +101,7 @@ struct Ctl {
     can_redo: RwSignal<bool>,
     /// Last (name, dirty, any_dirty) pushed to the backend; suppresses
     /// redundant title IPC.
-    last_status: StoredValue<Option<(String, bool, bool)>>,
+    last_status: StoredValue<Option<Status>>,
     /// Every open document, in tab order. Index-addressed by `active`.
     ///
     /// Two rules, both of which bite silently when broken:
@@ -92,6 +125,35 @@ struct Ctl {
     /// rather than a bool because the answer is applied asynchronously, by
     /// which time the active tab may have moved.
     disk_modal: RwSignal<Option<u32>>,
+    // ---- the active document, beyond markdown ----
+    kind: RwSignal<DocKind>,
+    /// Bytes on disk. Only shown, but shown for every kind.
+    doc_size: RwSignal<u64>,
+    /// `data:` URL of the active image.
+    data: RwSignal<String>,
+    /// The active binary. A `StoredValue` because a megabyte of `Vec<u8>` must
+    /// not be cloned on every read, with `hex_gen` standing in as the signal
+    /// that something in it changed.
+    hex: StoredValue<hex::HexDoc>,
+    hex_gen: RwSignal<u32>,
+    /// Cursor offset in bytes, and which nibble of that byte is next.
+    hex_cursor: RwSignal<usize>,
+    hex_high: RwSignal<bool>,
+    /// Overwrite rather than insert. The default, and the safe one: it cannot
+    /// shift every offset in a structured file.
+    hex_overwrite: RwSignal<bool>,
+    /// First rendered row, and how many fit. A megabyte is 65536 rows, so only
+    /// the visible ones exist in the DOM.
+    hex_top: RwSignal<usize>,
+    hex_rows: RwSignal<usize>,
+    hex_ref: NodeRef<html::Div>,
+    // ---- the project pane ----
+    project_open: RwSignal<bool>,
+    project_root: RwSignal<String>,
+    /// The tree, flattened to its visible rows. Expanding a directory splices
+    /// its children in behind it; collapsing removes everything deeper that
+    /// follows. One `<For>`, no recursion, no nested components.
+    tree: RwSignal<Vec<TreeNode>>,
     /// Last path set pushed to the watcher; suppresses redundant IPC the same
     /// way `last_status` does.
     last_watched: StoredValue<Vec<String>>,
@@ -131,6 +193,36 @@ struct Doc {
     snap: Snap,
     scroll: i32,
     hist: Hist,
+    /// Fixed when the tab opens: nothing turns a picture into markdown.
+    kind: DocKind,
+    size: u64,
+    /// `data:` URL, for an image.
+    data: String,
+    /// Bytes and their own operation-based undo, for a binary.
+    hex: hex::HexDoc,
+}
+
+/// What the backend was last told about the active tab: the window title, and
+/// which menu items mean anything for it.
+#[derive(Clone, PartialEq)]
+struct Status {
+    name: String,
+    dirty: bool,
+    any_dirty: bool,
+    markdown: bool,
+    text: bool,
+}
+
+/// One visible row of the project tree.
+#[derive(Clone, PartialEq)]
+struct TreeNode {
+    path: String,
+    name: String,
+    dir: bool,
+    /// Nesting level: the row's indent, and how a collapse knows how much of
+    /// what follows to remove.
+    depth: usize,
+    open: bool,
 }
 
 /// The cheap `Copy` projection the tab strip iterates over. `Doc` itself can
@@ -297,6 +389,33 @@ fn utf16_len(chars: &[char]) -> u32 {
 
 // ---------- controller helpers ----------
 
+/// The mode the active document is actually shown in.
+///
+/// The WYSIWYG/source toggle is a *markdown* idea: a plain text file has no
+/// rendered form, so it is always source, whatever the toggle last said. This
+/// keeps `ctl.mode` meaning "how markdown is shown" rather than becoming a
+/// per-tab setting that a `.rs` file could leave switched the wrong way.
+fn eff_mode(ctl: Ctl) -> Mode {
+    match ctl.kind.get_untracked() {
+        DocKind::Text => Mode::Source,
+        _ => ctl.mode.get_untracked(),
+    }
+}
+
+/// Reactive counterparts, for the view.
+fn shows_wysiwyg(ctl: Ctl) -> bool {
+    has_doc(ctl) && ctl.kind.get() == DocKind::Markdown && ctl.mode.get() == Mode::Wysiwyg
+}
+
+fn shows_source(ctl: Ctl) -> bool {
+    has_doc(ctl)
+        && match ctl.kind.get() {
+            DocKind::Text => true,
+            DocKind::Markdown => ctl.mode.get() == Mode::Source,
+            _ => false,
+        }
+}
+
 fn editor_el(ctl: Ctl) -> Option<web_sys::HtmlDivElement> {
     ctl.editor_ref.get_untracked()
 }
@@ -306,7 +425,17 @@ fn ta_el(ctl: Ctl) -> Option<HtmlTextAreaElement> {
 }
 
 fn focus_current(ctl: Ctl) {
-    match ctl.mode.get_untracked() {
+    match ctl.kind.get_untracked() {
+        DocKind::Binary => {
+            if let Some(el) = ctl.hex_ref.get_untracked() {
+                let _ = el.focus();
+            }
+            return;
+        }
+        DocKind::Image | DocKind::Oversized => return,
+        _ => {}
+    }
+    match eff_mode(ctl) {
         Mode::Wysiwyg => {
             if let Some(el) = editor_el(ctl) {
                 let _ = el.focus();
@@ -337,11 +466,15 @@ fn enable_checkboxes(ctl: Ctl) {
 }
 
 fn visible_text(ctl: Ctl) -> String {
-    match ctl.mode.get_untracked() {
+    match eff_mode(ctl) {
         Mode::Wysiwyg => editor_el(ctl)
             .and_then(|e| e.text_content())
             .unwrap_or_default(),
-        Mode::Source => ta_el(ctl).map(|t| t.value()).unwrap_or_default(),
+        // The signal, not the textarea: `prop:value` is applied by a queued
+        // render effect, so just after a document is installed the element
+        // still holds the previous one's text. Every writer keeps the signal
+        // in step, so it is the version that is always current.
+        Mode::Source => ctl.source.get_untracked(),
     }
 }
 
@@ -360,13 +493,21 @@ fn diagram_texts(ctl: Ctl) -> Vec<String> {
 }
 
 fn recount(ctl: Ctl) {
+    // A picture has no words and a binary has no characters; the status bar
+    // shows their size instead.
+    if !ctl.kind.get_untracked().is_text() {
+        ctl.words.set(0);
+        ctl.chars.set(0);
+        ctl.match_count.set(0);
+        return;
+    }
     let text = visible_text(ctl);
     let mut words = text.split_whitespace().count();
     let mut chars = text.chars().count();
     // A rendered diagram contributes its node labels to the editor's
     // textContent. Those aren't prose, so take them back out (approximate at
     // the edges, where a label can run into adjacent text).
-    if ctl.mode.get_untracked() == Mode::Wysiwyg {
+    if eff_mode(ctl) == Mode::Wysiwyg {
         for t in diagram_texts(ctl) {
             words = words.saturating_sub(t.split_whitespace().count());
             chars = chars.saturating_sub(t.chars().count());
@@ -382,7 +523,7 @@ fn recount(ctl: Ctl) {
 }
 
 fn current_markdown(ctl: Ctl) -> String {
-    match ctl.mode.get_untracked() {
+    match eff_mode(ctl) {
         Mode::Wysiwyg => editor_el(ctl)
             .map(|e| dom_to_markdown(e.unchecked_ref::<Element>()))
             .unwrap_or_default(),
@@ -396,8 +537,20 @@ fn current_markdown(ctl: Ctl) -> String {
     }
 }
 
+/// What a save writes.
+///
+/// Markdown goes through the serializer, which ends the file with a newline
+/// among other tidying. A plain text file does not: appending a byte the user
+/// did not type shows up as a diff in whatever they open it with next.
+fn save_payload(ctl: Ctl) -> String {
+    match ctl.kind.get_untracked() {
+        DocKind::Text => ta_el(ctl).map(|t| t.value()).unwrap_or_default(),
+        _ => current_markdown(ctl),
+    }
+}
+
 fn load_markdown(ctl: Ctl, md: &str) {
-    match ctl.mode.get_untracked() {
+    match eff_mode(ctl) {
         Mode::Wysiwyg => {
             if let Some(el) = editor_el(ctl) {
                 let html = to_html(md);
@@ -431,8 +584,18 @@ fn push_status(ctl: Ctl) {
         || ctl
             .docs
             .with_value(|d| d.iter().any(|doc| doc.dirty.get_untracked()));
-    // Redundant IPC on every keystroke is pointless; the tuple is cheap.
-    let next = (name.clone(), dirty, any_dirty);
+    let kind = ctl.kind.get_untracked();
+    let markdown = has_doc_now(ctl) && kind == DocKind::Markdown;
+    let text = has_doc_now(ctl) && kind.is_text();
+    // Redundant IPC on every keystroke is pointless, and the comparison is
+    // cheap next to a round trip.
+    let next = Status {
+        name: name.clone(),
+        dirty,
+        any_dirty,
+        markdown,
+        text,
+    };
     if ctl.last_status.get_value().as_ref() == Some(&next) {
         return;
     }
@@ -442,6 +605,8 @@ fn push_status(ctl: Ctl) {
             name,
             dirty,
             any_dirty,
+            markdown,
+            text,
         })
         .unwrap();
         let _ = tauri_api::invoke("set_title", args).await;
@@ -461,7 +626,7 @@ fn mark_clean(ctl: Ctl) {
 }
 
 fn toggle_mode(ctl: Ctl) {
-    match ctl.mode.get_untracked() {
+    match eff_mode(ctl) {
         Mode::Wysiwyg => {
             let md = current_markdown(ctl);
             ctl.source.set(md);
@@ -487,7 +652,7 @@ fn toggle_mode(ctl: Ctl) {
 // ---------- undo / redo ----------
 
 fn capture_current(ctl: Ctl) -> Option<Snap> {
-    match ctl.mode.get_untracked() {
+    match eff_mode(ctl) {
         Mode::Wysiwyg => {
             editor_el(ctl).map(|el| history::capture_wys(el.unchecked_ref::<Element>()))
         }
@@ -500,9 +665,15 @@ fn capture_current(ctl: Ctl) -> Option<Snap> {
 }
 
 fn history_flags(ctl: Ctl) {
-    let (u, r) = ctl
-        .hist
-        .with_value(|h| (!h.undo.is_empty(), !h.redo.is_empty()));
+    let (u, r) = match ctl.kind.get_untracked() {
+        DocKind::Binary => ctl
+            .hex
+            .with_value(|h| (h.can_undo(), h.can_redo())),
+        DocKind::Image | DocKind::Oversized => (false, false),
+        _ => ctl
+            .hist
+            .with_value(|h| (!h.undo.is_empty(), !h.redo.is_empty())),
+    };
     if ctl.can_undo.get_untracked() != u {
         ctl.can_undo.set(u);
     }
@@ -563,7 +734,7 @@ fn history_reset(ctl: Ctl) {
 fn apply_snap_now(ctl: Ctl, snap: &Snap) {
     match snap {
         Snap::Wys { html, .. } => {
-            if ctl.mode.get_untracked() != Mode::Wysiwyg {
+            if eff_mode(ctl) != Mode::Wysiwyg {
                 ctl.mode.set(Mode::Wysiwyg);
             }
             if let Some(el) = editor_el(ctl) {
@@ -572,7 +743,7 @@ fn apply_snap_now(ctl: Ctl, snap: &Snap) {
             }
         }
         Snap::Src { text, .. } => {
-            if ctl.mode.get_untracked() != Mode::Source {
+            if eff_mode(ctl) != Mode::Source {
                 ctl.mode.set(Mode::Source);
             }
             ctl.source.set(text.clone());
@@ -609,14 +780,14 @@ fn restore_caret_from(ctl: Ctl, snap: &Snap) {
 /// Scroll offset of whichever surface is showing. Captured per document so a
 /// tab comes back where it was left.
 fn scroll_top(ctl: Ctl) -> i32 {
-    match ctl.mode.get_untracked() {
+    match eff_mode(ctl) {
         Mode::Wysiwyg => editor_el(ctl).map(|e| e.scroll_top()).unwrap_or(0),
         Mode::Source => ta_el(ctl).map(|t| t.scroll_top()).unwrap_or(0),
     }
 }
 
 fn set_scroll_top(ctl: Ctl, top: i32) {
-    match ctl.mode.get_untracked() {
+    match eff_mode(ctl) {
         Mode::Wysiwyg => {
             if let Some(e) = editor_el(ctl) {
                 e.set_scroll_top(top);
@@ -694,8 +865,21 @@ fn do_open(ctl: Ctl) {
 }
 
 fn do_save(ctl: Ctl, save_as: bool, then: Option<Pending>) {
+    match ctl.kind.get_untracked() {
+        // Bytes go back as bytes; Save As would need its own dialog and a
+        // second path through the watcher, and a hex editor that can only
+        // write back where it read from is the safer instrument anyway.
+        DocKind::Binary => {
+            if !save_as {
+                hex_save(ctl, then);
+            }
+            return;
+        }
+        DocKind::Image | DocKind::Oversized => return,
+        DocKind::Markdown | DocKind::Text => {}
+    }
     spawn_local(async move {
-        let content = current_markdown(ctl);
+        let content = save_payload(ctl);
         // The backend no longer tracks "the current document", so the target
         // comes from the tab.
         let path = Some(ctl.doc_path.get_untracked()).filter(|p| !p.is_empty());
@@ -740,18 +924,11 @@ fn do_save(ctl: Ctl, save_as: bool, then: Option<Pending>) {
     });
 }
 
+/// A path that arrived from outside the tree: dropped on the window, opened
+/// by the OS, or picked from Open Recent. Same door as the tree, so a file's
+/// kind never depends on how it was opened.
 fn do_open_path(ctl: Ctl, path: String) {
-    spawn_local(async move {
-        let args = serde_wasm_bindgen::to_value(&tauri_api::PathArgs { path }).unwrap();
-        match tauri_api::invoke("open_path", args).await {
-            Ok(v) => {
-                if let Some(info) = tauri_api::parse_file_info(v) {
-                    open_document(ctl, info);
-                }
-            }
-            Err(e) => report_backend_error("Could not open file", &e),
-        }
-    });
+    open_tree_file(ctl, path);
 }
 
 /// Show a loaded file, reusing an existing tab where that is the right thing.
@@ -820,7 +997,7 @@ fn do_export_html(ctl: Ctl) {
     // property, which `inner_html` does not serialize — the same reason
     // `stash_active` quiesces before it snapshots.
     quiesce(ctl);
-    let body = match ctl.mode.get_untracked() {
+    let body = match eff_mode(ctl) {
         Mode::Wysiwyg => match editor_el(ctl) {
             Some(el) => export::body_from_editor(el.unchecked_ref::<Element>()),
             None => return,
@@ -846,6 +1023,495 @@ fn perform_pending(ctl: Ctl, p: Pending) {
     match p {
         Pending::CloseTab(id) => close_tab_forced(ctl, id),
         Pending::CloseWindow => close_window_step(ctl),
+    }
+}
+
+// ---------- the project tree ----------
+
+fn do_open_folder(ctl: Ctl) {
+    spawn_local(async move {
+        match tauri_api::invoke_no_args("pick_folder").await {
+            Ok(v) => {
+                let Ok(Some(root)) = serde_wasm_bindgen::from_value::<Option<String>>(v) else {
+                    return; // dialog cancelled
+                };
+                set_project_root(ctl, root);
+            }
+            Err(e) => report_backend_error("Could not open folder", &e),
+        }
+    });
+}
+
+fn set_project_root(ctl: Ctl, root: String) {
+    ctl.project_root.set(root.clone());
+    ctl.project_open.set(true);
+    ctl.tree.set(Vec::new());
+    spawn_local(async move {
+        let rows = read_dir(&root, 0).await;
+        ctl.tree.set(rows);
+    });
+}
+
+async fn read_dir(path: &str, depth: usize) -> Vec<TreeNode> {
+    let args = serde_wasm_bindgen::to_value(&tauri_api::PathArgs {
+        path: path.to_string(),
+    })
+    .unwrap();
+    match tauri_api::invoke("list_dir", args).await {
+        Ok(v) => tauri_api::parse::<Vec<tauri_api::Entry>>(v)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| TreeNode {
+                path: e.path,
+                name: e.name,
+                dir: e.dir,
+                depth,
+                open: false,
+            })
+            .collect(),
+        Err(e) => {
+            // A folder that cannot be listed — permissions, or it went away —
+            // reports itself rather than silently collapsing to nothing.
+            report_backend_error("Could not read folder", &e);
+            Vec::new()
+        }
+    }
+}
+
+/// Expand or collapse a directory row in place.
+fn toggle_dir(ctl: Ctl, path: String) {
+    let Some(i) = ctl
+        .tree
+        .with_untracked(|t| t.iter().position(|n| n.path == path))
+    else {
+        return;
+    };
+    let (open, depth) = ctl
+        .tree
+        .with_untracked(|t| (t[i].open, t[i].depth))
+        .to_owned();
+    if open {
+        // Everything deeper that follows belongs to this row.
+        ctl.tree.update(|t| {
+            t[i].open = false;
+            let end = t[i + 1..]
+                .iter()
+                .position(|n| n.depth <= depth)
+                .map(|p| i + 1 + p)
+                .unwrap_or(t.len());
+            t.drain(i + 1..end);
+        });
+        return;
+    }
+    spawn_local(async move {
+        let children = read_dir(&path, depth + 1).await;
+        ctl.tree.update(|t| {
+            // The row may have moved while the directory was being read.
+            let Some(i) = t.iter().position(|n| n.path == path) else {
+                return;
+            };
+            t[i].open = true;
+            for (n, child) in children.into_iter().enumerate() {
+                t.insert(i + 1 + n, child);
+            }
+        });
+    });
+}
+
+/// Open a file from the tree. Whatever it is, the backend has already decided.
+fn open_tree_file(ctl: Ctl, path: String) {
+    spawn_local(async move {
+        let args = serde_wasm_bindgen::to_value(&tauri_api::PathArgs { path }).unwrap();
+        match tauri_api::invoke("open_file", args).await {
+            Ok(v) => {
+                if let Some(f) = tauri_api::parse::<tauri_api::AnyFile>(v) {
+                    open_any(ctl, f);
+                }
+            }
+            Err(e) => report_backend_error("Could not open file", &e),
+        }
+    });
+}
+
+/// Show a file the backend has read, reusing a tab where that is right — the
+/// same rules as opening a document, because to the tab strip it is one.
+fn open_any(ctl: Ctl, f: tauri_api::AnyFile) {
+    if let Some(i) = ctl
+        .docs
+        .with_value(|d| d.iter().position(|doc| doc.path.get_untracked() == f.path))
+    {
+        // Deliberately not reloaded: that tab may hold unsaved edits.
+        switch_to(ctl, i);
+        return;
+    }
+    let kind = DocKind::from_str(&f.kind);
+    if is_pristine(ctl) {
+        set_doc_kind(ctl, kind);
+        install(ctl, &f);
+        return;
+    }
+    stash_active(ctl);
+    let id = {
+        let n = ctl.next_id.get_value();
+        ctl.next_id.set_value(n + 1);
+        n
+    };
+    let doc = make_doc(ctl, id, &f.name, &f.path, false, kind);
+    let i = ctl.docs.with_value(Vec::len);
+    ctl.docs.update_value(|d| d.push(doc));
+    publish_tabs(ctl);
+    ctl.active.set(Some(i));
+    ctl.hist.set_value(Hist::default());
+    install(ctl, &f);
+    set_scroll_top(ctl, 0);
+    history_flags(ctl);
+    focus_current(ctl);
+}
+
+/// `Doc.kind` is fixed at creation, so refilling a pristine tab with something
+/// that isn't markdown has to rewrite it.
+fn set_doc_kind(ctl: Ctl, kind: DocKind) {
+    if let Some(i) = ctl.active.get_untracked() {
+        ctl.docs.update_value(|d| {
+            if let Some(x) = d.get_mut(i) {
+                x.kind = kind;
+            }
+        });
+    }
+}
+
+/// Load a file the backend has read into the *active* tab.
+fn install(ctl: Ctl, f: &tauri_api::AnyFile) {
+    let kind = DocKind::from_str(&f.kind);
+    ctl.kind.set(kind);
+    ctl.doc_size.set(f.size);
+    ctl.doc_name.set(f.name.clone());
+    ctl.doc_path.set(f.path.clone());
+    ctl.data.set(String::new());
+    ctl.hex.set_value(hex::HexDoc::default());
+    ctl.hex_cursor.set(0);
+    ctl.hex_high.set(true);
+    ctl.hex_top.set(0);
+    match kind {
+        DocKind::Markdown | DocKind::Text => load_markdown(ctl, &f.text),
+        DocKind::Image => {
+            ctl.data.set(format!("data:{};base64,{}", f.mime, f.data));
+            clear_editor(ctl);
+        }
+        DocKind::Binary => {
+            match BASE64_STANDARD.decode(&f.data) {
+                Ok(bytes) => ctl.hex.set_value(hex::HexDoc::new(bytes)),
+                Err(e) => {
+                    report_backend_error("Could not read file", &JsValue::from_str(&e.to_string()))
+                }
+            }
+            clear_editor(ctl);
+        }
+        DocKind::Oversized => clear_editor(ctl),
+    }
+    ctl.hex_gen.update(|g| *g = g.wrapping_add(1));
+    set_doc_size(ctl, f.size);
+    set_doc_base(ctl, &f.text);
+    mark_clean(ctl);
+    recount(ctl);
+    history_flags(ctl);
+}
+
+fn clear_editor(ctl: Ctl) {
+    if let Some(el) = editor_el(ctl) {
+        el.set_inner_html("");
+    }
+    ctl.source.set(String::new());
+    ctl.hist.set_value(Hist::default());
+}
+
+fn set_doc_size(ctl: Ctl, size: u64) {
+    if let Some(i) = ctl.active.get_untracked() {
+        ctl.docs.update_value(|d| {
+            if let Some(x) = d.get_mut(i) {
+                x.size = size;
+            }
+        });
+    }
+}
+
+// ---------- the hex editor ----------
+
+fn hex_len(ctl: Ctl) -> usize {
+    ctl.hex.with_value(hex::HexDoc::len)
+}
+
+/// The furthest the cursor may go. Insert mode may sit one past the last byte,
+/// which is where an append happens; overwrite mode may not, because there is
+/// nothing there to write over.
+fn hex_max_cursor(ctl: Ctl) -> usize {
+    let len = hex_len(ctl);
+    if ctl.hex_overwrite.get_untracked() {
+        len.saturating_sub(1)
+    } else {
+        len
+    }
+}
+
+fn hex_touched(ctl: Ctl) {
+    ctl.hex_gen.update(|g| *g = g.wrapping_add(1));
+    mark_dirty(ctl);
+    history_flags(ctl);
+}
+
+fn hex_set_cursor(ctl: Ctl, at: usize) {
+    let at = at.min(hex_max_cursor(ctl));
+    ctl.hex_cursor.set(at);
+    ctl.hex_high.set(true);
+    hex_scroll_into_view(ctl, at);
+}
+
+fn hex_move(ctl: Ctl, delta: isize) {
+    let cur = ctl.hex_cursor.get_untracked() as isize;
+    hex_set_cursor(ctl, cur.saturating_add(delta).max(0) as usize);
+}
+
+/// Keep the cursor's row on screen, scrolling only when it has left it.
+fn hex_scroll_into_view(ctl: Ctl, at: usize) {
+    let Some(el) = ctl.hex_ref.get_untracked() else {
+        return;
+    };
+    let row = at / hex::ROW;
+    let top = ctl.hex_top.get_untracked();
+    let rows = ctl.hex_rows.get_untracked().max(1);
+    let el: &Element = el.unchecked_ref();
+    if row < top {
+        el.set_scroll_top((row * HEX_ROW_H) as i32);
+    } else if row >= top + rows {
+        el.set_scroll_top(((row + 1 - rows) * HEX_ROW_H) as i32);
+    }
+}
+
+/// A hex digit typed at the cursor. Half a byte at a time: the high nibble
+/// then the low one, which is how every hex editor behaves and why the two
+/// collapse into a single undo step.
+fn hex_type(ctl: Ctl, v: u8) {
+    let at = ctl.hex_cursor.get_untracked();
+    let high = ctl.hex_high.get_untracked();
+    let overwrite = ctl.hex_overwrite.get_untracked();
+    if overwrite && at >= hex_len(ctl) {
+        return; // nothing here to write over
+    }
+    ctl.hex.update_value(|h| {
+        let old = h.byte(at).unwrap_or(0);
+        if high {
+            if overwrite {
+                h.overwrite(at, (v << 4) | (old & 0x0f));
+            } else {
+                h.insert(at, v << 4);
+            }
+        } else {
+            h.overwrite(at, (old & 0xf0) | v);
+        }
+    });
+    if high {
+        ctl.hex_high.set(false);
+    } else {
+        ctl.hex_high.set(true);
+        let next = (at + 1).min(hex_max_cursor(ctl));
+        ctl.hex_cursor.set(next);
+        hex_scroll_into_view(ctl, next);
+    }
+    hex_touched(ctl);
+}
+
+fn hex_delete(ctl: Ctl, backwards: bool) {
+    // Deleting shortens the file, which overwrite mode exists to prevent.
+    if ctl.hex_overwrite.get_untracked() {
+        return;
+    }
+    let at = ctl.hex_cursor.get_untracked();
+    let at = if backwards {
+        if at == 0 {
+            return;
+        }
+        at - 1
+    } else {
+        at
+    };
+    let removed = ctl.hex.try_update_value(|h| h.delete(at)).unwrap_or(false);
+    if removed {
+        ctl.hex_cursor.set(at.min(hex_max_cursor(ctl)));
+        ctl.hex_high.set(true);
+        hex_touched(ctl);
+    }
+}
+
+fn hex_undo(ctl: Ctl) {
+    if let Some(Some(at)) = ctl.hex.try_update_value(hex::HexDoc::undo) {
+        ctl.hex_cursor.set(at.min(hex_max_cursor(ctl)));
+        ctl.hex_high.set(true);
+        hex_scroll_into_view(ctl, at);
+        hex_touched(ctl);
+    }
+}
+
+fn hex_redo(ctl: Ctl) {
+    if let Some(Some(at)) = ctl.hex.try_update_value(hex::HexDoc::redo) {
+        ctl.hex_cursor.set(at.min(hex_max_cursor(ctl)));
+        ctl.hex_high.set(true);
+        hex_scroll_into_view(ctl, at);
+        hex_touched(ctl);
+    }
+}
+
+/// Insert / overwrite. Leaving insert mode can strand the cursor one past the
+/// end, which only insert mode allows.
+fn hex_toggle_overwrite(ctl: Ctl) {
+    if ctl.kind.get_untracked() != DocKind::Binary {
+        return;
+    }
+    let next = !ctl.hex_overwrite.get_untracked();
+    ctl.hex_overwrite.set(next);
+    ctl.hex_high.set(true);
+    let cur = ctl.hex_cursor.get_untracked();
+    let max = hex_max_cursor(ctl);
+    if cur > max {
+        ctl.hex_cursor.set(max);
+    }
+}
+
+fn hex_save(ctl: Ctl, then: Option<Pending>) {
+    let path = ctl.doc_path.get_untracked();
+    if path.is_empty() {
+        return; // a binary always came from a file
+    }
+    let data = ctl.hex.with_value(|h| BASE64_STANDARD.encode(h.bytes()));
+    spawn_local(async move {
+        let args = serde_wasm_bindgen::to_value(&tauri_api::BytesArgs { path, data }).unwrap();
+        match tauri_api::invoke("save_bytes", args).await {
+            Ok(v) => {
+                let Some(r) = tauri_api::parse::<tauri_api::SaveResult>(v) else {
+                    return;
+                };
+                if r.conflict {
+                    if let Some(id) = active_doc_id(ctl) {
+                        set_stale(ctl, id, true);
+                    }
+                    maybe_prompt_disk(ctl);
+                    return;
+                }
+                if r.file.is_some() {
+                    // The bytes on disk are these bytes now, so there is
+                    // nothing before this point worth an undo step's memory.
+                    ctl.hex.update_value(hex::HexDoc::mark_saved);
+                    mark_clean(ctl);
+                    history_flags(ctl);
+                    if let Some(p) = then {
+                        perform_pending(ctl, p);
+                    }
+                }
+            }
+            Err(e) => report_backend_error("Could not save file", &e),
+        }
+    });
+}
+
+/// Rows are a fixed height so the visible window can be found by division
+/// rather than by measuring 65536 of them. Must match `.hex-row` in the CSS.
+const HEX_ROW_H: usize = 20;
+
+/// Both size limits are the backend's; repeating them is how the oversized
+/// tab explains itself.
+const TEXT_LIMIT: u64 = 1024 * 1024;
+const IMAGE_LIMIT: u64 = 16 * 1024 * 1024;
+
+fn human_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    match bytes {
+        b if b >= MB => format!("{:.1} MB", b as f64 / MB as f64),
+        b if b >= KB => format!("{:.1} KB", b as f64 / KB as f64),
+        b => format!("{b} bytes"),
+    }
+}
+
+/// One rendered row of the hex dump: offset, sixteen bytes, sixteen glyphs.
+///
+/// Both columns are per-byte elements rather than one run of text, because
+/// both are click targets and either can hold the cursor.
+fn hex_row(ctl: Ctl, row: usize) -> impl IntoView {
+    ctl.hex_gen.get();
+    let cursor = ctl.hex_cursor.get();
+    let start = row * hex::ROW;
+    let bytes: Vec<Option<u8>> = ctl
+        .hex
+        .with_value(|h| (0..hex::ROW).map(|i| h.byte(start + i)).collect());
+    let len = ctl.hex.with_value(hex::HexDoc::len);
+    let cells: Vec<_> = bytes
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let at = start + i;
+            let here = at == cursor;
+            let label = b.map(hex::hex_byte).unwrap_or_else(|| "  ".to_string());
+            view! {
+                <span
+                    class="hex-cell"
+                    class:cursor=here
+                    class:gap=move || i % 8 == 7
+                    on:mousedown=move |e: web_sys::MouseEvent| {
+                        e.prevent_default();
+                        hex_set_cursor(ctl, at);
+                    }
+                >
+                    {label}
+                </span>
+            }
+        })
+        .collect();
+    let ascii: Vec<_> = bytes
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let at = start + i;
+            let here = at == cursor;
+            let ch = b.map(hex::ascii_byte).unwrap_or(' ').to_string();
+            view! {
+                <span
+                    class="hex-char"
+                    class:cursor=here
+                    on:mousedown=move |e: web_sys::MouseEvent| {
+                        e.prevent_default();
+                        hex_set_cursor(ctl, at);
+                    }
+                >
+                    {ch}
+                </span>
+            }
+        })
+        .collect();
+    // One past the last byte is where an append lands, and it needs somewhere
+    // visible to sit.
+    let at_end = cursor == len && start + hex::ROW > len;
+    view! {
+        <div class="hex-row">
+            <span class="hex-offset">{hex::offset_label(start)}</span>
+            <span class="hex-bytes">{cells}<span class="hex-eof" class:cursor=at_end></span></span>
+            <span class="hex-ascii">{ascii}</span>
+        </div>
+    }
+}
+
+/// Recompute which rows are on screen, after a scroll or a resize.
+fn hex_recompute_window(ctl: Ctl) {
+    let Some(el) = ctl.hex_ref.get_untracked() else {
+        return;
+    };
+    let el: &Element = el.unchecked_ref();
+    let top = (el.scroll_top().max(0) as usize) / HEX_ROW_H;
+    // One row of slack at each end, so a partially visible row is still drawn.
+    let rows = (el.client_height().max(0) as usize) / HEX_ROW_H + 2;
+    if ctl.hex_top.get_untracked() != top {
+        ctl.hex_top.set(top);
+    }
+    if ctl.hex_rows.get_untracked() != rows {
+        ctl.hex_rows.set(rows);
     }
 }
 
@@ -997,7 +1663,7 @@ fn replace_document(ctl: Ctl, md: &str) {
     // An open diagram's source lives in a textarea we are about to replace.
     quiesce(ctl);
     history_commit(ctl);
-    match ctl.mode.get_untracked() {
+    match eff_mode(ctl) {
         Mode::Wysiwyg => {
             if let Some(el) = editor_el(ctl) {
                 let html = to_html(md);
@@ -1024,17 +1690,26 @@ fn disk_reload(ctl: Ctl) {
     };
     spawn_local(async move {
         let args = serde_wasm_bindgen::to_value(&tauri_api::PathArgs { path }).unwrap();
-        match tauri_api::invoke("reload_doc", args).await {
+        match tauri_api::invoke("open_file", args).await {
             Ok(v) => {
-                let Some(info) = tauri_api::parse_file_info(v) else {
+                let Some(f) = tauri_api::parse::<tauri_api::AnyFile>(v) else {
                     return;
                 };
                 if !focus_doc(ctl, id) {
                     return;
                 }
-                replace_document(ctl, &info.content);
-                set_doc_base(ctl, &info.content);
-                mark_clean(ctl);
+                // A binary or an image is replaced wholesale — there is no
+                // undoable text edit to express, and `install` resets the
+                // hex history along with everything else.
+                if DocKind::from_str(&f.kind).is_text() {
+                    replace_document(ctl, &f.text);
+                    set_doc_base(ctl, &f.text);
+                    set_doc_size(ctl, f.size);
+                    ctl.doc_size.set(f.size);
+                    mark_clean(ctl);
+                } else {
+                    install(ctl, &f);
+                }
             }
             Err(e) => {
                 set_stale(ctl, id, true);
@@ -1066,7 +1741,7 @@ fn disk_merge(ctl: Ctl) {
                 }
                 // Conflict markers are line noise in a rendered view, and
                 // resolving them is a text edit — so hand over the text.
-                if r.conflicted && ctl.mode.get_untracked() == Mode::Wysiwyg {
+                if r.conflicted && eff_mode(ctl) == Mode::Wysiwyg {
                     toggle_mode(ctl);
                 }
                 replace_document(ctl, &r.text);
@@ -1208,20 +1883,36 @@ fn stash_active(ctl: Ctl) {
         return;
     };
     quiesce(ctl);
-    let snap = capture_current(ctl).unwrap_or(Snap::Wys {
-        html: String::new(),
-        caret: 0,
-    });
-    let scroll = scroll_top(ctl);
-    // `Hist` is not Clone: move it out and leave a default behind.
+    let text = ctl.kind.get_untracked().is_text();
+    // The editor pair holds nothing for a picture or a binary, so there is no
+    // snapshot to take and no scroll position worth keeping.
+    let snap = if text {
+        capture_current(ctl).unwrap_or(Snap::Wys {
+            html: String::new(),
+            caret: 0,
+        })
+    } else {
+        Snap::Wys {
+            html: String::new(),
+            caret: 0,
+        }
+    };
+    let scroll = if text { scroll_top(ctl) } else { 0 };
+    // Neither `Hist` nor `HexDoc` is worth cloning: move them out and leave
+    // defaults behind.
     let mut hist = Hist::default();
     ctl.hist.update_value(|h| hist = std::mem::take(h));
+    let mut hexdoc = hex::HexDoc::default();
+    ctl.hex.update_value(|h| hexdoc = std::mem::take(h));
+    let data = ctl.data.get_untracked();
 
     ctl.docs.update_value(|docs| {
         if let Some(d) = docs.get_mut(i) {
             d.snap = snap;
             d.scroll = scroll;
             d.hist = hist;
+            d.hex = hexdoc;
+            d.data = data;
             // name / path / dirty are already current: `sync_active_doc`
             // writes them through on every change.
         }
@@ -1237,7 +1928,7 @@ fn stash_active(ctl: Ctl) {
 fn activate(ctl: Ctl, i: usize) {
     // Pull everything out under one borrow; the signal handles are Copy, so
     // they are read after the borrow is dropped.
-    let Some((snap, scroll, hist, name, path, dirty)) = ctl
+    let Some((snap, scroll, hist, name, path, dirty, kind, size, data, hexdoc)) = ctl
         .docs
         .try_update_value(|docs| {
             let d = docs.get_mut(i)?;
@@ -1248,6 +1939,10 @@ fn activate(ctl: Ctl, i: usize) {
                 d.name,
                 d.path,
                 d.dirty,
+                d.kind,
+                d.size,
+                std::mem::take(&mut d.data),
+                std::mem::take(&mut d.hex),
             ))
         })
         .flatten()
@@ -1260,10 +1955,21 @@ fn activate(ctl: Ctl, i: usize) {
     ctl.doc_path.set(path.get_untracked());
     ctl.dirty.set(dirty.get_untracked());
     ctl.hist.set_value(hist);
+    ctl.kind.set(kind);
+    ctl.doc_size.set(size);
+    ctl.data.set(data);
+    ctl.hex.set_value(hexdoc);
+    ctl.hex_gen.update(|g| *g = g.wrapping_add(1));
 
-    // Deliberately not `restore_snap`: that dirties unconditionally, which
-    // would mark every tab you merely look at as modified.
-    apply_snap_now(ctl, &snap);
+    if kind.is_text() {
+        // Deliberately not `restore_snap`: that dirties unconditionally, which
+        // would mark every tab you merely look at as modified.
+        apply_snap_now(ctl, &snap);
+    } else if let Some(el) = editor_el(ctl) {
+        // The editor is hidden for these, but it must not keep the last
+        // document's markup: `recount` and `window.find` both read it.
+        el.set_inner_html("");
+    }
     ctl.hist.update_value(|h| h.shadow = Some(snap.clone()));
 
     recount(ctl);
@@ -1304,7 +2010,7 @@ fn switch_to_id(ctl: Ctl, id: u32) {
 /// under the ambient owner is a trap: a tab opened from a handler inside a
 /// `<Show>` or `<For>` gets signals that are disposed when that branch
 /// unmounts, and every later read panics with "already disposed".
-fn make_doc(ctl: Ctl, id: u32, name: &str, path: &str, dirty: bool) -> Doc {
+fn make_doc(ctl: Ctl, id: u32, name: &str, path: &str, dirty: bool, kind: DocKind) -> Doc {
     let build = || Doc {
         id,
         name: RwSignal::new(name.to_string()),
@@ -1318,6 +2024,10 @@ fn make_doc(ctl: Ctl, id: u32, name: &str, path: &str, dirty: bool) -> Doc {
         },
         scroll: 0,
         hist: Hist::default(),
+        kind,
+        size: 0,
+        data: String::new(),
+        hex: hex::HexDoc::default(),
     };
     match ctl.owner.get_value() {
         Some(o) => o.with(build),
@@ -1333,12 +2043,16 @@ fn new_tab(ctl: Ctl, name: &str, path: &str, md: &str, dirty: bool) {
         ctl.next_id.set_value(n + 1);
         n
     };
-    let doc = make_doc(ctl, id, name, path, dirty);
+    let doc = make_doc(ctl, id, name, path, dirty, DocKind::Markdown);
     let i = ctl.docs.with_value(Vec::len);
     ctl.docs.update_value(|d| d.push(doc));
     publish_tabs(ctl);
 
     ctl.active.set(Some(i));
+    ctl.kind.set(DocKind::Markdown);
+    ctl.doc_size.set(0);
+    ctl.data.set(String::new());
+    ctl.hex.set_value(hex::HexDoc::default());
     ctl.doc_name.set(name.to_string());
     ctl.doc_path.set(path.to_string());
     // What this tab and its file agree on right now. An import or a new
@@ -1347,7 +2061,7 @@ fn new_tab(ctl: Ctl, name: &str, path: &str, md: &str, dirty: bool) {
     ctl.hist.set_value(Hist::default());
     // Mode is inherited: someone working in Markdown gets a Markdown tab.
     // `load_markdown` is mode-aware and resets history.
-    if ctl.mode.get_untracked() == Mode::Source {
+    if eff_mode(ctl) == Mode::Source {
         if let Some(el) = editor_el(ctl) {
             el.set_inner_html("<p><br></p>");
         }
@@ -1431,6 +2145,15 @@ fn enter_empty_state(ctl: Ctl) {
     ctl.doc_path.set(String::new());
     ctl.dirty.set(false);
     ctl.source.set(String::new());
+    // Back to markdown, or closing the last tab of a picture or a binary
+    // would leave its pane drawn over the empty frame.
+    ctl.kind.set(DocKind::Markdown);
+    ctl.doc_size.set(0);
+    ctl.data.set(String::new());
+    ctl.hex.set_value(hex::HexDoc::default());
+    ctl.hex_cursor.set(0);
+    ctl.hex_top.set(0);
+    ctl.hex_gen.update(|g| *g = g.wrapping_add(1));
     // Not "<p><br></p>": there is no paragraph, because there is no document.
     if let Some(el) = editor_el(ctl) {
         el.set_inner_html("");
@@ -1604,7 +2327,7 @@ fn find_next(ctl: Ctl, backwards: bool) {
     if q.is_empty() {
         return;
     }
-    match ctl.mode.get_untracked() {
+    match eff_mode(ctl) {
         Mode::Wysiwyg => {
             tauri_api::window_find(&q, ctl.case_sens.get_untracked(), backwards, true);
         }
@@ -1631,7 +2354,7 @@ fn replace_one(ctl: Ctl) {
         return;
     }
     let rep = ctl.replace_q.get_untracked();
-    match ctl.mode.get_untracked() {
+    match eff_mode(ctl) {
         Mode::Wysiwyg => {
             if selection_matches_query(ctl) {
                 history_commit(ctl);
@@ -1694,7 +2417,7 @@ fn replace_all(ctl: Ctl) {
     }
     let rep = ctl.replace_q.get_untracked();
     let cs = ctl.case_sens.get_untracked();
-    match ctl.mode.get_untracked() {
+    match eff_mode(ctl) {
         Mode::Wysiwyg => {
             let total = count_matches(&visible_text(ctl), &q, cs);
             if total > 0 {
@@ -1774,7 +2497,7 @@ fn confirm_url_modal(ctl: Ctl) {
     if url.is_empty() {
         return;
     }
-    match ctl.mode.get_untracked() {
+    match eff_mode(ctl) {
         Mode::Wysiwyg => {
             restore_selection(ctl);
             history_commit(ctl);
@@ -1941,7 +2664,7 @@ fn fmt_action(ctl: Ctl, action: &str) {
         );
         return;
     }
-    let wys = ctl.mode.get_untracked() == Mode::Wysiwyg;
+    let wys = eff_mode(ctl) == Mode::Wysiwyg;
     if wys {
         focus_current(ctl);
         history_commit(ctl);
@@ -2260,7 +2983,7 @@ fn table_delete_table(ctl: Ctl) {
 }
 
 fn update_in_table(ctl: Ctl) {
-    let inside = ctl.mode.get_untracked() == Mode::Wysiwyg
+    let inside = eff_mode(ctl) == Mode::Wysiwyg
         && selection_element().and_then(|e| cell_from(&e)).is_some();
     if ctl.in_table.get_untracked() != inside {
         ctl.in_table.set(inside);
@@ -2323,12 +3046,35 @@ fn do_action(ctl: Ctl, action: &str) {
     // Everything else would act on an editor that isn't there: `save` would
     // write an empty file over a real path, `select_all` would select the
     // toolbar, `find` would run `window.find` over the app chrome.
-    if !has_doc_now(ctl) && !matches!(action, "new" | "open" | "import_html" | "import_docx") {
+    if !has_doc_now(ctl)
+        && !matches!(
+            action,
+            "new" | "open" | "import_html" | "import_docx" | "open_folder" | "toggle_project"
+        )
+    {
+        return;
+    }
+    // A picture is not a document. Everything that writes, searches or
+    // formats is meant for one, and the tab strip now holds things that are
+    // none of those — the toolbar is disabled to match, but menu accelerators
+    // reach past it.
+    let kind = ctl.kind.get_untracked();
+    if kind != DocKind::Markdown
+        && (action.starts_with("fmt_")
+            || action.starts_with("tbl_")
+            || matches!(action, "toggle_mode" | "export_html"))
+    {
+        return;
+    }
+    if !kind.is_text() && matches!(action, "find" | "replace" | "select_all" | "save_as") {
         return;
     }
     match action {
         "new" => do_new(ctl),
         "open" => do_open(ctl),
+        "open_folder" => do_open_folder(ctl),
+        "toggle_project" => ctl.project_open.update(|v| *v = !*v),
+        "toggle_overwrite" => hex_toggle_overwrite(ctl),
         "import_html" => do_import_html(ctl),
         "import_docx" => do_import_docx(ctl),
         "save" => do_save(ctl, false, None),
@@ -2341,6 +3087,10 @@ fn do_action(ctl: Ctl, action: &str) {
         }
         "next_tab" => cycle_tab(ctl, 1),
         "prev_tab" => cycle_tab(ctl, -1),
+        // The hex editor keeps its own history: 200 snapshots of a megabyte is
+        // not an undo stack, it is a memory leak with a keyboard shortcut.
+        "undo" if kind == DocKind::Binary => hex_undo(ctl),
+        "redo" if kind == DocKind::Binary => hex_redo(ctl),
         "undo" => history_undo(ctl),
         "redo" => history_redo(ctl),
         "select_all" => {
@@ -2362,6 +3112,267 @@ fn do_action(ctl: Ctl, action: &str) {
     }
 }
 
+
+// The hex editor's own keyboard. It is a grid, not a text field, so
+// nothing here is inherited: every key that does something is listed.
+fn on_hex_keydown(ctl: Ctl, e: web_sys::KeyboardEvent) {
+    if e.ctrl_key() || e.meta_key() || e.alt_key() {
+        return; // Ctrl+S, Ctrl+Z and friends belong to the window handler
+    }
+    let key = e.key();
+    let rows = ctl.hex_rows.get_untracked().saturating_sub(2).max(1) as isize;
+    match key.as_str() {
+        "ArrowRight" => hex_move(ctl, 1),
+        "ArrowLeft" => hex_move(ctl, -1),
+        "ArrowDown" => hex_move(ctl, hex::ROW as isize),
+        "ArrowUp" => hex_move(ctl, -(hex::ROW as isize)),
+        "PageDown" => hex_move(ctl, rows * hex::ROW as isize),
+        "PageUp" => hex_move(ctl, -(rows * hex::ROW as isize)),
+        "Home" => hex_set_cursor(ctl, 0),
+        "End" => hex_set_cursor(ctl, hex_len(ctl)),
+        "Insert" => hex_toggle_overwrite(ctl),
+        "Backspace" => hex_delete(ctl, true),
+        "Delete" => hex_delete(ctl, false),
+        _ => {
+            let Some(v) = hex::hex_digit(&key) else {
+                return; // not ours; let the browser have it
+            };
+            hex_type(ctl, v);
+        }
+    }
+    e.prevent_default();
+}
+
+// ---------- panes ----------
+
+/// The directory tree. Split out of `App`'s `view!` deliberately: the macro
+/// builds one deeply nested type per element, and a debug build overflows the
+/// wasm stack long before the browser complains about anything else.
+fn project_pane(ctl: Ctl) -> impl IntoView {
+    view! {
+        <aside class="project" class:hidden=move || !ctl.project_open.get()>
+            <div class="project-head">
+                <span class="project-root" title=move || ctl.project_root.get()>
+                    {move || {
+                        let r = ctl.project_root.get();
+                        if r.is_empty() {
+                            "No folder".to_string()
+                        } else {
+                            r.rsplit(['/', '\\']).next().unwrap_or(&r).to_string()
+                        }
+                    }}
+                </span>
+                <button
+                    class="project-btn"
+                    title="Choose folder (Ctrl+Shift+K)"
+                    on:mousedown=|e: web_sys::MouseEvent| e.prevent_default()
+                    on:click=move |_| do_open_folder(ctl)
+                >
+                    "…"
+                </button>
+            </div>
+            <div class="project-tree">
+                <Show
+                    when=move || !ctl.project_root.get().is_empty()
+                    fallback=move || {
+                        view! {
+                            <button
+                                class="btn project-empty"
+                                on:mousedown=|e: web_sys::MouseEvent| e.prevent_default()
+                                on:click=move |_| do_open_folder(ctl)
+                            >
+                                "Open Folder…"
+                            </button>
+                        }
+                    }
+                >
+                    // Keyed on the open state as well as the path: a row's
+                    // markup is built once from the captured `TreeNode`, so
+                    // without this its disclosure triangle would never change.
+                    <For
+                        each=move || ctl.tree.get()
+                        key=|n| (n.path.clone(), n.open)
+                        let(node)
+                    >
+                        {
+                            let path = node.path.clone();
+                            let open_path = node.path.clone();
+                            view! {
+                                <div
+                                    class="tree-row"
+                                    class:dir=node.dir
+                                    class:open=node.open
+                                    class:active=move || {
+                                        ctl.doc_path.get() == path
+                                    }
+                                    style=format!("padding-left:{}px", 6 + node.depth * 12)
+                                    title=node.path.clone()
+                                    // Same reason as the tab strip: a bare
+                                    // click here would collapse the caret
+                                    // that is about to be stashed.
+                                    on:mousedown=move |e: web_sys::MouseEvent| {
+                                        if e.button() != 0 {
+                                            return;
+                                        }
+                                        e.prevent_default();
+                                        if node.dir {
+                                            toggle_dir(ctl, open_path.clone());
+                                        } else {
+                                            open_tree_file(ctl, open_path.clone());
+                                        }
+                                    }
+                                >
+                                    <span class="tree-mark"></span>
+                                    <span class="tree-name">{node.name.clone()}</span>
+                                </div>
+                            }
+                        }
+                    </For>
+                </Show>
+            </div>
+        </aside>
+    }
+}
+
+/// The three tabs that are not an editor: a picture, a hex dump, and a file
+/// too big for either.
+fn asset_panes(ctl: Ctl) -> impl IntoView {
+    view! {
+            // Read-only by construction: there is no image editor here,
+            // and `object-fit` keeps a large one inside the pane.
+            <Show when=move || ctl.kind.get() == DocKind::Image>
+                <div class="asset-view">
+                    <img class="asset-image" src=move || ctl.data.get() alt="" />
+                </div>
+            </Show>
+
+            <Show when=move || ctl.kind.get() == DocKind::Binary>
+                <div
+                    class="hex-view"
+                    tabindex="0"
+                    node_ref=ctl.hex_ref
+                    on:scroll=move |_| hex_recompute_window(ctl)
+                    on:keydown=move |e| on_hex_keydown(ctl, e)
+                >
+                    // Holds the scrollbar open for the whole file; only the
+                    // rows in view are ever built.
+                    <div
+                        class="hex-spacer"
+                        style=move || {
+                            ctl.hex_gen.get();
+                            format!(
+                                "height:{}px",
+                                ctl.hex.with_value(hex::HexDoc::rows) * HEX_ROW_H,
+                            )
+                        }
+                    >
+                        <div
+                            class="hex-rows"
+                            style=move || {
+                                format!("transform:translateY({}px)", ctl.hex_top.get() * HEX_ROW_H)
+                            }
+                        >
+                            <For
+                                each=move || {
+                                    ctl.hex_gen.get();
+                                    let rows = ctl.hex.with_value(hex::HexDoc::rows);
+                                    let top = ctl.hex_top.get().min(rows.saturating_sub(1));
+                                    (top..(top + ctl.hex_rows.get()).min(rows)).collect::<Vec<_>>()
+                                }
+                                key=|r| *r
+                                let(row)
+                            >
+                                {move || hex_row(ctl, row)}
+                            </For>
+                        </div>
+                    </div>
+                </div>
+            </Show>
+
+            <Show when=move || ctl.kind.get() == DocKind::Oversized>
+                <div class="asset-view">
+                    <div class="empty-state">
+                        <p class="empty-hint">"Too large to open"</p>
+                        <p class="empty-sub">
+                            {move || {
+                                format!(
+                                    "{} is {}. The limit is {} for text and binaries, {} for images.",
+                                    ctl.doc_name.get(),
+                                    human_size(ctl.doc_size.get()),
+                                    human_size(TEXT_LIMIT),
+                                    human_size(IMAGE_LIMIT),
+                                )
+                            }}
+                        </p>
+                    </div>
+                </div>
+            </Show>
+    }
+}
+
+/// The right-hand end of the status bar, which says something different for
+/// every kind of tab.
+fn status_metrics(ctl: Ctl) -> impl IntoView {
+    view! {
+            <span class="status-metrics" class:hidden=move || !has_doc(ctl)>
+                <Show
+                    when=move || ctl.kind.get().is_text()
+                    fallback=move || {
+                        view! {
+                            // For a binary this is its own live length, which
+                            // inserting and deleting move away from the size
+                            // on disk; for the rest, the size on disk is all
+                            // there is to say.
+                            <span>
+                                {move || {
+                                    ctl.hex_gen.get();
+                                    if ctl.kind.get() == DocKind::Binary {
+                                        human_size(ctl.hex.with_value(hex::HexDoc::len) as u64)
+                                    } else {
+                                        human_size(ctl.doc_size.get())
+                                    }
+                                }}
+                            </span>
+                            <Show when=move || ctl.kind.get() == DocKind::Binary>
+                                <span class="status-sep">"·"</span>
+                                <span>
+                                    {move || {
+                                        format!("0x{:08x}", ctl.hex_cursor.get())
+                                    }}
+                                </span>
+                                <span class="status-sep">"·"</span>
+                                <button
+                                    class="status-btn"
+                                    title="Insert / overwrite (Ins, or Ctrl+Shift+O)"
+                                    on:mousedown=|e: web_sys::MouseEvent| e.prevent_default()
+                                    on:click=move |_| hex_toggle_overwrite(ctl)
+                                >
+                                    {move || {
+                                        if ctl.hex_overwrite.get() { "OVR" } else { "INS" }
+                                    }}
+                                </button>
+                            </Show>
+                        }
+                    }
+                >
+                    <span>{move || format!("{} words", ctl.words.get())}</span>
+                    <span class="status-sep">"·"</span>
+                    <span>{move || format!("{} chars", ctl.chars.get())}</span>
+                    <span class="status-sep">"·"</span>
+                    <span>
+                        {move || {
+                            match ctl.kind.get() {
+                                DocKind::Text => "Text",
+                                _ if ctl.mode.get() == Mode::Source => "Markdown",
+                                _ => "WYSIWYG",
+                            }
+                        }}
+                    </span>
+                </Show>
+            </span>
+    }
+}
+
 // ---------- component ----------
 
 fn tb_btn(
@@ -2376,8 +3387,9 @@ fn tb_btn(
             class=format!("tb-btn {class}")
             title=tip
             // One line disables all 20 format and table buttons in the empty
-            // frame.
-            prop:disabled=move || !has_doc(ctl)
+            // frame, and again for a tab holding something that has no
+            // markdown to format.
+            prop:disabled=move || !has_doc(ctl) || ctl.kind.get() != DocKind::Markdown
             on:mousedown=|e| e.prevent_default()
             on:click=move |_| do_action(ctl, action)
         >
@@ -2429,13 +3441,27 @@ pub fn App() -> impl IntoView {
         tabstrip_ref: NodeRef::new(),
         disk_modal: RwSignal::new(None),
         last_watched: StoredValue::new(Vec::new()),
+        kind: RwSignal::new(DocKind::Markdown),
+        doc_size: RwSignal::new(0),
+        data: RwSignal::new(String::new()),
+        hex: StoredValue::new(hex::HexDoc::default()),
+        hex_gen: RwSignal::new(0),
+        hex_cursor: RwSignal::new(0),
+        hex_high: RwSignal::new(true),
+        hex_overwrite: RwSignal::new(true),
+        hex_top: RwSignal::new(0),
+        hex_rows: RwSignal::new(40),
+        hex_ref: NodeRef::new(),
+        project_open: RwSignal::new(false),
+        project_root: RwSignal::new(String::new()),
+        tree: RwSignal::new(Vec::new()),
         owner: StoredValue::new_local(Owner::current()),
     };
 
     // The first document exists before the view does: `sync_active_doc`
     // indexes `docs[active]`, and the editor's init effect must not run
     // against an empty tab list.
-    let first = make_doc(ctl, 0, "Untitled", "", false);
+    let first = make_doc(ctl, 0, "Untitled", "", false, DocKind::Markdown);
     ctl.docs.update_value(|d| d.push(first));
     ctl.next_id.set_value(1);
     ctl.active.set(Some(0));
@@ -2489,14 +3515,32 @@ pub fn App() -> impl IntoView {
     window_event_listener(leptos::ev::resize, move |_| {
         scroll_active_tab_into_view(ctl);
         recompute_overflow(ctl);
+        hex_recompute_window(ctl);
+    });
+
+    // How many hex rows fit is a question about a pane that may have only just
+    // been rendered, so it is asked a frame after the tab becomes a binary —
+    // and again when the project pane appears and takes width from it.
+    Effect::new(move |_| {
+        let _ = ctl.kind.get();
+        let _ = ctl.project_open.get();
+        request_animation_frame(move || {
+            hex_recompute_window(ctl);
+            // The grid is not a text field: without focus it gets no keys.
+            if ctl.kind.get_untracked() == DocKind::Binary {
+                if let Some(el) = ctl.hex_ref.get_untracked() {
+                    let _ = el.focus();
+                }
+            }
+        });
     });
 
     // Load a CLI-passed file and hook up backend events.
     spawn_local(async move {
         match tauri_api::invoke_no_args("init_doc").await {
             Ok(v) => {
-                for info in tauri_api::parse_file_infos(v) {
-                    open_document(ctl, info);
+                for f in tauri_api::parse::<Vec<tauri_api::AnyFile>>(v).unwrap_or_default() {
+                    open_any(ctl, f);
                 }
             }
             // A file named on the command line that can't be read would
@@ -2584,6 +3628,11 @@ pub fn App() -> impl IntoView {
             ("s", false, false) => "save",
             ("s", true, false) => "save_as",
             ("e", true, false) => "export_html",
+            ("k", true, false) => "open_folder",
+            ("p", true, false) => "toggle_project",
+            // The hex editor's mode switch. `Insert` is handled by the hex
+            // pane's own keydown; this is the one that exists on a Mac.
+            ("o", true, false) => "toggle_overwrite",
             ("w", false, false) => "close_tab",
             // Ctrl+Tab is unreliable as a *native* accelerator on WebKitGTK
             // (focus traversal eats it), so it lives here; the menu carries
@@ -2761,7 +3810,7 @@ pub fn App() -> impl IntoView {
     };
 
     let on_editor_ctxmenu = move |e: web_sys::MouseEvent| {
-        if ctl.mode.get_untracked() != Mode::Wysiwyg {
+        if eff_mode(ctl) != Mode::Wysiwyg {
             return;
         }
         let Some(el) = e
@@ -2855,7 +3904,7 @@ pub fn App() -> impl IntoView {
                     class="tb-btn tb-mode"
                     class:active=move || mode_is(Mode::Source)
                     title="Toggle markdown source (Ctrl+Shift+M)"
-                    prop:disabled=move || !has_doc(ctl)
+                    prop:disabled=move || !has_doc(ctl) || ctl.kind.get() != DocKind::Markdown
                     on:mousedown=|e| e.prevent_default()
                     on:click=move |_| do_action(ctl, "toggle_mode")
                 >
@@ -2863,6 +3912,9 @@ pub fn App() -> impl IntoView {
                 </button>
             </div>
 
+            <div class="body">
+            {project_pane(ctl)}
+            <div class="main">
             <div class="tabbar" class:hidden=move || !has_doc(ctl)>
                 <div class="tabstrip" node_ref=ctl.tabstrip_ref>
                     <For each=move || ctl.tabs.get() key=|t| t.id let(tab)>
@@ -3012,7 +4064,7 @@ pub fn App() -> impl IntoView {
             <div class="editor-wrap">
                 <div
                     class="editor wysiwyg markdown-body"
-                    class:hidden=move || !mode_is(Mode::Wysiwyg) || !has_doc(ctl)
+                    class:hidden=move || !shows_wysiwyg(ctl)
                     // Not merely hidden: an editor that is momentarily visible
                     // or Tab-reachable must not accept typing into a document
                     // that does not exist.
@@ -3037,7 +4089,7 @@ pub fn App() -> impl IntoView {
                 ></div>
                 <textarea
                     class="editor source"
-                    class:hidden=move || !mode_is(Mode::Source) || !has_doc(ctl)
+                    class:hidden=move || !shows_source(ctl)
                     prop:disabled=move || !has_doc(ctl)
                     spellcheck="false"
                     node_ref=ctl.ta_ref
@@ -3053,6 +4105,7 @@ pub fn App() -> impl IntoView {
                     on:keydown=on_ta_keydown
                     on:paste=on_ta_paste
                 ></textarea>
+                {asset_panes(ctl)}
                 <Show when=move || !has_doc(ctl)>
                     <div class="empty-state">
                         <p class="empty-hint">"No document open"</p>
@@ -3078,6 +4131,8 @@ pub fn App() -> impl IntoView {
                     </div>
                 </Show>
             </div>
+            </div>
+            </div>
 
             <div class="statusbar">
                 <span class="status-path">
@@ -3090,13 +4145,11 @@ pub fn App() -> impl IntoView {
                     }}
                 </span>
                 <span class="tb-spacer"></span>
-                <span class="status-metrics" class:hidden=move || !has_doc(ctl)>
-                    <span>{move || format!("{} words", ctl.words.get())}</span>
-                    <span class="status-sep">"·"</span>
-                    <span>{move || format!("{} chars", ctl.chars.get())}</span>
-                    <span class="status-sep">"·"</span>
-                    <span>{move || if mode_is(Mode::Source) { "Markdown" } else { "WYSIWYG" }}</span>
-                </span>
+                // Words and characters mean nothing for a picture or a
+                // binary; those get their size, and the hex editor gets the
+                // two things it is useless without — where the cursor is, and
+                // whether typing will overwrite or insert.
+                {status_metrics(ctl)}
             </div>
 
             <Show when=move || ctl.ctx_menu.get().is_some()>
@@ -3235,7 +4288,9 @@ pub fn App() -> impl IntoView {
                             </button>
                             // Nothing to merge in a document with no local
                             // edits: the merge would just be the reload.
-                            <Show when=move || ctl.dirty.get()>
+                            // Merging is a text operation; there is no sensible
+                            // three-way merge of a PNG.
+                            <Show when=move || ctl.dirty.get() && ctl.kind.get().is_text()>
                                 <button class="btn" on:click=move |_| disk_merge(ctl)>
                                     "Merge"
                                 </button>

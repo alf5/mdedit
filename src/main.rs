@@ -1,6 +1,7 @@
 mod app;
 mod error_dialog;
 mod export;
+mod hex;
 mod history;
 mod markdown;
 mod mermaid;

@@ -35,10 +35,11 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
 - **Formatting toolbar**: bold, italic, strikethrough, inline code, headings,
   bullet/numbered/task lists, blockquote, code block, links, images, tables,
   horizontal rules — works in both WYSIWYG and source mode.
-- **Native menus**: File (New / Open / Open Recent / Save / Save As / Export
-  as HTML / Close Tab / Quit), Edit (undo, redo, clipboard, Find / Replace), View (source
-  toggle, next/previous document), Insert (link, image, table, mermaid
-  diagram, hr, table rows/columns), Format, Help.
+- **Native menus**: File (New / Open / Open Folder / Open Recent / Save /
+  Save As / Export as HTML / Close Tab / Quit), Edit (undo, redo, clipboard,
+  Find / Replace), View (project pane, source toggle, hex overwrite mode,
+  next/previous document), Insert (link, image, table, mermaid diagram, hr,
+  table rows/columns), Format, Help.
 - **Table editing**: insert row above/below and column left/right, delete
   row/column/table — from the toolbar (shown while the caret is in a table),
   the Insert menu, or a right-click context menu on any table cell.
@@ -63,6 +64,28 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
   (pure-Rust OOXML parser — headings, bold/italic/strikethrough,
   hyperlinks, nested bullet/numbered lists, tables, quotes, line breaks;
   images, footnotes and TOC field machinery are skipped).
+- **Project pane** (optional): **File → Open Folder…** (`Ctrl/Cmd+Shift+K`)
+  opens a directory tree down the left-hand side; `Ctrl/Cmd+Shift+P` shows and
+  hides it. Directories are read when you expand them, so a folder with a
+  large `node_modules` in it costs nothing until you look inside. The folder is
+  not remembered between launches, in keeping with tabs.
+
+  Anything in the tree opens in a tab, and what a file *is* decides what it
+  gets: markdown gets the editor; **images** (including SVG) are displayed,
+  read-only; anything else is sniffed, and **binaries get a hex editor** while
+  the rest is **editable plain text**. Text and binaries stop at 1 MB and
+  images at 16 MB — past that the tab says so rather than pretending the file
+  is empty. Formatting, export and the source toggle are disabled for anything
+  that isn't markdown, in the toolbar and in the menus, so their accelerators
+  are inert too.
+- **Hex editor**: arrow keys, `PageUp`/`PageDown`, `Home`/`End`, and hex digits
+  type over the byte under the cursor — high nibble then low, which is one
+  `Ctrl+Z` to take back. `Insert` (or `Ctrl/Cmd+Shift+O`, or the `OVR`/`INS`
+  button in the status bar) switches between **overwrite** and **insert**;
+  overwrite is the default and cannot change the file's length, so it cannot
+  shift every offset in a structured binary. In insert mode `Backspace` and
+  `Delete` remove bytes. Undo is operation-based, and saving writes the bytes
+  back where they came from — there is no Save As for a binary.
 - **External change detection**: if something else writes to an open file — a
   `git pull`, another editor, a script — the tab says so and asks what to do:
   **Reload** (take the file's version), **Merge** (three-way merge against
@@ -92,6 +115,9 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
 | `Ctrl/Cmd+S` | Save |
 | `Ctrl/Cmd+Shift+S` | Save As |
 | `Ctrl/Cmd+Shift+E` | Export as HTML |
+| `Ctrl/Cmd+Shift+K` | Open folder (project pane) |
+| `Ctrl/Cmd+Shift+P` | Show / hide the project pane |
+| `Insert` or `Ctrl/Cmd+Shift+O` | Hex editor: overwrite / insert mode |
 | `Ctrl/Cmd+W` | Close tab |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous document |
 | `Ctrl/Cmd+PageDown` / `PageUp` | Next / previous document |

@@ -2460,6 +2460,7 @@ version = "0.5.0"
 dependencies = [
  "base64 0.23.1",
  "diffy",
+ "libc",
  "notify",
  "roxmltree",
  "serde",

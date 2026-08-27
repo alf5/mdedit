@@ -1,3 +1,5 @@
+#[cfg(desktop)]
+mod detach;
 mod docx;
 mod project;
 mod watch;
@@ -98,7 +100,7 @@ fn init_doc(app: AppHandle, state: State<AppState>) -> Vec<project::AnyFile> {
         &app,
         std::env::args()
             .skip(1)
-            // macOS passes -psn_… on some launches.
+            // Flags (`--detach`, macOS `-psn_…`) are not files.
             .filter(|a| !a.starts_with('-'))
             .map(PathBuf::from)
             .chain(pending),
@@ -938,6 +940,12 @@ fn on_second_instance(app: &AppHandle, args: Vec<String>, cwd: String) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Before GTK/WebKit: `--detach` forks into a new session so the shell
+    // gets the prompt back. A second launch already exits after handing its
+    // argv to the running window, so the flag is a no-op there.
+    #[cfg(desktop)]
+    detach::maybe_detach();
+
     // WebKitGTK's DMA-BUF renderer crashes on some Wayland/driver combos
     // (GDK "Error 71 (Protocol error)"). Disable it unless the user opted in.
     #[cfg(target_os = "linux")]

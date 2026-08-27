@@ -19,6 +19,9 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
 - **One instance** — opening a `.md` from the file manager (or a second
   `mdedit file.md` in a terminal) adds a tab to the running window instead of
   starting a second copy. Selecting several files at once opens them all.
+  A first launch from a terminal holds the shell until the window closes;
+  `mdedit --detach` (with or without files) returns the prompt immediately.
+  A second launch already does — it only forwards its files and exits.
 - **WYSIWYG editing** — markdown is rendered with `pulldown-cmark` into an
   editable view; edits are serialized back to clean markdown source. Toggle to
   a raw **markdown source** mode any time (`Ctrl+Shift+M`).
@@ -50,7 +53,8 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
   buttons with live enabled state, menu items, `Ctrl+Z`/`Ctrl+Shift+Z`/`Ctrl+Y`.
 - Window title shows the active tab (`notes.md - mdedit`, `*` when modified),
   word/char count status bar, light + dark theme, open files from the CLI:
-  `mdedit notes.md draft.md`.
+  `mdedit notes.md draft.md`, or `mdedit --detach notes.md` to background a
+  first launch.
 - **Drag & drop** markdown files onto the window to open them as tabs, and
   installed bundles register a **file association** for
   `.md`/`.markdown`/`.mdown`/`.mkd`, so "Open With → mdedit" and double-click

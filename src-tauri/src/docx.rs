@@ -20,10 +20,7 @@ pub fn docx_to_markdown(bytes: &[u8]) -> Result<String, String> {
     convert(&document, &rels, &numbering)
 }
 
-fn read_zip_file(
-    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
-    name: &str,
-) -> Option<String> {
+fn read_zip_file(archive: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> Option<String> {
     let mut file = archive.by_name(name).ok()?;
     let mut out = String::new();
     file.read_to_string(&mut out).ok()?;
@@ -36,7 +33,10 @@ fn parse_rels(xml: &str) -> HashMap<String, String> {
     let Ok(doc) = roxmltree::Document::parse(xml) else {
         return map;
     };
-    for rel in doc.descendants().filter(|n| n.has_tag_name_local("Relationship")) {
+    for rel in doc
+        .descendants()
+        .filter(|n| n.has_tag_name_local("Relationship"))
+    {
         if let (Some(id), Some(target)) = (rel.attribute("Id"), rel.attribute("Target")) {
             map.insert(id.to_string(), target.to_string());
         }
@@ -51,11 +51,18 @@ fn parse_numbering(xml: &str) -> HashMap<String, HashMap<String, bool>> {
     let Ok(doc) = roxmltree::Document::parse(xml) else {
         return map;
     };
-    for an in doc.descendants().filter(|n| n.has_tag_name_local("abstractNum")) {
-        let Some(id) = an.attr_local("abstractNumId") else { continue };
+    for an in doc
+        .descendants()
+        .filter(|n| n.has_tag_name_local("abstractNum"))
+    {
+        let Some(id) = an.attr_local("abstractNumId") else {
+            continue;
+        };
         let mut levels = HashMap::new();
         for lvl in an.descendants().filter(|n| n.has_tag_name_local("lvl")) {
-            let Some(ilvl) = lvl.attr_local("ilvl") else { continue };
+            let Some(ilvl) = lvl.attr_local("ilvl") else {
+                continue;
+            };
             let fmt = lvl
                 .children()
                 .find(|n| n.has_tag_name_local("numFmt"))
@@ -66,7 +73,9 @@ fn parse_numbering(xml: &str) -> HashMap<String, HashMap<String, bool>> {
         abstract_levels.insert(id.to_string(), levels);
     }
     for num in doc.descendants().filter(|n| n.has_tag_name_local("num")) {
-        let Some(num_id) = num.attr_local("numId") else { continue };
+        let Some(num_id) = num.attr_local("numId") else {
+            continue;
+        };
         let Some(abs) = num
             .children()
             .find(|n| n.has_tag_name_local("abstractNumId"))
@@ -110,8 +119,7 @@ struct Ctx {
 }
 
 fn convert(document: &str, rels: &str, numbering: &str) -> Result<String, String> {
-    let doc =
-        roxmltree::Document::parse(document).map_err(|e| format!("bad document.xml: {e}"))?;
+    let doc = roxmltree::Document::parse(document).map_err(|e| format!("bad document.xml: {e}"))?;
     let ctx = Ctx {
         rels: parse_rels(rels),
         numbering: parse_numbering(numbering),
@@ -219,7 +227,10 @@ fn paragraph_to_md(p: &Node, ctx: &Ctx) -> Option<(BlockKind, String)> {
         let flat = text.replace("\\\n", " ");
         return Some((BlockKind::Normal, format!("{} {flat}", "#".repeat(heading))));
     }
-    if matches!(style.as_str(), "Quote" | "IntenseQuote" | "BlockQuote" | "BlockQuotation") {
+    if matches!(
+        style.as_str(),
+        "Quote" | "IntenseQuote" | "BlockQuote" | "BlockQuotation"
+    ) {
         let quoted = text
             .lines()
             .map(|l| format!("> {l}"))
@@ -271,7 +282,9 @@ fn run_to_md(r: &Node) -> String {
         pr.map(|pr| {
             pr.children().any(|n| {
                 n.has_tag_name_local(name)
-                    && n.attr_local("val").map(|v| v != "0" && v != "false").unwrap_or(true)
+                    && n.attr_local("val")
+                        .map(|v| v != "0" && v != "false")
+                        .unwrap_or(true)
             })
         })
         .unwrap_or(false)
@@ -368,7 +381,10 @@ fn escape_md(s: &str) -> String {
             out.push(' ');
             continue;
         }
-        if matches!(c, '\\' | '`' | '*' | '_' | '[' | ']' | '~' | '<' | '&' | '#' | '>') {
+        if matches!(
+            c,
+            '\\' | '`' | '*' | '_' | '[' | ']' | '~' | '<' | '&' | '#' | '>'
+        ) {
             out.push('\\');
         }
         out.push(c);
@@ -398,9 +414,8 @@ mod tests {
 
     #[test]
     fn hyperlinks_resolve_rels() {
-        let d = doc(
-            r#"<w:p><w:hyperlink r:id="rId4"><w:r><w:t>site</w:t></w:r></w:hyperlink></w:p>"#,
-        );
+        let d =
+            doc(r#"<w:p><w:hyperlink r:id="rId4"><w:r><w:t>site</w:t></w:r></w:hyperlink></w:p>"#);
         let rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId4" Target="https://example.com" TargetMode="External"/></Relationships>"#;
         let md = convert(&d, rels, "").unwrap();
         assert_eq!(md, "[site](https://example.com)\n");
@@ -427,14 +442,12 @@ mod tests {
 
     #[test]
     fn tables_and_quotes() {
-        let d = doc(
-            r#"<w:tbl>
+        let d = doc(r#"<w:tbl>
                  <w:tr><w:tc><w:p><w:r><w:t>H1</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>H2</w:t></w:r></w:p></w:tc></w:tr>
                  <w:tr><w:tc><w:p><w:r><w:t>a|b</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>c</w:t></w:r></w:p></w:tc></w:tr>
                </w:tbl>
                <w:p><w:pPr><w:pStyle w:val="Quote"/></w:pPr><w:r><w:t>wise words</w:t></w:r></w:p>
-               <w:p><w:pPr><w:pStyle w:val="Quote"/></w:pPr><w:r><w:t>more words</w:t></w:r></w:p>"#,
-        );
+               <w:p><w:pPr><w:pStyle w:val="Quote"/></w:pPr><w:r><w:t>more words</w:t></w:r></w:p>"#);
         let md = convert(&d, "", "").unwrap();
         assert_eq!(
             md,

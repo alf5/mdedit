@@ -52,6 +52,50 @@ impl DocKind {
     }
 }
 
+/// Extra typography for rendered markdown. The unclassed default is the
+/// GitHub-flavored sheet in `document.css`; the others add a class.
+#[derive(Clone, Copy, PartialEq)]
+enum MdStyle {
+    Ogma,
+    Default,
+    Manuscript,
+    Compact,
+    Typewriter,
+}
+
+impl MdStyle {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ogma => "ogma",
+            Self::Default => "default",
+            Self::Manuscript => "manuscript",
+            Self::Compact => "compact",
+            Self::Typewriter => "typewriter",
+        }
+    }
+
+    fn from_str(s: &str) -> Self {
+        match s {
+            "ogma" => Self::Ogma,
+            "manuscript" => Self::Manuscript,
+            "compact" => Self::Compact,
+            "typewriter" => Self::Typewriter,
+            _ => Self::Default,
+        }
+    }
+
+    /// Extra class on `.markdown-body`, or empty for the GitHub default sheet.
+    fn class(self) -> &'static str {
+        match self {
+            Self::Ogma => "md-style-ogma",
+            Self::Default => "",
+            Self::Manuscript => "md-style-manuscript",
+            Self::Compact => "md-style-compact",
+            Self::Typewriter => "md-style-typewriter",
+        }
+    }
+}
+
 /// The only two operations that can still destroy unsaved work. Opening and
 /// importing never discard anything — they open a new tab.
 #[derive(Clone, PartialEq)]
@@ -119,6 +163,16 @@ struct Ctl {
     /// generation drops its caret/scroll restore.
     switch_gen: StoredValue<u32>,
     tab_menu: RwSignal<Option<(f64, f64)>>,
+    /// Right-click menu on a single tab: (doc id, x, y).
+    tab_ctx: RwSignal<Option<(u32, f64, f64)>>,
+    /// Toolbar headings submenu: (x, y) of the top-left corner.
+    heading_menu: RwSignal<Option<(f64, f64)>>,
+    /// WYSIWYG column: false is the readable lane, true is the full pane.
+    md_full_width: RwSignal<bool>,
+    /// Extra typography for rendered markdown.
+    md_style: RwSignal<MdStyle>,
+    /// Hierarchical heading and list numbers, layered on any style.
+    md_numbered: RwSignal<bool>,
     tabs_overflow: RwSignal<bool>,
     tabstrip_ref: NodeRef<html::Div>,
     /// Id of the document whose "changed on disk" prompt is showing. An id
@@ -211,6 +265,12 @@ struct Status {
     any_dirty: bool,
     markdown: bool,
     text: bool,
+    project: bool,
+    source: bool,
+    full_width: bool,
+    numbered: bool,
+    style: String,
+    overwrite: bool,
 }
 
 /// One visible row of the project tree.
@@ -335,8 +395,12 @@ fn find_in_chars(hay: &[char], needle: &[char], from: usize, cs: bool) -> Option
     if needle.is_empty() || hay.len() < needle.len() {
         return None;
     }
-    (from..=hay.len() - needle.len())
-        .find(|&i| hay[i..i + needle.len()].iter().zip(needle).all(|(&a, &b)| chars_eq(a, b, cs)))
+    (from..=hay.len() - needle.len()).find(|&i| {
+        hay[i..i + needle.len()]
+            .iter()
+            .zip(needle)
+            .all(|(&a, &b)| chars_eq(a, b, cs))
+    })
 }
 
 fn rfind_in_chars(hay: &[char], needle: &[char], before: usize, cs: bool) -> Option<usize> {
@@ -344,9 +408,12 @@ fn rfind_in_chars(hay: &[char], needle: &[char], before: usize, cs: bool) -> Opt
         return None;
     }
     let end = before.min(hay.len() - needle.len() + 1);
-    (0..end)
-        .rev()
-        .find(|&i| hay[i..i + needle.len()].iter().zip(needle).all(|(&a, &b)| chars_eq(a, b, cs)))
+    (0..end).rev().find(|&i| {
+        hay[i..i + needle.len()]
+            .iter()
+            .zip(needle)
+            .all(|(&a, &b)| chars_eq(a, b, cs))
+    })
 }
 
 fn count_matches(hay: &str, needle: &str, cs: bool) -> usize {
@@ -414,6 +481,10 @@ fn shows_source(ctl: Ctl) -> bool {
             DocKind::Markdown => ctl.mode.get() == Mode::Source,
             _ => false,
         }
+}
+
+fn shows_format_bar(ctl: Ctl) -> bool {
+    has_doc(ctl) && ctl.kind.get() == DocKind::Markdown
 }
 
 fn editor_el(ctl: Ctl) -> Option<web_sys::HtmlDivElement> {
@@ -554,7 +625,11 @@ fn load_markdown(ctl: Ctl, md: &str) {
         Mode::Wysiwyg => {
             if let Some(el) = editor_el(ctl) {
                 let html = to_html(md);
-                el.set_inner_html(if html.is_empty() { "<p><br></p>" } else { &html });
+                el.set_inner_html(if html.is_empty() {
+                    "<p><br></p>"
+                } else {
+                    &html
+                });
                 enable_checkboxes(ctl);
             }
         }
@@ -587,6 +662,12 @@ fn push_status(ctl: Ctl) {
     let kind = ctl.kind.get_untracked();
     let markdown = has_doc_now(ctl) && kind == DocKind::Markdown;
     let text = has_doc_now(ctl) && kind.is_text();
+    let project = ctl.project_open.get_untracked();
+    let source = markdown && ctl.mode.get_untracked() == Mode::Source;
+    let full_width = ctl.md_full_width.get_untracked();
+    let numbered = ctl.md_numbered.get_untracked();
+    let style = ctl.md_style.get_untracked().as_str().to_string();
+    let overwrite = ctl.hex_overwrite.get_untracked();
     // Redundant IPC on every keystroke is pointless, and the comparison is
     // cheap next to a round trip.
     let next = Status {
@@ -595,6 +676,12 @@ fn push_status(ctl: Ctl) {
         any_dirty,
         markdown,
         text,
+        project,
+        source,
+        full_width,
+        numbered,
+        style: style.clone(),
+        overwrite,
     };
     if ctl.last_status.get_value().as_ref() == Some(&next) {
         return;
@@ -607,6 +694,12 @@ fn push_status(ctl: Ctl) {
             any_dirty,
             markdown,
             text,
+            project,
+            source,
+            full_width,
+            numbered,
+            style,
+            overwrite,
         })
         .unwrap();
         let _ = tauri_api::invoke("set_title", args).await;
@@ -638,7 +731,11 @@ fn toggle_mode(ctl: Ctl) {
             ctl.mode.set(Mode::Wysiwyg);
             if let Some(el) = editor_el(ctl) {
                 let html = to_html(&md);
-                el.set_inner_html(if html.is_empty() { "<p><br></p>" } else { &html });
+                el.set_inner_html(if html.is_empty() {
+                    "<p><br></p>"
+                } else {
+                    &html
+                });
                 enable_checkboxes(ctl);
             }
         }
@@ -647,6 +744,7 @@ fn toggle_mode(ctl: Ctl) {
     focus_current(ctl);
     update_in_table(ctl);
     history_sync(ctl);
+    push_status(ctl);
 }
 
 // ---------- undo / redo ----------
@@ -666,9 +764,7 @@ fn capture_current(ctl: Ctl) -> Option<Snap> {
 
 fn history_flags(ctl: Ctl) {
     let (u, r) = match ctl.kind.get_untracked() {
-        DocKind::Binary => ctl
-            .hex
-            .with_value(|h| (h.can_undo(), h.can_redo())),
+        DocKind::Binary => ctl.hex.with_value(|h| (h.can_undo(), h.can_redo())),
         DocKind::Image | DocKind::Oversized => (false, false),
         _ => ctl
             .hist
@@ -709,7 +805,9 @@ fn history_commit(ctl: Ctl) {
 /// burst started.
 fn history_on_input(ctl: Ctl) {
     let now = js_sys::Date::now();
-    let new_burst = ctl.hist.with_value(|h| now - h.last_input > TYPING_BURST_MS);
+    let new_burst = ctl
+        .hist
+        .with_value(|h| now - h.last_input > TYPING_BURST_MS);
     if new_burst {
         history_commit(ctl);
     }
@@ -986,37 +1084,84 @@ fn do_import_docx(ctl: Ctl) {
     });
 }
 
-/// Write the document out as a standalone HTML file.
+/// The standalone document for whatever is on screen: what Export as HTML
+/// writes, what Export as PDF paginates, and what Print sends to the printer.
 ///
-/// The body comes from whichever half of the editor is live, so this exports
+/// The body comes from whichever half of the editor is live, so this renders
 /// what is on screen rather than what is on disk. In WYSIWYG mode that is the
 /// rendered DOM itself — no markdown round-trip, so nothing `dom_to_markdown`
 /// normalizes away can go missing on the way out.
-fn do_export_html(ctl: Ctl) {
+fn rendered_document(ctl: Ctl) -> Option<String> {
     // A diagram open for editing keeps its source in a textarea's value
     // property, which `inner_html` does not serialize — the same reason
     // `stash_active` quiesces before it snapshots.
     quiesce(ctl);
     let body = match eff_mode(ctl) {
-        Mode::Wysiwyg => match editor_el(ctl) {
-            Some(el) => export::body_from_editor(el.unchecked_ref::<Element>()),
-            None => return,
-        },
+        Mode::Wysiwyg => export::body_from_editor(editor_el(ctl)?.unchecked_ref::<Element>()),
         Mode::Source => {
             let md = ta_el(ctl).map(|t| t.value()).unwrap_or_default();
             export::body_from_markdown(&md)
         }
     };
-    let content = export::build_document(&ctl.doc_name.get_untracked(), &body);
+    Some(export::build_document(
+        &ctl.doc_name.get_untracked(),
+        &body,
+        &export_body_class(ctl),
+    ))
+}
+
+/// Write the document out as a standalone HTML file.
+fn do_export_html(ctl: Ctl) {
+    do_export(ctl, "export_html", "Could not export file");
+}
+
+/// Write the document out as PDF. The backend paginates the very same HTML,
+/// in a webview of its own; see `src-tauri/src/pdf.rs`.
+fn do_export_pdf(ctl: Ctl) {
+    do_export(ctl, "export_pdf", "Could not export PDF");
+}
+
+fn do_export(ctl: Ctl, cmd: &'static str, whoops: &'static str) {
+    let Some(content) = rendered_document(ctl) else {
+        return;
+    };
     // The tab's path only seeds the dialog's directory and filename: an export
     // never overwrites the markdown, and never becomes the tab's own path.
     let path = Some(ctl.doc_path.get_untracked()).filter(|p| !p.is_empty());
     spawn_local(async move {
         let args = serde_wasm_bindgen::to_value(&SaveArgs { content, path }).unwrap();
-        if let Err(e) = tauri_api::invoke("export_html", args).await {
-            report_backend_error("Could not export file", &e);
+        if let Err(e) = tauri_api::invoke(cmd, args).await {
+            report_backend_error(whoops, &e);
         }
     });
+}
+
+/// Send the document to the platform's print dialog, from which "print to
+/// file" is another way to a PDF — one that lets the user pick the paper.
+fn do_print(ctl: Ctl) {
+    let Some(content) = rendered_document(ctl) else {
+        return;
+    };
+    if let Err(e) = export::print_document(&content) {
+        report_backend_error("Could not print", &JsValue::from_str(e));
+    }
+}
+
+fn export_body_class(ctl: Ctl) -> String {
+    let mut extra = ctl.md_style.get_untracked().class().to_string();
+    if ctl.md_full_width.get_untracked() {
+        if !extra.is_empty() {
+            extra.push(' ');
+        }
+        extra.push_str("md-full-width");
+    }
+    if ctl.md_numbered.get_untracked() {
+        if !extra.is_empty() {
+            extra.push(' ');
+        }
+        extra.push_str("md-numbered");
+    }
+    extra
 }
 
 fn perform_pending(ctl: Ctl, p: Pending) {
@@ -1045,6 +1190,7 @@ fn do_open_folder(ctl: Ctl) {
 fn set_project_root(ctl: Ctl, root: String) {
     ctl.project_root.set(root.clone());
     ctl.project_open.set(true);
+    push_status(ctl);
     ctl.tree.set(Vec::new());
     spawn_local(async move {
         let rows = read_dir(&root, 0).await;
@@ -1374,6 +1520,7 @@ fn hex_toggle_overwrite(ctl: Ctl) {
     if cur > max {
         ctl.hex_cursor.set(max);
     }
+    push_status(ctl);
 }
 
 fn hex_save(ctl: Ctl, then: Option<Pending>) {
@@ -1559,10 +1706,9 @@ fn set_doc_base(ctl: Ctl, md: &str) {
 }
 
 fn set_stale(ctl: Ctl, id: u32, stale: bool) {
-    let Some(sig) = index_of(ctl, id).and_then(|i| {
-        ctl.docs
-            .with_value(|d| d.get(i).map(|x| x.stale))
-    }) else {
+    let Some(sig) =
+        index_of(ctl, id).and_then(|i| ctl.docs.with_value(|d| d.get(i).map(|x| x.stale)))
+    else {
         return;
     };
     if sig.get_untracked() != stale {
@@ -1610,10 +1756,7 @@ fn maybe_prompt_disk(ctl: Ctl) {
     let Some(i) = ctl.active.get_untracked() else {
         return;
     };
-    let Some((id, stale)) = ctl
-        .docs
-        .with_value(|d| d.get(i).map(|x| (x.id, x.stale)))
-    else {
+    let Some((id, stale)) = ctl.docs.with_value(|d| d.get(i).map(|x| (x.id, x.stale))) else {
         return;
     };
     if stale.get_untracked() {
@@ -1667,7 +1810,11 @@ fn replace_document(ctl: Ctl, md: &str) {
         Mode::Wysiwyg => {
             if let Some(el) = editor_el(ctl) {
                 let html = to_html(md);
-                el.set_inner_html(if html.is_empty() { "<p><br></p>" } else { &html });
+                el.set_inner_html(if html.is_empty() {
+                    "<p><br></p>"
+                } else {
+                    &html
+                });
                 enable_checkboxes(ctl);
             }
         }
@@ -1812,6 +1959,31 @@ fn publish_tabs(ctl: Ctl) {
 
 fn index_of(ctl: Ctl, id: u32) -> Option<usize> {
     ctl.docs.with_value(|d| d.iter().position(|x| x.id == id))
+}
+
+fn tab_path_signal(ctl: Ctl, id: u32) -> Option<RwSignal<String>> {
+    index_of(ctl, id).and_then(|i| ctl.docs.with_value(|d| d.get(i).map(|x| x.path)))
+}
+
+fn tab_path(ctl: Ctl, id: u32) -> String {
+    tab_path_signal(ctl, id)
+        .map(|s| s.get())
+        .unwrap_or_default()
+}
+
+fn open_tab_folder(ctl: Ctl, id: u32) {
+    let path = tab_path_signal(ctl, id)
+        .map(|s| s.get_untracked())
+        .unwrap_or_default();
+    if path.is_empty() {
+        return;
+    }
+    spawn_local(async move {
+        let args = serde_wasm_bindgen::to_value(&tauri_api::PathArgs { path }).unwrap();
+        if let Err(e) = tauri_api::invoke("open_containing_folder", args).await {
+            report_backend_error("Could not open folder", &e);
+        }
+    });
 }
 
 fn active_id(ctl: Ctl) -> Option<u32> {
@@ -1996,6 +2168,7 @@ fn switch_to(ctl: Ctl, i: usize) {
     if ctl.active.get_untracked() == Some(i) || i >= ctl.docs.with_value(Vec::len) {
         return;
     }
+    ctl.heading_menu.set(None);
     stash_active(ctl);
     activate(ctl, i);
 }
@@ -2263,6 +2436,15 @@ fn close_overlays(ctl: Ctl) -> bool {
     let mut closed = false;
     if ctl.ctx_menu.get_untracked().is_some() {
         close_ctx_menu(ctl);
+        closed = true;
+    } else if ctl.heading_menu.get_untracked().is_some() {
+        ctl.heading_menu.set(None);
+        closed = true;
+    } else if ctl.tab_ctx.get_untracked().is_some() {
+        ctl.tab_ctx.set(None);
+        closed = true;
+    } else if ctl.tab_menu.get_untracked().is_some() {
+        ctl.tab_menu.set(None);
         closed = true;
     } else if ctl.url_modal.get_untracked().is_some() {
         ctl.url_modal.set(None);
@@ -2535,7 +2717,9 @@ fn confirm_url_modal(ctl: Ctl) {
         }
         Mode::Source => {
             let md = match kind {
-                UrlKind::Link => format!("[{}]({})", if text.is_empty() { &url } else { &text }, url),
+                UrlKind::Link => {
+                    format!("[{}]({})", if text.is_empty() { &url } else { &text }, url)
+                }
                 UrlKind::Image => format!("![{text}]({url})"),
             };
             ta_replace_selection(ctl, &md);
@@ -2633,7 +2817,10 @@ fn strip_block_prefix(l: &str) -> &str {
         if let Some(r) = s.strip_prefix("> ") {
             s = r;
         }
-        if let Some(r) = s.strip_prefix("- [ ] ").or_else(|| s.strip_prefix("- [x] ")) {
+        if let Some(r) = s
+            .strip_prefix("- [ ] ")
+            .or_else(|| s.strip_prefix("- [x] "))
+        {
             s = r;
         } else if let Some(r) = s.strip_prefix("- ") {
             s = r;
@@ -2646,7 +2833,8 @@ fn strip_block_prefix(l: &str) -> &str {
 }
 
 /// Starter diagram for Insert → Mermaid Diagram.
-const MERMAID_MD: &str = "graph TD\n  A[Start] --> B{Choice}\n  B -->|yes| C[Do it]\n  B -->|no| D[Stop]\n";
+const MERMAID_MD: &str =
+    "graph TD\n  A[Start] --> B{Choice}\n  B -->|yes| C[Do it]\n  B -->|no| D[Stop]\n";
 
 const TABLE_MD: &str = "\n| Col 1 | Col 2 | Col 3 |\n| --- | --- | --- |\n|  |  |  |\n|  |  |  |\n";
 const TABLE_HTML: &str = "<table><thead><tr><th>Col 1</th><th>Col 2</th><th>Col 3</th></tr></thead><tbody><tr><td><br></td><td><br></td><td><br></td></tr><tr><td><br></td><td><br></td><td><br></td></tr></tbody></table><p><br></p>";
@@ -2681,6 +2869,9 @@ fn fmt_action(ctl: Ctl, action: &str) {
             "fmt_h1" => exec_val("formatBlock", "<h1>"),
             "fmt_h2" => exec_val("formatBlock", "<h2>"),
             "fmt_h3" => exec_val("formatBlock", "<h3>"),
+            "fmt_h4" => exec_val("formatBlock", "<h4>"),
+            "fmt_h5" => exec_val("formatBlock", "<h5>"),
+            "fmt_h6" => exec_val("formatBlock", "<h6>"),
             "fmt_p" => exec_val("formatBlock", "<p>"),
             "fmt_ul" => exec("insertUnorderedList"),
             "fmt_ol" => exec("insertOrderedList"),
@@ -2710,6 +2901,9 @@ fn fmt_action(ctl: Ctl, action: &str) {
             "fmt_h1" => ta_lines(ctl, &|_, l| format!("# {}", strip_block_prefix(l))),
             "fmt_h2" => ta_lines(ctl, &|_, l| format!("## {}", strip_block_prefix(l))),
             "fmt_h3" => ta_lines(ctl, &|_, l| format!("### {}", strip_block_prefix(l))),
+            "fmt_h4" => ta_lines(ctl, &|_, l| format!("#### {}", strip_block_prefix(l))),
+            "fmt_h5" => ta_lines(ctl, &|_, l| format!("##### {}", strip_block_prefix(l))),
+            "fmt_h6" => ta_lines(ctl, &|_, l| format!("###### {}", strip_block_prefix(l))),
             "fmt_p" => ta_lines(ctl, &|_, l| strip_block_prefix(l).to_string()),
             "fmt_ul" => ta_lines(ctl, &|_, l| format!("- {}", strip_block_prefix(l))),
             "fmt_ol" => ta_lines(ctl, &|i, l| format!("{}. {}", i + 1, strip_block_prefix(l))),
@@ -2717,9 +2911,7 @@ fn fmt_action(ctl: Ctl, action: &str) {
             "fmt_quote" => ta_lines(ctl, &|_, l| format!("> {l}")),
             "fmt_codeblock" => ta_surround(ctl, "```\n", "\n```"),
             "fmt_table" => ta_replace_selection(ctl, TABLE_MD),
-            "fmt_mermaid" => {
-                ta_replace_selection(ctl, &format!("\n```mermaid\n{MERMAID_MD}```\n"))
-            }
+            "fmt_mermaid" => ta_replace_selection(ctl, &format!("\n```mermaid\n{MERMAID_MD}```\n")),
             "fmt_hr" => ta_replace_selection(ctl, "\n\n---\n\n"),
             _ => {}
         }
@@ -2983,8 +3175,8 @@ fn table_delete_table(ctl: Ctl) {
 }
 
 fn update_in_table(ctl: Ctl) {
-    let inside = eff_mode(ctl) == Mode::Wysiwyg
-        && selection_element().and_then(|e| cell_from(&e)).is_some();
+    let inside =
+        eff_mode(ctl) == Mode::Wysiwyg && selection_element().and_then(|e| cell_from(&e)).is_some();
     if ctl.in_table.get_untracked() != inside {
         ctl.in_table.set(inside);
     }
@@ -3056,13 +3248,22 @@ fn do_action(ctl: Ctl, action: &str) {
     }
     // A picture is not a document. Everything that writes, searches or
     // formats is meant for one, and the tab strip now holds things that are
-    // none of those — the toolbar is disabled to match, but menu accelerators
-    // reach past it.
+    // none of those — the formatting bar is hidden to match, but menu
+    // accelerators reach past it.
     let kind = ctl.kind.get_untracked();
     if kind != DocKind::Markdown
         && (action.starts_with("fmt_")
             || action.starts_with("tbl_")
-            || matches!(action, "toggle_mode" | "export_html"))
+            || action.starts_with("md_style_")
+            || matches!(
+                action,
+                "toggle_mode"
+                    | "export_html"
+                    | "export_pdf"
+                    | "print"
+                    | "toggle_full_width"
+                    | "toggle_numbered"
+            ))
     {
         return;
     }
@@ -3073,13 +3274,18 @@ fn do_action(ctl: Ctl, action: &str) {
         "new" => do_new(ctl),
         "open" => do_open(ctl),
         "open_folder" => do_open_folder(ctl),
-        "toggle_project" => ctl.project_open.update(|v| *v = !*v),
+        "toggle_project" => {
+            ctl.project_open.update(|v| *v = !*v);
+            push_status(ctl);
+        }
         "toggle_overwrite" => hex_toggle_overwrite(ctl),
         "import_html" => do_import_html(ctl),
         "import_docx" => do_import_docx(ctl),
         "save" => do_save(ctl, false, None),
         "save_as" => do_save(ctl, true, None),
         "export_html" => do_export_html(ctl),
+        "export_pdf" => do_export_pdf(ctl),
+        "print" => do_print(ctl),
         "close_tab" => {
             if let Some(id) = active_id(ctl) {
                 close_tab(ctl, id);
@@ -3100,6 +3306,34 @@ fn do_action(ctl: Ctl, action: &str) {
         "find" => open_find(ctl, false),
         "replace" => open_find(ctl, true),
         "toggle_mode" => toggle_mode(ctl),
+        "toggle_full_width" => {
+            ctl.md_full_width.update(|v| *v = !*v);
+            push_status(ctl);
+        }
+        "toggle_numbered" => {
+            ctl.md_numbered.update(|v| *v = !*v);
+            push_status(ctl);
+        }
+        "md_style_ogma" => {
+            ctl.md_style.set(MdStyle::Ogma);
+            push_status(ctl);
+        }
+        "md_style_default" => {
+            ctl.md_style.set(MdStyle::Default);
+            push_status(ctl);
+        }
+        "md_style_manuscript" => {
+            ctl.md_style.set(MdStyle::Manuscript);
+            push_status(ctl);
+        }
+        "md_style_compact" => {
+            ctl.md_style.set(MdStyle::Compact);
+            push_status(ctl);
+        }
+        "md_style_typewriter" => {
+            ctl.md_style.set(MdStyle::Typewriter);
+            push_status(ctl);
+        }
         "tbl_row_above" => table_insert_row(ctl, false),
         "tbl_row_below" => table_insert_row(ctl, true),
         "tbl_col_left" => table_insert_col(ctl, false),
@@ -3111,7 +3345,6 @@ fn do_action(ctl: Ctl, action: &str) {
         _ => {}
     }
 }
-
 
 // The hex editor's own keyboard. It is a grid, not a text field, so
 // nothing here is inherited: every key that does something is listed.
@@ -3398,6 +3631,174 @@ fn tb_btn(
     }
 }
 
+fn heading_item(
+    ctl: Ctl,
+    action: &'static str,
+    label: &'static str,
+    kbd: &'static str,
+) -> impl IntoView {
+    view! {
+        <button
+            class="ctx-item ctx-item-row"
+            on:mousedown=|e| e.prevent_default()
+            on:click=move |_| {
+                ctl.heading_menu.set(None);
+                do_action(ctl, action);
+            }
+        >
+            <span>{label}</span>
+            <span class="ctx-kbd">{kbd}</span>
+        </button>
+    }
+}
+
+/// One toolbar control for H1–H6 and paragraph, instead of seven buttons.
+fn heading_menu(ctl: Ctl) -> impl IntoView {
+    view! {
+        <button
+            class="tb-btn"
+            class:active=move || ctl.heading_menu.get().is_some()
+            title="Headings"
+            prop:disabled=move || !has_doc(ctl) || ctl.kind.get() != DocKind::Markdown
+            on:mousedown=|e| e.prevent_default()
+            on:click=move |e: web_sys::MouseEvent| {
+                if ctl.heading_menu.get_untracked().is_some() {
+                    ctl.heading_menu.set(None);
+                    return;
+                }
+                let Some(el) = e
+                    .current_target()
+                    .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                else {
+                    return;
+                };
+                let r = el.get_bounding_client_rect();
+                ctl.heading_menu.set(Some((r.left(), r.bottom() + 2.0)));
+            }
+        >
+            "H"
+            <span class="tb-caret">"▾"</span>
+        </button>
+        <Show when=move || ctl.heading_menu.get().is_some()>
+            <div
+                class="ctx-backdrop"
+                on:mousedown=move |_| ctl.heading_menu.set(None)
+            ></div>
+            <div
+                class="ctxmenu"
+                style=move || {
+                    let (x, y) = ctl.heading_menu.get().unwrap_or((0.0, 0.0));
+                    format!("left:{x}px;top:{y}px")
+                }
+            >
+                {heading_item(ctl, "fmt_h1", "Heading 1", "Ctrl+1")}
+                {heading_item(ctl, "fmt_h2", "Heading 2", "Ctrl+2")}
+                {heading_item(ctl, "fmt_h3", "Heading 3", "Ctrl+3")}
+                {heading_item(ctl, "fmt_h4", "Heading 4", "Ctrl+4")}
+                {heading_item(ctl, "fmt_h5", "Heading 5", "Ctrl+5")}
+                {heading_item(ctl, "fmt_h6", "Heading 6", "Ctrl+6")}
+                <div class="ctx-sep"></div>
+                {heading_item(ctl, "fmt_p", "Paragraph", "Ctrl+0")}
+            </div>
+        </Show>
+    }
+}
+
+/// Formatting, undo, and the WYSIWYG/source switch. Lives inside the
+/// document column and only for markdown — a picture or a hex dump has
+/// nothing here to act on, and putting the bar above the tabs made the
+/// strip jump when you switched to one.
+fn format_bar(ctl: Ctl) -> impl IntoView {
+    let mode_is = move |m: Mode| ctl.mode.get() == m;
+    let wysiwyg = move || ctl.mode.get() == Mode::Wysiwyg;
+    view! {
+        <div class="toolbar" class:hidden=move || !shows_format_bar(ctl)>
+            <button
+                class="tb-btn"
+                title="Undo (Ctrl+Z)"
+                prop:disabled=move || !ctl.can_undo.get()
+                on:mousedown=|e| e.prevent_default()
+                on:click=move |_| do_action(ctl, "undo")
+            >
+                "↶"
+            </button>
+            <button
+                class="tb-btn"
+                title="Redo (Ctrl+Shift+Z)"
+                prop:disabled=move || !ctl.can_redo.get()
+                on:mousedown=|e| e.prevent_default()
+                on:click=move |_| do_action(ctl, "redo")
+            >
+                "↷"
+            </button>
+            <span class="tb-sep"></span>
+            {tb_btn(ctl, "fmt_bold", "tb-b", "B", "Bold (Ctrl+B)")}
+            {tb_btn(ctl, "fmt_italic", "tb-i", "I", "Italic (Ctrl+I)")}
+            {tb_btn(ctl, "fmt_strike", "tb-s", "S", "Strikethrough (Ctrl+Shift+X)")}
+            {tb_btn(ctl, "fmt_code", "tb-mono", "</>", "Inline code (Ctrl+E)")}
+            <span class="tb-sep"></span>
+            {heading_menu(ctl)}
+            <span class="tb-sep"></span>
+            {tb_btn(ctl, "fmt_ul", "", "•", "Bullet list")}
+            {tb_btn(ctl, "fmt_ol", "", "1.", "Numbered list")}
+            {tb_btn(ctl, "fmt_task", "", "☑", "Task list")}
+            <span class="tb-sep"></span>
+            {tb_btn(ctl, "fmt_quote", "", "❝", "Blockquote")}
+            {tb_btn(ctl, "fmt_codeblock", "tb-mono", "{ }", "Code block")}
+            {tb_btn(ctl, "fmt_link", "", "🔗", "Insert link (Ctrl+K)")}
+            {tb_btn(ctl, "fmt_image", "", "🖼", "Insert image")}
+            {tb_btn(ctl, "fmt_table", "", "⊞", "Insert table")}
+            {tb_btn(ctl, "fmt_hr", "", "―", "Horizontal rule")}
+            <span class="tb-group" class:hidden=move || !ctl.in_table.get()>
+                <span class="tb-sep"></span>
+                {tb_btn(ctl, "tbl_row_above", "tb-text", "Row ↑", "Insert row above")}
+                {tb_btn(ctl, "tbl_row_below", "tb-text", "Row ↓", "Insert row below")}
+                {tb_btn(ctl, "tbl_col_left", "tb-text", "Col ←", "Insert column left")}
+                {tb_btn(ctl, "tbl_col_right", "tb-text", "Col →", "Insert column right")}
+                {tb_btn(ctl, "tbl_del_row", "tb-text", "− Row", "Delete row")}
+                {tb_btn(ctl, "tbl_del_col", "tb-text", "− Col", "Delete column")}
+            </span>
+            <span class="tb-spacer"></span>
+            <select
+                class="tb-select"
+                class:hidden=move || !wysiwyg()
+                title="Rendered markdown style"
+                prop:value=move || ctl.md_style.get().as_str()
+                on:change=move |e| {
+                    ctl.md_style.set(MdStyle::from_str(&event_target_value(&e)));
+                    push_status(ctl);
+                }
+            >
+                <option value="ogma">"Ogma"</option>
+                <option value="default">"GitHub"</option>
+                <option value="manuscript">"Manuscript"</option>
+                <option value="compact">"Compact"</option>
+                <option value="typewriter">"Typewriter"</option>
+            </select>
+            <button
+                class="tb-btn tb-mode"
+                class:active=move || ctl.md_full_width.get()
+                class:hidden=move || !wysiwyg()
+                title="Full-width markdown (otherwise a readable column)"
+                on:mousedown=|e| e.prevent_default()
+                on:click=move |_| do_action(ctl, "toggle_full_width")
+            >
+                "Wide"
+            </button>
+            <button
+                class="tb-btn tb-mode"
+                class:active=move || mode_is(Mode::Source)
+                title="Toggle markdown source (Ctrl+Shift+M)"
+                prop:disabled=move || !has_doc(ctl) || ctl.kind.get() != DocKind::Markdown
+                on:mousedown=|e| e.prevent_default()
+                on:click=move |_| do_action(ctl, "toggle_mode")
+            >
+                {move || if mode_is(Mode::Source) { "WYSIWYG" } else { "Markdown" }}
+            </button>
+        </div>
+    }
+}
+
 #[component]
 pub fn App() -> impl IntoView {
     let ctl = Ctl {
@@ -3437,6 +3838,11 @@ pub fn App() -> impl IntoView {
         next_id: StoredValue::new(0),
         switch_gen: StoredValue::new(0),
         tab_menu: RwSignal::new(None),
+        tab_ctx: RwSignal::new(None),
+        heading_menu: RwSignal::new(None),
+        md_full_width: RwSignal::new(false),
+        md_style: RwSignal::new(MdStyle::Default),
+        md_numbered: RwSignal::new(false),
         tabs_overflow: RwSignal::new(false),
         tabstrip_ref: NodeRef::new(),
         disk_modal: RwSignal::new(None),
@@ -3628,6 +4034,7 @@ pub fn App() -> impl IntoView {
             ("s", false, false) => "save",
             ("s", true, false) => "save_as",
             ("e", true, false) => "export_html",
+            ("p", false, false) => "print",
             ("k", true, false) => "open_folder",
             ("p", true, false) => "toggle_project",
             // The hex editor's mode switch. `Insert` is handled by the hex
@@ -3656,6 +4063,9 @@ pub fn App() -> impl IntoView {
             ("1", false, false) => "fmt_h1",
             ("2", false, false) => "fmt_h2",
             ("3", false, false) => "fmt_h3",
+            ("4", false, false) => "fmt_h4",
+            ("5", false, false) => "fmt_h5",
+            ("6", false, false) => "fmt_h6",
             ("0", false, false) => "fmt_p",
             ("u", false, false) => {
                 // no underline in markdown
@@ -3677,18 +4087,16 @@ pub fn App() -> impl IntoView {
 
     // The webview keeps its own history; reroute it to ours (context-menu
     // Undo, macOS gesture undo, etc.).
-    let on_before_input = move |e: web_sys::InputEvent| {
-        match e.input_type().as_str() {
-            "historyUndo" => {
-                e.prevent_default();
-                do_action(ctl, "undo");
-            }
-            "historyRedo" => {
-                e.prevent_default();
-                do_action(ctl, "redo");
-            }
-            _ => {}
+    let on_before_input = move |e: web_sys::InputEvent| match e.input_type().as_str() {
+        "historyUndo" => {
+            e.prevent_default();
+            do_action(ctl, "undo");
         }
+        "historyRedo" => {
+            e.prevent_default();
+            do_action(ctl, "redo");
+        }
+        _ => {}
     };
 
     let on_editor_keydown = move |e: web_sys::KeyboardEvent| {
@@ -3813,10 +4221,7 @@ pub fn App() -> impl IntoView {
         if eff_mode(ctl) != Mode::Wysiwyg {
             return;
         }
-        let Some(el) = e
-            .target()
-            .and_then(|t| t.dyn_into::<Element>().ok())
-        else {
+        let Some(el) = e.target().and_then(|t| t.dyn_into::<Element>().ok()) else {
             return;
         };
         let Some((cell, _, _)) = cell_from(&el) else {
@@ -3825,8 +4230,16 @@ pub fn App() -> impl IntoView {
         e.prevent_default();
         ctl.ctx_cell.set_value(Some(cell));
         let win = window();
-        let vw = win.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(800.0);
-        let vh = win.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(600.0);
+        let vw = win
+            .inner_width()
+            .ok()
+            .and_then(|v| v.as_f64())
+            .unwrap_or(800.0);
+        let vh = win
+            .inner_height()
+            .ok()
+            .and_then(|v| v.as_f64())
+            .unwrap_or(600.0);
         let x = f64::from(e.client_x()).min(vw - 200.0).max(0.0);
         let y = f64::from(e.client_y()).min(vh - 270.0).max(0.0);
         ctl.ctx_menu.set(Some((x, y)));
@@ -3846,76 +4259,16 @@ pub fn App() -> impl IntoView {
         }
     };
 
-    let mode_is = move |m: Mode| ctl.mode.get() == m;
-
     view! {
         <div class="app">
-            <div class="toolbar">
-                <button
-                    class="tb-btn"
-                    title="Undo (Ctrl+Z)"
-                    prop:disabled=move || !ctl.can_undo.get()
-                    on:mousedown=|e| e.prevent_default()
-                    on:click=move |_| do_action(ctl, "undo")
-                >
-                    "↶"
-                </button>
-                <button
-                    class="tb-btn"
-                    title="Redo (Ctrl+Shift+Z)"
-                    prop:disabled=move || !ctl.can_redo.get()
-                    on:mousedown=|e| e.prevent_default()
-                    on:click=move |_| do_action(ctl, "redo")
-                >
-                    "↷"
-                </button>
-                <span class="tb-sep"></span>
-                {tb_btn(ctl, "fmt_bold", "tb-b", "B", "Bold (Ctrl+B)")}
-                {tb_btn(ctl, "fmt_italic", "tb-i", "I", "Italic (Ctrl+I)")}
-                {tb_btn(ctl, "fmt_strike", "tb-s", "S", "Strikethrough (Ctrl+Shift+X)")}
-                {tb_btn(ctl, "fmt_code", "tb-mono", "</>", "Inline code (Ctrl+E)")}
-                <span class="tb-sep"></span>
-                {tb_btn(ctl, "fmt_h1", "", "H1", "Heading 1 (Ctrl+1)")}
-                {tb_btn(ctl, "fmt_h2", "", "H2", "Heading 2 (Ctrl+2)")}
-                {tb_btn(ctl, "fmt_h3", "", "H3", "Heading 3 (Ctrl+3)")}
-                {tb_btn(ctl, "fmt_p", "", "¶", "Paragraph (Ctrl+0)")}
-                <span class="tb-sep"></span>
-                {tb_btn(ctl, "fmt_ul", "", "•", "Bullet list")}
-                {tb_btn(ctl, "fmt_ol", "", "1.", "Numbered list")}
-                {tb_btn(ctl, "fmt_task", "", "☑", "Task list")}
-                <span class="tb-sep"></span>
-                {tb_btn(ctl, "fmt_quote", "", "❝", "Blockquote")}
-                {tb_btn(ctl, "fmt_codeblock", "tb-mono", "{ }", "Code block")}
-                {tb_btn(ctl, "fmt_link", "", "🔗", "Insert link (Ctrl+K)")}
-                {tb_btn(ctl, "fmt_image", "", "🖼", "Insert image")}
-                {tb_btn(ctl, "fmt_table", "", "⊞", "Insert table")}
-                {tb_btn(ctl, "fmt_hr", "", "―", "Horizontal rule")}
-                <span class="tb-group" class:hidden=move || !ctl.in_table.get()>
-                    <span class="tb-sep"></span>
-                    {tb_btn(ctl, "tbl_row_above", "tb-text", "Row ↑", "Insert row above")}
-                    {tb_btn(ctl, "tbl_row_below", "tb-text", "Row ↓", "Insert row below")}
-                    {tb_btn(ctl, "tbl_col_left", "tb-text", "Col ←", "Insert column left")}
-                    {tb_btn(ctl, "tbl_col_right", "tb-text", "Col →", "Insert column right")}
-                    {tb_btn(ctl, "tbl_del_row", "tb-text", "− Row", "Delete row")}
-                    {tb_btn(ctl, "tbl_del_col", "tb-text", "− Col", "Delete column")}
-                </span>
-                <span class="tb-spacer"></span>
-                <button
-                    class="tb-btn tb-mode"
-                    class:active=move || mode_is(Mode::Source)
-                    title="Toggle markdown source (Ctrl+Shift+M)"
-                    prop:disabled=move || !has_doc(ctl) || ctl.kind.get() != DocKind::Markdown
-                    on:mousedown=|e| e.prevent_default()
-                    on:click=move |_| do_action(ctl, "toggle_mode")
-                >
-                    {move || if mode_is(Mode::Source) { "WYSIWYG" } else { "Markdown" }}
-                </button>
-            </div>
-
             <div class="body">
             {project_pane(ctl)}
             <div class="main">
-            <div class="tabbar" class:hidden=move || !has_doc(ctl)>
+            <div
+                class="tabbar"
+                class:hidden=move || !has_doc(ctl)
+                on:contextmenu=move |e: web_sys::MouseEvent| e.prevent_default()
+            >
                 <div class="tabstrip" node_ref=ctl.tabstrip_ref>
                     <For each=move || ctl.tabs.get() key=|t| t.id let(tab)>
                         <div
@@ -3958,6 +4311,18 @@ pub fn App() -> impl IntoView {
                                 }
                             }
                             on:auxclick=|e: web_sys::MouseEvent| e.prevent_default()
+                            on:contextmenu=move |e: web_sys::MouseEvent| {
+                                e.prevent_default();
+                                e.stop_propagation();
+                                ctl.tab_menu.set(None);
+                                close_ctx_menu(ctl);
+                                let win = window();
+                                let vw = win.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(800.0);
+                                let vh = win.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(600.0);
+                                let x = f64::from(e.client_x()).min(vw - 220.0).max(0.0);
+                                let y = f64::from(e.client_y()).min(vh - 60.0).max(0.0);
+                                ctl.tab_ctx.set(Some((tab.id, x, y)));
+                            }
                         >
                             <span class="tab-name">{move || tab.name.get()}</span>
                             <button
@@ -3992,12 +4357,15 @@ pub fn App() -> impl IntoView {
                             .unwrap_or(800.0);
                         // Anchored from the right so the menu grows leftward
                         // and can never spill off-screen.
+                        ctl.tab_ctx.set(None);
                         ctl.tab_menu.set(Some(((vw - r.right()).max(4.0), r.bottom() + 2.0)));
                     }
                 >
                     "»"
                 </button>
             </div>
+
+            {format_bar(ctl)}
 
             <div class="findbar" class:hidden=move || !ctl.find_open.get() || !has_doc(ctl)>
                 <input
@@ -4065,6 +4433,12 @@ pub fn App() -> impl IntoView {
                 <div
                     class="editor wysiwyg markdown-body"
                     class:hidden=move || !shows_wysiwyg(ctl)
+                    class:md-full-width=move || ctl.md_full_width.get()
+                    class:md-numbered=move || ctl.md_numbered.get()
+                    class:md-style-ogma=move || ctl.md_style.get() == MdStyle::Ogma
+                    class:md-style-manuscript=move || ctl.md_style.get() == MdStyle::Manuscript
+                    class:md-style-compact=move || ctl.md_style.get() == MdStyle::Compact
+                    class:md-style-typewriter=move || ctl.md_style.get() == MdStyle::Typewriter
                     // Not merely hidden: an editor that is momentarily visible
                     // or Tab-reachable must not accept typing into a document
                     // that does not exist.
@@ -4176,6 +4550,49 @@ pub fn App() -> impl IntoView {
                     {ctx_item("tbl_del_row", "Delete row")}
                     {ctx_item("tbl_del_col", "Delete column")}
                     {ctx_item("tbl_del_table", "Delete table")}
+                </div>
+            </Show>
+
+            <Show when=move || ctl.tab_ctx.get().is_some()>
+                <div
+                    class="ctx-backdrop"
+                    on:mousedown=move |_| ctl.tab_ctx.set(None)
+                    on:contextmenu=move |e: web_sys::MouseEvent| {
+                        e.prevent_default();
+                        ctl.tab_ctx.set(None);
+                    }
+                ></div>
+                <div
+                    class="ctxmenu"
+                    style=move || {
+                        let (_, x, y) = ctl.tab_ctx.get().unwrap_or((0, 0.0, 0.0));
+                        format!("left:{x}px;top:{y}px")
+                    }
+                >
+                    <button
+                        class="ctx-item"
+                        title=move || {
+                            let id = ctl.tab_ctx.get().map(|(id, _, _)| id).unwrap_or(0);
+                            if tab_path(ctl, id).is_empty() {
+                                "Save the document first".to_string()
+                            } else {
+                                String::new()
+                            }
+                        }
+                        prop:disabled=move || {
+                            let id = ctl.tab_ctx.get().map(|(id, _, _)| id).unwrap_or(0);
+                            tab_path(ctl, id).is_empty()
+                        }
+                        on:click=move |_| {
+                            let id = ctl.tab_ctx.get_untracked().map(|(id, _, _)| id);
+                            ctl.tab_ctx.set(None);
+                            if let Some(id) = id {
+                                open_tab_folder(ctl, id);
+                            }
+                        }
+                    >
+                        "Open Containing Folder"
+                    </button>
                 </div>
             </Show>
 

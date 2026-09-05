@@ -34,7 +34,9 @@ pub fn capture_wys(editor: &Element) -> Snap {
 fn sync_checkbox_attrs(root: &Element) {
     if let Ok(list) = root.query_selector_all("input[type=checkbox]") {
         for i in 0..list.length() {
-            if let Some(input) = list.item(i).and_then(|n| n.dyn_into::<HtmlInputElement>().ok())
+            if let Some(input) = list
+                .item(i)
+                .and_then(|n| n.dyn_into::<HtmlInputElement>().ok())
             {
                 if input.checked() {
                     let _ = input.set_attribute("checked", "");

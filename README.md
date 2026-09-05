@@ -13,7 +13,9 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
   Each tab keeps its own undo history, view mode, caret and scroll position.
   Close with `Ctrl+W`, the tab's `✕`, or a middle click; a modified tab asks
   before it goes, and quitting walks the modified tabs one at a time. Closing
-  the last tab leaves an empty window rather than quitting.
+  the last tab leaves an empty window rather than quitting. Right-click a tab
+  to **Open Containing Folder** in the OS file manager (disabled until the
+  document has a path).
 - **Recent files** — **File → Open Recent** keeps the last 10 documents,
   remembered between runs in `recent.json` under your config directory.
 - **One instance** — opening a `.md` from the file manager (or a second
@@ -37,12 +39,19 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
   hard panic on `wasm32-unknown-unknown`.)
 - **Formatting toolbar**: bold, italic, strikethrough, inline code, headings,
   bullet/numbered/task lists, blockquote, code block, links, images, tables,
-  horizontal rules — works in both WYSIWYG and source mode.
+  horizontal rules — works in both WYSIWYG and source mode. Shown only for
+  markdown tabs, in the document column (not above the tab strip, and not
+  for images, hex or plain text). In the rendered view, **Wide** toggles
+  between a readable column and the full pane, and a style menu switches
+  Ogma / GitHub / Manuscript / Compact / Typewriter typography.
+  **View → Hierarchical Numbering** overlays outline-style heading and list
+  numbers on any of those. The scrollbar stays on the window's right edge.
 - **Native menus**: File (New / Open / Open Folder / Open Recent / Save /
-  Save As / Export as HTML / Close Tab / Quit), Edit (undo, redo, clipboard,
-  Find / Replace), View (project pane, source toggle, hex overwrite mode,
-  next/previous document), Insert (link, image, table, mermaid diagram, hr,
-  table rows/columns), Format, Help.
+  Save As / Export as HTML / Export as PDF / Print / Close Tab / Quit),
+  Edit (undo, redo, clipboard, Find / Replace), View (project pane, markdown
+  source, full-width, hierarchical numbering, markdown style, hex overwrite —
+  each ticked when on — next/previous document), Insert (link, image, table,
+  mermaid diagram, hr, table rows/columns), Format, Help.
 - **Table editing**: insert row above/below and column left/right, delete
   row/column/table — from the toolbar (shown while the caret is in a table),
   the Insert menu, or a right-click context menu on any table cell.
@@ -109,6 +118,24 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
   ```` ```mermaid ```` fences rather than unrecoverable SVG. Relative image
   links are left as written, so they resolve when the `.html` is saved beside
   the markdown it came from.
+- **PDF export and printing**: **File → Export as PDF…** writes a PDF, and
+  **File → Print…** (`Ctrl/Cmd+P`) opens the system print dialog — from which
+  "print to file" is a second route to a PDF, one that lets you pick the paper.
+  Both paginate the *same* document the HTML export writes, so a PDF is the
+  exported page with page breaks in it and the three renderings cannot drift.
+  There is no second renderer and no bundled browser: the export is printed by
+  whatever machinery the platform's webview already owns — `WebKitPrintOperation`
+  on Linux, `PrintToPdf` on Windows, `NSPrintOperation` on macOS — in a hidden
+  window of its own, so no editor chrome reaches the page.
+
+  The page rules live in `document.css` under `@media print`, which means an
+  exported `.html` printed from a browser breaks its pages the same way: the
+  light palette is pinned (a document composed in dark mode would otherwise
+  print white ink on a background the printer drops), backgrounds are kept so
+  code blocks, table headers and alerts stay distinguishable, headings are not
+  left stranded at the foot of a page, tables, quotes, code blocks and diagrams
+  avoid being split, over-long code lines wrap rather than being clipped, and
+  a diagram taller than the text block is scaled down to it.
 
 ## Keyboard shortcuts
 
@@ -119,6 +146,7 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
 | `Ctrl/Cmd+S` | Save |
 | `Ctrl/Cmd+Shift+S` | Save As |
 | `Ctrl/Cmd+Shift+E` | Export as HTML |
+| `Ctrl/Cmd+P` | Print (or print to file, for a PDF) |
 | `Ctrl/Cmd+Shift+K` | Open folder (project pane) |
 | `Ctrl/Cmd+Shift+P` | Show / hide the project pane |
 | `Insert` or `Ctrl/Cmd+Shift+O` | Hex editor: overwrite / insert mode |
@@ -133,7 +161,7 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
 | `Ctrl/Cmd+Shift+X` | Strikethrough |
 | `Ctrl/Cmd+E` | Inline code |
 | `Ctrl/Cmd+K` | Insert link |
-| `Ctrl/Cmd+1/2/3` / `Ctrl/Cmd+0` | Heading 1–3 / paragraph |
+| `Ctrl/Cmd+1`–`6` / `Ctrl/Cmd+0` | Heading 1–6 / paragraph |
 | `Ctrl/Cmd+V` / `Ctrl/Cmd+Shift+V` | Smart paste / plain paste |
 | `Ctrl/Cmd+Shift+M` | Toggle WYSIWYG / markdown source |
 | `Tab` / `Shift+Tab` | Indent / outdent list item |

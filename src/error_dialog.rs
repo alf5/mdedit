@@ -121,7 +121,11 @@ fn build(title: &str, detail: &str, kind: Kind) -> Option<()> {
     let dismiss = button(
         &doc,
         if kind == Kind::Fatal { "Dismiss" } else { "OK" },
-        if kind == Kind::Fatal { "btn" } else { "btn primary" },
+        if kind == Kind::Fatal {
+            "btn"
+        } else {
+            "btn primary"
+        },
     )?;
     let ov = overlay.clone();
     on_click(&dismiss, move || {

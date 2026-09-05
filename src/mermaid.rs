@@ -140,7 +140,9 @@ mod tests {
     #[test]
     fn keeps_the_source_in_the_data_attribute() {
         let html = render_block("graph LR\n  A[\"x & y\"] --> B\n");
-        assert!(html.contains("data-mermaid=\"graph LR&#10;  A[&quot;x &amp; y&quot;] --&gt; B&#10;\""));
+        assert!(
+            html.contains("data-mermaid=\"graph LR&#10;  A[&quot;x &amp; y&quot;] --&gt; B&#10;\"")
+        );
     }
 
     #[test]

@@ -43,6 +43,12 @@ pub struct TitleArgs {
     pub markdown: bool,
     /// It holds text of some kind, so Save As does.
     pub text: bool,
+    pub project: bool,
+    pub source: bool,
+    pub full_width: bool,
+    pub numbered: bool,
+    pub style: String,
+    pub overwrite: bool,
 }
 
 #[derive(Serialize)]

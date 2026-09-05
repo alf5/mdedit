@@ -1,6 +1,7 @@
 #[cfg(desktop)]
 mod detach;
 mod docx;
+mod pdf;
 mod project;
 mod watch;
 
@@ -8,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent, Wry};
 use tauri_plugin_dialog::DialogExt;
 
@@ -39,6 +40,25 @@ struct DocState {
     /// Enabled for markdown only.
     md_items: Vec<MenuItem<Wry>>,
     doc_menus: Vec<Submenu<Wry>>,
+    /// View-menu check items; ticks are pushed from the frontend.
+    view_checks: Option<ViewChecks>,
+}
+
+/// Native View menu ticks. Separate from `MenuItem` because a check item is
+/// a different type, and every one of these has to be set as a group when
+/// the frontend reports a change.
+#[derive(Clone)]
+struct ViewChecks {
+    project: CheckMenuItem<Wry>,
+    source: CheckMenuItem<Wry>,
+    full_width: CheckMenuItem<Wry>,
+    numbered: CheckMenuItem<Wry>,
+    style_ogma: CheckMenuItem<Wry>,
+    style_github: CheckMenuItem<Wry>,
+    style_manuscript: CheckMenuItem<Wry>,
+    style_compact: CheckMenuItem<Wry>,
+    style_typewriter: CheckMenuItem<Wry>,
+    overwrite: CheckMenuItem<Wry>,
 }
 
 fn is_markdown_file(path: &Path) -> bool {
@@ -110,7 +130,9 @@ fn init_doc(app: AppHandle, state: State<AppState>) -> Vec<project::AnyFile> {
 /// Files named on the command line, whatever they are. Unreadable paths are
 /// skipped, as they were when this only knew about markdown.
 fn read_args(app: &AppHandle, paths: impl Iterator<Item = PathBuf>) -> Vec<project::AnyFile> {
-    paths.filter_map(|p| open_file(app.clone(), p.display().to_string()).ok()).collect()
+    paths
+        .filter_map(|p| open_file(app.clone(), p.display().to_string()).ok())
+        .collect()
 }
 
 /// Pick an HTML file and return its raw contents; the frontend converts it
@@ -126,7 +148,9 @@ async fn import_html(app: AppHandle) -> Result<Option<String>, String> {
         .blocking_pick_file();
     let Some(fp) = picked else { return Ok(None) };
     let path = fp.into_path().map_err(|e| e.to_string())?;
-    std::fs::read_to_string(&path).map(Some).map_err(|e| e.to_string())
+    std::fs::read_to_string(&path)
+        .map(Some)
+        .map_err(|e| e.to_string())
 }
 
 /// Pick a .docx and return it converted to markdown. Like import_html,
@@ -315,7 +339,12 @@ struct MergeResult {
 /// content both last agreed on. Merging accepts the file's current state as
 /// the new baseline, so this re-stamps it exactly as a reload would.
 #[tauri::command]
-fn merge_doc(app: AppHandle, path: String, base: String, mine: String) -> Result<MergeResult, String> {
+fn merge_doc(
+    app: AppHandle,
+    path: String,
+    base: String,
+    mine: String,
+) -> Result<MergeResult, String> {
     let path = PathBuf::from(path);
     let disk = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let (text, conflicted) = watch::merge(&base, &mine, &disk);
@@ -396,6 +425,43 @@ async fn export_html(
     Ok(Some(path.display().to_string()))
 }
 
+/// Directory a file manager should open for this path: the path itself if it
+/// is a directory, otherwise its parent. `None` when the path has no parent
+/// (a bare filename with no directory component).
+fn containing_folder(path: &Path) -> Option<PathBuf> {
+    let dir = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent()?.to_path_buf()
+    };
+    if dir.as_os_str().is_empty() {
+        None
+    } else {
+        Some(dir)
+    }
+}
+
+fn open_in_file_manager(dir: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let mut cmd = std::process::Command::new("explorer");
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = std::process::Command::new("xdg-open");
+    cmd.arg(dir).spawn().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Open the document's folder in the OS file manager. Used by the tab
+/// context menu; a missing parent (never-saved tab) is rejected here so the
+/// frontend can disable the item without a round trip on every render.
+#[tauri::command]
+fn open_containing_folder(path: String) -> Result<(), String> {
+    let path = PathBuf::from(path);
+    let dir = containing_folder(&path).ok_or_else(|| "No containing folder".to_string())?;
+    open_in_file_manager(&dir)
+}
+
 /// The frontend owns the tab list, so it drives the title: `name`/`dirty`
 /// describe the active tab, `any_dirty` covers every tab and gates the
 /// close-confirmation prompt. An empty `name` means no document is open.
@@ -409,6 +475,12 @@ fn set_title(
     any_dirty: bool,
     markdown: bool,
     text: bool,
+    project: bool,
+    source: bool,
+    full_width: bool,
+    numbered: bool,
+    style: String,
+    overwrite: bool,
 ) {
     state.0.lock().unwrap().any_dirty = any_dirty;
     if let Some(w) = app.get_webview_window("main") {
@@ -420,6 +492,9 @@ fn set_title(
         let _ = w.set_title(&title);
     }
     set_doc_menus_enabled(&app, !name.is_empty(), markdown, text);
+    set_view_ticks(
+        &app, project, source, full_width, numbered, &style, overwrite,
+    );
 }
 
 /// Close for real, bypassing the unsaved-changes check.
@@ -452,7 +527,10 @@ struct Prefs {
 }
 
 fn prefs_path(app: &AppHandle) -> Option<PathBuf> {
-    app.path().app_config_dir().ok().map(|d| d.join("recent.json"))
+    app.path()
+        .app_config_dir()
+        .ok()
+        .map(|d| d.join("recent.json"))
 }
 
 /// Never fails loudly: a missing, unreadable or corrupt file just means
@@ -493,7 +571,10 @@ fn elide_start(s: &str, max: usize) -> String {
     if chars.len() <= max {
         return s.to_string();
     }
-    format!("…{}", chars[chars.len() - max + 1..].iter().collect::<String>())
+    format!(
+        "…{}",
+        chars[chars.len() - max + 1..].iter().collect::<String>()
+    )
 }
 
 /// A native menu offers exactly one text run per item — there is no dimmed
@@ -668,6 +749,52 @@ fn set_doc_menus_enabled(app: &AppHandle, has_doc: bool, markdown: bool, text: b
     for m in &menus {
         let _ = m.set_enabled(markdown);
     }
+    if let Some(v) = {
+        let state = app.state::<AppState>();
+        let s = state.0.lock().unwrap();
+        s.view_checks.clone()
+    } {
+        for it in [
+            &v.source,
+            &v.full_width,
+            &v.numbered,
+            &v.style_ogma,
+            &v.style_github,
+            &v.style_manuscript,
+            &v.style_compact,
+            &v.style_typewriter,
+        ] {
+            let _ = it.set_enabled(markdown);
+        }
+    }
+}
+
+fn set_view_ticks(
+    app: &AppHandle,
+    project: bool,
+    source: bool,
+    full_width: bool,
+    numbered: bool,
+    style: &str,
+    overwrite: bool,
+) {
+    let Some(v) = ({
+        let state = app.state::<AppState>();
+        let s = state.0.lock().unwrap();
+        s.view_checks.clone()
+    }) else {
+        return;
+    };
+    let _ = v.project.set_checked(project);
+    let _ = v.source.set_checked(source);
+    let _ = v.full_width.set_checked(full_width);
+    let _ = v.numbered.set_checked(numbered);
+    let _ = v.style_ogma.set_checked(style == "ogma");
+    let _ = v.style_github.set_checked(style == "default");
+    let _ = v.style_manuscript.set_checked(style == "manuscript");
+    let _ = v.style_compact.set_checked(style == "compact");
+    let _ = v.style_typewriter.set_checked(style == "typewriter");
+    let _ = v.overwrite.set_checked(overwrite);
 }
 
 /// The built menu plus the handles that get mutated at runtime.
@@ -680,6 +807,7 @@ struct MenuHandles {
     /// Enabled for markdown only.
     md_items: Vec<MenuItem<Wry>>,
     doc_menus: Vec<Submenu<Wry>>,
+    view_checks: ViewChecks,
 }
 
 fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<MenuHandles> {
@@ -712,6 +840,10 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<MenuHandles> 
         true,
         Some("CmdOrCtrl+Shift+E"),
     )?;
+    // No accelerator: Ctrl+Shift+P is the project pane's, and an export that
+    // opens a save dialog is not something anyone reaches for mid-sentence.
+    let export_pdf = MenuItem::with_id(app, "export_pdf", "Export as PDF…", true, None::<&str>)?;
+    let print = MenuItem::with_id(app, "print", "Print…", true, Some("CmdOrCtrl+P"))?;
 
     let file_menu = Submenu::with_id_and_items(
         app,
@@ -730,11 +862,20 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<MenuHandles> 
             )?,
             &recent_menu,
             &MenuItem::with_id(app, "import_html", "Import HTML…", true, None::<&str>)?,
-            &MenuItem::with_id(app, "import_docx", "Import Word Document…", true, None::<&str>)?,
+            &MenuItem::with_id(
+                app,
+                "import_docx",
+                "Import Word Document…",
+                true,
+                None::<&str>,
+            )?,
             &PredefinedMenuItem::separator(app)?,
             &save,
             &save_as,
             &export,
+            &export_pdf,
+            &PredefinedMenuItem::separator(app)?,
+            &print,
             &PredefinedMenuItem::separator(app)?,
             &close_tab,
             &PredefinedMenuItem::separator(app)?,
@@ -770,6 +911,101 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<MenuHandles> 
         ],
     )?;
 
+    let project_pane = CheckMenuItem::with_id(
+        app,
+        "toggle_project",
+        "Project Pane",
+        true,
+        false,
+        Some("CmdOrCtrl+Shift+P"),
+    )?;
+    let source_mode = CheckMenuItem::with_id(
+        app,
+        "toggle_mode",
+        "Markdown Source",
+        true,
+        false,
+        Some("CmdOrCtrl+Shift+M"),
+    )?;
+    let full_width = CheckMenuItem::with_id(
+        app,
+        "toggle_full_width",
+        "Full Width",
+        true,
+        false,
+        None::<&str>,
+    )?;
+    let numbered = CheckMenuItem::with_id(
+        app,
+        "toggle_numbered",
+        "Hierarchical Numbering",
+        true,
+        false,
+        None::<&str>,
+    )?;
+    let style_ogma =
+        CheckMenuItem::with_id(app, "md_style_ogma", "Ogma", true, false, None::<&str>)?;
+    let style_github =
+        CheckMenuItem::with_id(app, "md_style_default", "GitHub", true, true, None::<&str>)?;
+    let style_manuscript = CheckMenuItem::with_id(
+        app,
+        "md_style_manuscript",
+        "Manuscript",
+        true,
+        false,
+        None::<&str>,
+    )?;
+    let style_compact = CheckMenuItem::with_id(
+        app,
+        "md_style_compact",
+        "Compact",
+        true,
+        false,
+        None::<&str>,
+    )?;
+    let style_typewriter = CheckMenuItem::with_id(
+        app,
+        "md_style_typewriter",
+        "Typewriter",
+        true,
+        false,
+        None::<&str>,
+    )?;
+    let style_menu = Submenu::with_items(
+        app,
+        "Markdown Style",
+        true,
+        &[
+            &style_ogma,
+            &style_github,
+            &style_manuscript,
+            &style_compact,
+            &style_typewriter,
+        ],
+    )?;
+    // Overwrite is the hex editor's default, so the item is born ticked.
+    let overwrite = CheckMenuItem::with_id(
+        app,
+        "toggle_overwrite",
+        "Overwrite Mode (Hex)",
+        true,
+        true,
+        Some("CmdOrCtrl+Shift+O"),
+    )?;
+
+    let view_checks = ViewChecks {
+        project: project_pane.clone(),
+        source: source_mode.clone(),
+        full_width: full_width.clone(),
+        numbered: numbered.clone(),
+        style_ogma: style_ogma.clone(),
+        style_github: style_github.clone(),
+        style_manuscript: style_manuscript.clone(),
+        style_compact: style_compact.clone(),
+        style_typewriter: style_typewriter.clone(),
+        overwrite: overwrite.clone(),
+    };
+
     // Ctrl+Tab / Ctrl+Shift+Tab also cycle documents, but only via the
     // in-page keydown handler: as a *native* accelerator it is unreliable on
     // WebKitGTK, where focus traversal eats it first.
@@ -778,32 +1014,17 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<MenuHandles> 
         "View",
         true,
         &[
-            &MenuItem::with_id(
-                app,
-                "toggle_project",
-                "Project Pane",
-                true,
-                Some("CmdOrCtrl+Shift+P"),
-            )?,
+            &project_pane,
             &PredefinedMenuItem::separator(app)?,
-            &MenuItem::with_id(
-                app,
-                "toggle_mode",
-                "Toggle Markdown Source",
-                true,
-                Some("CmdOrCtrl+Shift+M"),
-            )?,
+            &source_mode,
+            &full_width,
+            &numbered,
+            &style_menu,
             // The hex editor's insert/overwrite switch. `Insert` is the key
             // everyone reaches for and is bound in the keymap, but Apple
             // keyboards have not had one for twenty years, so it needs a
             // second way in that exists on every machine.
-            &MenuItem::with_id(
-                app,
-                "toggle_overwrite",
-                "Overwrite Mode (Hex)",
-                true,
-                Some("CmdOrCtrl+Shift+O"),
-            )?,
+            &overwrite,
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(
                 app,
@@ -851,12 +1072,21 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<MenuHandles> 
         &[
             &MenuItem::with_id(app, "fmt_bold", "Bold", true, Some("CmdOrCtrl+B"))?,
             &MenuItem::with_id(app, "fmt_italic", "Italic", true, Some("CmdOrCtrl+I"))?,
-            &MenuItem::with_id(app, "fmt_strike", "Strikethrough", true, Some("CmdOrCtrl+Shift+X"))?,
+            &MenuItem::with_id(
+                app,
+                "fmt_strike",
+                "Strikethrough",
+                true,
+                Some("CmdOrCtrl+Shift+X"),
+            )?,
             &MenuItem::with_id(app, "fmt_code", "Inline Code", true, Some("CmdOrCtrl+E"))?,
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(app, "fmt_h1", "Heading 1", true, Some("CmdOrCtrl+1"))?,
             &MenuItem::with_id(app, "fmt_h2", "Heading 2", true, Some("CmdOrCtrl+2"))?,
             &MenuItem::with_id(app, "fmt_h3", "Heading 3", true, Some("CmdOrCtrl+3"))?,
+            &MenuItem::with_id(app, "fmt_h4", "Heading 4", true, Some("CmdOrCtrl+4"))?,
+            &MenuItem::with_id(app, "fmt_h5", "Heading 5", true, Some("CmdOrCtrl+5"))?,
+            &MenuItem::with_id(app, "fmt_h6", "Heading 6", true, Some("CmdOrCtrl+6"))?,
             &MenuItem::with_id(app, "fmt_p", "Paragraph", true, Some("CmdOrCtrl+0"))?,
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(app, "fmt_ul", "Bullet List", true, None::<&str>)?,
@@ -872,7 +1102,13 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<MenuHandles> 
         app,
         "Help",
         true,
-        &[&MenuItem::with_id(app, "about", "About mdedit", true, None::<&str>)?],
+        &[&MenuItem::with_id(
+            app,
+            "about",
+            "About mdedit",
+            true,
+            None::<&str>,
+        )?],
     )?;
 
     let menu = Menu::with_items(
@@ -894,8 +1130,9 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<MenuHandles> 
         recent: recent_menu,
         doc_items: vec![save, close_tab],
         text_items: vec![save_as],
-        md_items: vec![export],
-        doc_menus: vec![insert_menu, format_menu],
+        md_items: vec![export, export_pdf, print],
+        doc_menus: vec![insert_menu, format_menu, style_menu],
+        view_checks,
     })
 }
 
@@ -972,9 +1209,25 @@ pub fn run() {
         .manage(AppState(Mutex::new(DocState::default())))
         .manage(watch::Watch::default())
         .invoke_handler(tauri::generate_handler![
-            init_doc, open_doc, import_html, import_docx, export_html, save_doc,
-            save_doc_as, set_title, force_close, show_about, watch_paths, merge_doc,
-            ack_disk_change, open_file, save_bytes, pick_folder, project::list_dir
+            init_doc,
+            open_doc,
+            import_html,
+            import_docx,
+            export_html,
+            pdf::export_pdf,
+            save_doc,
+            save_doc_as,
+            set_title,
+            force_close,
+            show_about,
+            watch_paths,
+            merge_doc,
+            ack_disk_change,
+            open_file,
+            save_bytes,
+            pick_folder,
+            open_containing_folder,
+            project::list_dir
         ])
         .setup(|app| {
             let handle = app.handle();
@@ -991,6 +1244,7 @@ pub fn run() {
             s.text_items = h.text_items;
             s.md_items = h.md_items;
             s.doc_menus = h.doc_menus;
+            s.view_checks = Some(h.view_checks);
             Ok(())
         })
         .on_menu_event(|app, event| {
@@ -1095,4 +1349,30 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod containing_folder_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn file_yields_its_parent() {
+        assert_eq!(
+            containing_folder(Path::new("home/a/notes.md")),
+            Some(PathBuf::from("home/a"))
+        );
+    }
+
+    #[test]
+    fn directory_yields_itself() {
+        let dir = std::env::temp_dir();
+        assert!(dir.is_dir());
+        assert_eq!(containing_folder(&dir), Some(dir));
+    }
+
+    #[test]
+    fn bare_filename_has_no_folder() {
+        assert_eq!(containing_folder(Path::new("notes.md")), None);
+    }
 }

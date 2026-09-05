@@ -124,6 +124,29 @@ body {
   padding: 0 10px;
 }
 
+.tb-select {
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 12.5px;
+  outline: none;
+  cursor: pointer;
+}
+
+.tb-select:hover,
+.tb-select:focus {
+  border-color: var(--accent);
+}
+
+.tb-caret {
+  font-size: 9px;
+  margin-left: 3px;
+  opacity: 0.7;
+}
+
 /* ---------- find bar ---------- */
 
 .find-input {
@@ -609,10 +632,25 @@ body {
 
 .editor {
   flex: 1;
-  overflow-y: auto;
+  overflow-y: scroll;
   padding: 28px 40px 45vh;
   outline: none;
   border: none;
+}
+
+/* The rendered document is a full-pane scroll container; the readable
+   column is padding, so the scrollbar sits on the window's right edge
+   rather than on a centered 860px box. `document.css` still constrains
+   exported HTML with max-width. */
+.editor.markdown-body {
+  max-width: none;
+  margin: 0;
+  width: auto;
+}
+
+.editor.markdown-body:not(.md-full-width) {
+  padding-left: max(40px, calc((100% - var(--md-lane)) / 2));
+  padding-right: max(40px, calc((100% - var(--md-lane)) / 2));
 }
 
 .editor.source {
@@ -741,9 +779,42 @@ body {
   cursor: pointer;
 }
 
+/* More specific than `.ctx-item { display: block }` so the shortcut
+   column can sit on the right edge. */
+.ctx-item.ctx-item-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.ctx-kbd {
+  flex: 0 0 auto;
+  margin-left: auto;
+  text-align: right;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
 .ctx-item:hover {
   background: var(--accent);
   color: var(--accent-text);
+}
+
+.ctx-item:hover .ctx-kbd {
+  color: var(--accent-text);
+  opacity: 0.85;
+}
+
+.ctx-item:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.ctx-item:disabled:hover {
+  background: transparent;
+  color: var(--text);
 }
 
 .ctx-sep {

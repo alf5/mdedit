@@ -390,8 +390,7 @@ fn table_to_md(el: &Element) -> String {
 fn footnote_def_to_md(el: &Element) -> String {
     let name = el.id();
     let blocks = serialize_blocks(el.unchecked_ref(), &|e| {
-        e.tag_name().to_uppercase() == "SUP"
-            && e.class_list().contains("footnote-definition-label")
+        e.tag_name().to_uppercase() == "SUP" && e.class_list().contains("footnote-definition-label")
     });
     let body = blocks.join("\n\n");
     let mut out = String::new();

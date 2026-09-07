@@ -1733,12 +1733,22 @@ fn on_disk_changed(ctl: Ctl, path: String) {
         return;
     };
     // One unanswered question per file: a burst of filesystem events, or a
-    // second external save while the prompt is already up, is still one prompt.
-    if stale.get_untracked() {
-        return;
+    // second external save while the prompt is already up, is still one
+    // prompt — `maybe_prompt_disk` declines to open a second one. But a
+    // marker with no prompt behind it means the last one was dismissed
+    // rather than answered, and a fresh write deserves a fresh ask.
+    if !stale.get_untracked() {
+        stale.set(true);
     }
-    stale.set(true);
     maybe_prompt_disk(ctl);
+}
+
+/// Is a question on screen? Nothing typed while one is up belongs in the
+/// document behind it, and no second question may open over it.
+fn modal_open(ctl: Ctl) -> bool {
+    ctl.disk_modal.get_untracked().is_some()
+        || ctl.pending.get_untracked().is_some()
+        || ctl.url_modal.get_untracked().is_some()
 }
 
 /// Prompt only about the document being looked at. A background tab keeps its
@@ -1747,10 +1757,7 @@ fn on_disk_changed(ctl: Ctl, path: String) {
 fn maybe_prompt_disk(ctl: Ctl) {
     // One modal at a time, and never over an unanswered question about
     // something else.
-    if ctl.disk_modal.get_untracked().is_some()
-        || ctl.pending.get_untracked().is_some()
-        || ctl.url_modal.get_untracked().is_some()
-    {
+    if modal_open(ctl) {
         return;
     }
     let Some(i) = ctl.active.get_untracked() else {
@@ -1761,6 +1768,52 @@ fn maybe_prompt_disk(ctl: Ctl) {
     };
     if stale.get_untracked() {
         ctl.disk_modal.set(Some(id));
+    }
+}
+
+/// Keep Tab inside an open modal, cycling its inputs and buttons.
+///
+/// Two reasons, both found the hard way. A question whose answers cannot be
+/// reached from the keyboard can only be *dismissed*, never answered; and a
+/// Tab that escapes lands in the document the question is about, indenting it
+/// — which turns a clean document dirty behind the very prompt asking what to
+/// do about it, and changes the answers on offer while you look at them.
+fn trap_tab(e: web_sys::KeyboardEvent) {
+    // Ctrl+Tab is the tab-cycling shortcut, and it is not focus movement.
+    if e.key() != "Tab" || e.ctrl_key() || e.meta_key() {
+        return;
+    }
+    let Some(modal) = e
+        .current_target()
+        .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+    else {
+        return;
+    };
+    let Ok(stops) = modal.query_selector_all(".modal-input, .modal-btns .btn") else {
+        return;
+    };
+    let n = stops.length() as i32;
+    if n == 0 {
+        return;
+    }
+    let active = document().active_element();
+    let at = (0..n).find(|i| {
+        stops
+            .item(*i as u32)
+            .zip(active.as_ref())
+            .is_some_and(|(node, a)| node.is_same_node(Some(a.as_ref())))
+    });
+    let step = if e.shift_key() { -1 } else { 1 };
+    // Focus that started outside the modal (it should not, but a stray click
+    // on the overlay can do it) is pulled to the first answer rather than
+    // left where Tab cannot reach anything.
+    let next = at.map_or(0, |i| (i + step).rem_euclid(n));
+    if let Some(el) = stops
+        .item(next as u32)
+        .and_then(|node| node.dyn_into::<web_sys::HtmlElement>().ok())
+    {
+        e.prevent_default();
+        let _ = el.focus();
     }
 }
 
@@ -3916,12 +3969,41 @@ pub fn App() -> impl IntoView {
             recompute_overflow(ctl);
         });
     });
+    // Coming back to the window re-asks about a file whose prompt was
+    // dismissed rather than answered. The backend re-checks every watched
+    // file on the same event; this is the frontend half of it, and the one
+    // that matters when the dismissed question was about the only open tab.
+    window_event_listener(leptos::ev::focus, move |_| {
+        maybe_prompt_disk(ctl);
+    });
+
     // A resize can push the active tab out of view without the tab list
     // changing at all, so it re-runs both.
     window_event_listener(leptos::ev::resize, move |_| {
         scroll_active_tab_into_view(ctl);
         recompute_overflow(ctl);
         hex_recompute_window(ctl);
+    });
+
+    // A question needs a keyboard path to its answers, and focus has to leave
+    // the document the question is about. Both are the same act: focus the
+    // primary button as the modal appears. `trap_tab` keeps focus there.
+    Effect::new(move |_| {
+        if ctl.disk_modal.get().is_none() && ctl.pending.get().is_none() {
+            return;
+        }
+        // The button belongs to the `<Show>` branch this effect just made
+        // itself reactive to; it reaches the DOM a frame later.
+        request_animation_frame(move || {
+            if let Some(btn) = document()
+                .query_selector(".modal .modal-btns .btn")
+                .ok()
+                .flatten()
+                .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
+            {
+                let _ = btn.focus();
+            }
+        });
     });
 
     // How many hex rows fit is a question about a pane that may have only just
@@ -3954,6 +4036,15 @@ pub fn App() -> impl IntoView {
             Err(e) => report_backend_error("Could not open file", &e),
         }
         let menu_cb = Closure::<dyn FnMut(JsValue)>::new(move |ev: JsValue| {
+            // The native menu is *outside* the webview: its accelerators never
+            // reach the window's keydown listener, and its items stay clickable
+            // over an overlay that covers everything the webview draws. So the
+            // rule that shortcuts do not act behind an open question has to be
+            // stated again here, or Ctrl+B bolds the document being asked about
+            // and File → Save writes it.
+            if modal_open(ctl) {
+                return;
+            }
             if let Ok(p) = js_sys::Reflect::get(&ev, &JsValue::from_str("payload")) {
                 if let Some(id) = p.as_string() {
                     do_action(ctl, &id);
@@ -4015,6 +4106,12 @@ pub fn App() -> impl IntoView {
             if close_overlays(ctl) {
                 e.prevent_default();
             }
+            return;
+        }
+        // Every shortcut below acts on the document behind an open question —
+        // bolding it, saving it, closing its tab, opening another. Escape,
+        // handled above, stays live: dismissing is itself an answer to give.
+        if modal_open(ctl) {
             return;
         }
         let ctrl = e.ctrl_key() || e.meta_key();
@@ -4100,6 +4197,14 @@ pub fn App() -> impl IntoView {
     };
 
     let on_editor_keydown = move |e: web_sys::KeyboardEvent| {
+        // A modal is a question *about this document*, so nothing typed while
+        // one is up belongs in it. Opening a modal moves focus into it, which
+        // is what normally keeps keys away from here; this is the belt to
+        // that pair of braces.
+        if modal_open(ctl) {
+            e.prevent_default();
+            return;
+        }
         // Inside a diagram's source the textarea owns the keyboard; Tab there
         // means "indent this line", not "indent the surrounding list".
         if focused_mermaid_source().is_some() {
@@ -4201,6 +4306,10 @@ pub fn App() -> impl IntoView {
     };
 
     let on_ta_keydown = move |e: web_sys::KeyboardEvent| {
+        if modal_open(ctl) {
+            e.prevent_default();
+            return;
+        }
         if e.key() == "Tab" && !e.shift_key() && !e.ctrl_key() && !e.meta_key() {
             e.prevent_default();
             ta_replace_selection(ctl, "  ");
@@ -4287,7 +4396,7 @@ pub fn App() -> impl IntoView {
                                     p
                                 };
                                 if tab.stale.get() {
-                                    format!("{base}\nChanged on disk")
+                                    format!("{base}\nChanged on disk — click to be asked")
                                 } else {
                                     base
                                 }
@@ -4305,7 +4414,17 @@ pub fn App() -> impl IntoView {
                                     }
                                     0 => {
                                         e.prevent_default();
-                                        switch_to_id(ctl, tab.id);
+                                        // Clicking the tab you are already on
+                                        // is how a dismissed prompt is asked
+                                        // for again — `switch_to_id` is a
+                                        // no-op there, so nothing else would
+                                        // come of it. With one tab open it is
+                                        // the only way back to the question.
+                                        if active_doc_id(ctl) == Some(tab.id) {
+                                            maybe_prompt_disk(ctl);
+                                        } else {
+                                            switch_to_id(ctl, tab.id);
+                                        }
                                     }
                                     _ => {}
                                 }
@@ -4635,7 +4754,7 @@ pub fn App() -> impl IntoView {
 
             <Show when=move || ctl.pending.get().is_some()>
                 <div class="overlay">
-                    <div class="modal">
+                    <div class="modal" on:keydown=trap_tab>
                         <p class="modal-title">
                             {move || format!("Save changes to {}?", ctl.doc_name.get())}
                         </p>
@@ -4683,7 +4802,7 @@ pub fn App() -> impl IntoView {
 
             <Show when=move || ctl.disk_modal.get().is_some()>
                 <div class="overlay">
-                    <div class="modal">
+                    <div class="modal" on:keydown=trap_tab>
                         <p class="modal-title">
                             {move || format!("{} changed on disk", ctl.doc_name.get())}
                         </p>
@@ -4722,7 +4841,7 @@ pub fn App() -> impl IntoView {
 
             <Show when=move || ctl.url_modal.get().is_some()>
                 <div class="overlay">
-                    <div class="modal">
+                    <div class="modal" on:keydown=trap_tab>
                         <p class="modal-title">
                             {move || {
                                 match ctl.url_modal.get() {

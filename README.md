@@ -16,6 +16,19 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
   the last tab leaves an empty window rather than quitting. Right-click a tab
   to **Open Containing Folder** in the OS file manager (disabled until the
   document has a path).
+- **Side by side** — split the window into two sides, each with its own tab
+  strip, three ways: **View → Split Right** (`Ctrl/Cmd+\`), **Split Right**
+  on a tab's right-click menu, or by dragging a tab onto the right (or left)
+  half of the document. Once split, the same command reads **Move to Left /
+  Right Side**; dragging a tab onto the other strip puts it there at the drop
+  point, onto the other side's document puts it last, and along its own strip
+  reorders it (`Esc` cancels a drag). **Join Sides** puts everything back on
+  one side, and moving or closing a side's last tab does the same. Drag the
+  divider to give either side 20–80% of the width; double-click it to make
+  them equal again. The side you aren't typing in shows its document exactly
+  as it was left and can be scrolled; click anywhere on it to edit there, with
+  the caret where you clicked. The format and find bars span both sides and
+  act on the side being edited.
 - **Recent files** — **File → Open Recent** keeps the last 10 documents,
   remembered between runs in `recent.json` under your config directory.
 - **One instance** — opening a `.md` from the file manager (or a second
@@ -50,7 +63,8 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
   Save As / Export as HTML / Export as PDF / Print / Close Tab / Quit),
   Edit (undo, redo, clipboard, Find / Replace), View (project pane, markdown
   source, full-width, hierarchical numbering, markdown style, hex overwrite —
-  each ticked when on — next/previous document), Insert (link, image, table,
+  each ticked when on — split right / move to the other side, join sides,
+  next/previous document), Insert (link, image, table,
   mermaid diagram, hr, table rows/columns), Format, Help.
 - **Table editing**: insert row above/below and column left/right, delete
   row/column/table — from the toolbar (shown while the caret is in a table),
@@ -153,6 +167,7 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
 | `Ctrl/Cmd+W` | Close tab |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous document |
 | `Ctrl/Cmd+PageDown` / `PageUp` | Next / previous document |
+| `Ctrl/Cmd+\` | Split right / move the tab to the other side |
 | `Ctrl/Cmd+Z` | Undo |
 | `Ctrl/Cmd+Shift+Z` or `Ctrl+Y` | Redo |
 | `Ctrl/Cmd+F` | Find |

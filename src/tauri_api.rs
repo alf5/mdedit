@@ -14,6 +14,12 @@ extern "C" {
     /// Non-standard but supported by WebKit and Chromium (WebView2).
     #[wasm_bindgen(js_namespace = window, js_name = find)]
     pub fn window_find(search: &str, case_sensitive: bool, backwards: bool, wrap: bool) -> bool;
+
+    /// Non-standard too, and in the same two engines; the standard
+    /// `caretPositionFromPoint` only reached WebKit in 2024. `catch` because
+    /// an engine without it should cost a caret position, not the app.
+    #[wasm_bindgen(js_namespace = document, js_name = caretRangeFromPoint, catch)]
+    pub fn caret_range_from_point(x: f64, y: f64) -> Result<Option<web_sys::Range>, JsValue>;
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -49,6 +55,12 @@ pub struct TitleArgs {
     pub numbered: bool,
     pub style: String,
     pub overwrite: bool,
+    /// The window shows two sides.
+    pub split: bool,
+    /// The side the active tab is on: 0 left, 1 right.
+    pub side: u8,
+    /// More than one tab is open, so there is something to put on a side.
+    pub multi: bool,
 }
 
 #[derive(Serialize)]

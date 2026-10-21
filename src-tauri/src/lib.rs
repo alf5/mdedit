@@ -42,6 +42,17 @@ struct DocState {
     doc_menus: Vec<Submenu<Wry>>,
     /// View-menu check items; ticks are pushed from the frontend.
     view_checks: Option<ViewChecks>,
+    /// View-menu items for the two sides of a split window.
+    side_items: Option<SideItems>,
+}
+
+/// "Split Right" and "Join Sides". The first is relabelled as the window
+/// splits — it is one command, "send this tab across", whose name depends on
+/// which way across is.
+#[derive(Clone)]
+struct SideItems {
+    split: MenuItem<Wry>,
+    join: MenuItem<Wry>,
 }
 
 /// Native View menu ticks. Separate from `MenuItem` because a check item is
@@ -481,6 +492,9 @@ fn set_title(
     numbered: bool,
     style: String,
     overwrite: bool,
+    split: bool,
+    side: u8,
+    multi: bool,
 ) {
     state.0.lock().unwrap().any_dirty = any_dirty;
     if let Some(w) = app.get_webview_window("main") {
@@ -495,6 +509,32 @@ fn set_title(
     set_view_ticks(
         &app, project, source, full_width, numbered, &style, overwrite,
     );
+    set_side_items(&app, split, side, multi);
+}
+
+/// What sending the active tab across is called, which depends on where it
+/// is now. The frontend's tab menu uses the same three names.
+fn side_label(split: bool, side: u8) -> &'static str {
+    match (split, side) {
+        (false, _) => "Split Right",
+        (true, 0) => "Move to Right Side",
+        (true, _) => "Move to Left Side",
+    }
+}
+
+/// A single tab has no other side to go to, and an unsplit window has nothing
+/// to join.
+fn set_side_items(app: &AppHandle, split: bool, side: u8, multi: bool) {
+    let Some(items) = ({
+        let state = app.state::<AppState>();
+        let s = state.0.lock().unwrap();
+        s.side_items.clone()
+    }) else {
+        return;
+    };
+    let _ = items.split.set_text(side_label(split, side));
+    let _ = items.split.set_enabled(multi);
+    let _ = items.join.set_enabled(split);
 }
 
 /// Close for real, bypassing the unsaved-changes check.
@@ -808,6 +848,7 @@ struct MenuHandles {
     md_items: Vec<MenuItem<Wry>>,
     doc_menus: Vec<Submenu<Wry>>,
     view_checks: ViewChecks,
+    side_items: SideItems,
 }
 
 fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<MenuHandles> {
@@ -1006,6 +1047,20 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<MenuHandles> 
         overwrite: overwrite.clone(),
     };
 
+    // Born disabled: the window opens with one tab, which has nowhere to go.
+    let split = MenuItem::with_id(
+        app,
+        "split_move",
+        side_label(false, 0),
+        false,
+        Some("CmdOrCtrl+\\"),
+    )?;
+    let join = MenuItem::with_id(app, "unsplit", "Join Sides", false, None::<&str>)?;
+    let side_items = SideItems {
+        split: split.clone(),
+        join: join.clone(),
+    };
+
     // Ctrl+Tab / Ctrl+Shift+Tab also cycle documents, but only via the
     // in-page keydown handler: as a *native* accelerator it is unreliable on
     // WebKitGTK, where focus traversal eats it first.
@@ -1025,6 +1080,9 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<MenuHandles> 
             // keyboards have not had one for twenty years, so it needs a
             // second way in that exists on every machine.
             &overwrite,
+            &PredefinedMenuItem::separator(app)?,
+            &split,
+            &join,
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(
                 app,
@@ -1133,6 +1191,7 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<MenuHandles> 
         md_items: vec![export, export_pdf, print],
         doc_menus: vec![insert_menu, format_menu, style_menu],
         view_checks,
+        side_items,
     })
 }
 
@@ -1245,6 +1304,7 @@ pub fn run() {
             s.md_items = h.md_items;
             s.doc_menus = h.doc_menus;
             s.view_checks = Some(h.view_checks);
+            s.side_items = Some(h.side_items);
             Ok(())
         })
         .on_menu_event(|app, event| {

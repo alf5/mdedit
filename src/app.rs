@@ -162,7 +162,8 @@ struct Ctl {
     /// Bumped by every `activate`; a queued frame that finds a stale
     /// generation drops its caret/scroll restore.
     switch_gen: StoredValue<u32>,
-    tab_menu: RwSignal<Option<(f64, f64)>>,
+    /// The `»` menu of one side's strip: (side, right, top).
+    tab_menu: RwSignal<Option<(u8, f64, f64)>>,
     /// Right-click menu on a single tab: (doc id, x, y).
     tab_ctx: RwSignal<Option<(u32, f64, f64)>>,
     /// Toolbar headings submenu: (x, y) of the top-left corner.
@@ -173,8 +174,9 @@ struct Ctl {
     md_style: RwSignal<MdStyle>,
     /// Hierarchical heading and list numbers, layered on any style.
     md_numbered: RwSignal<bool>,
-    tabs_overflow: RwSignal<bool>,
-    tabstrip_ref: NodeRef<html::Div>,
+    /// One per side, like everything else about a tab strip.
+    tabs_overflow: [RwSignal<bool>; 2],
+    tabstrip_ref: [NodeRef<html::Div>; 2],
     /// Id of the document whose "changed on disk" prompt is showing. An id
     /// rather than a bool because the answer is applied asynchronously, by
     /// which time the active tab may have moved.
@@ -216,6 +218,28 @@ struct Ctl {
     /// opened from the empty-state button would otherwise belong to that
     /// `<Show>` branch, and be disposed the instant a document exists.
     owner: StoredValue<Option<Owner>, LocalStorage>,
+    // ---- side by side ----
+    /// The document at the front of each side — the one that side shows. The
+    /// focused side's front is always the active document; the other side's
+    /// is shown beside it as a still. Ids, not indices, for the usual reason.
+    front: RwSignal<[Option<u32>; 2]>,
+    /// The left side's share of the width while split.
+    split_ratio: RwSignal<f64>,
+    /// The document the still was last filled from, so that a refresh which
+    /// changes nothing costs nothing.
+    peek_shown: StoredValue<Option<u32>>,
+    peek_kind: RwSignal<DocKind>,
+    peek_mode: RwSignal<Mode>,
+    peek_wys_ref: NodeRef<html::Div>,
+    peek_src_ref: NodeRef<html::Div>,
+    peek_asset_ref: NodeRef<html::Div>,
+    main_ref: NodeRef<html::Div>,
+    /// A press on a tab that may yet turn into a drag.
+    drag_arm: StoredValue<Option<DragArm>>,
+    /// The tab being dragged, once it has moved far enough to count as one.
+    drag: RwSignal<Option<TabDrag>>,
+    /// The divider between the sides is being dragged.
+    resizing: RwSignal<bool>,
 }
 
 /// The stashed state of one document. The *active* document's live state
@@ -254,6 +278,10 @@ struct Doc {
     data: String,
     /// Bytes and their own operation-based undo, for a binary.
     hex: hex::HexDoc,
+    /// Which side of the window the tab is on: 0 is the left, and the only
+    /// side there is until the window is split. `docs` is kept grouped by it,
+    /// left side first, so tab order and Ctrl+Tab still read left to right.
+    pane: u8,
 }
 
 /// What the backend was last told about the active tab: the window title, and
@@ -271,6 +299,9 @@ struct Status {
     numbered: bool,
     style: String,
     overwrite: bool,
+    split: bool,
+    side: u8,
+    multi: bool,
 }
 
 /// One visible row of the project tree.
@@ -295,7 +326,48 @@ struct TabView {
     name: RwSignal<String>,
     dirty: RwSignal<bool>,
     stale: RwSignal<bool>,
+    /// Moving a tab across republishes the list, so a plain copy will do.
+    pane: u8,
 }
+
+/// A press on a tab, kept until the pointer either lets go (a click) or
+/// moves far enough to be dragging it.
+#[derive(Clone, Copy)]
+struct DragArm {
+    id: u32,
+    name: RwSignal<String>,
+    x: f64,
+    y: f64,
+    /// What the tab's side was showing before the press switched to it,
+    /// which is what that side goes back to if the tab is dragged away.
+    shown: Option<u32>,
+}
+
+/// Where a dragged tab would land.
+#[derive(Clone, Copy, PartialEq)]
+enum DropTarget {
+    /// Into a side's tab strip, before the `at`-th of that strip's *other*
+    /// tabs — reordering it, or moving it across.
+    Strip { side: u8, at: usize },
+    /// Onto a side's document area. In an unsplit window that splits it.
+    Side(u8),
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct TabDrag {
+    id: u32,
+    name: RwSignal<String>,
+    x: f64,
+    y: f64,
+    target: Option<DropTarget>,
+    mark: Option<Mark>,
+}
+
+/// A drop indicator, in viewport pixels: (left, top, width, height).
+type Mark = (f64, f64, f64, f64);
+
+/// How far a press must travel before it is a drag rather than a sloppy click.
+const DRAG_SLOP: f64 = 5.0;
 
 #[derive(Default)]
 struct Hist {
@@ -483,8 +555,10 @@ fn shows_source(ctl: Ctl) -> bool {
         }
 }
 
+/// Split, it stays up for every kind of tab, disabled where it means nothing:
+/// it spans both sides, and its coming and going would move both documents.
 fn shows_format_bar(ctl: Ctl) -> bool {
-    has_doc(ctl) && ctl.kind.get() == DocKind::Markdown
+    has_doc(ctl) && (ctl.kind.get() == DocKind::Markdown || is_split(ctl))
 }
 
 fn editor_el(ctl: Ctl) -> Option<web_sys::HtmlDivElement> {
@@ -668,6 +742,9 @@ fn push_status(ctl: Ctl) {
     let numbered = ctl.md_numbered.get_untracked();
     let style = ctl.md_style.get_untracked().as_str().to_string();
     let overwrite = ctl.hex_overwrite.get_untracked();
+    let split = is_split_now(ctl);
+    let side = focus_side_now(ctl);
+    let multi = ctl.docs.with_value(Vec::len) > 1;
     // Redundant IPC on every keystroke is pointless, and the comparison is
     // cheap next to a round trip.
     let next = Status {
@@ -682,6 +759,9 @@ fn push_status(ctl: Ctl) {
         numbered,
         style: style.clone(),
         overwrite,
+        split,
+        side,
+        multi,
     };
     if ctl.last_status.get_value().as_ref() == Some(&next) {
         return;
@@ -700,6 +780,9 @@ fn push_status(ctl: Ctl) {
             numbered,
             style,
             overwrite,
+            split,
+            side,
+            multi,
         })
         .unwrap();
         let _ = tauri_api::invoke("set_title", args).await;
@@ -1302,11 +1385,11 @@ fn open_any(ctl: Ctl, f: tauri_api::AnyFile) {
         ctl.next_id.set_value(n + 1);
         n
     };
-    let doc = make_doc(ctl, id, &f.name, &f.path, false, kind);
-    let i = ctl.docs.with_value(Vec::len);
-    ctl.docs.update_value(|d| d.push(doc));
+    let doc = make_doc(ctl, id, &f.name, &f.path, false, kind, focus_side_now(ctl));
+    let i = insert_doc(ctl, doc);
     publish_tabs(ctl);
     ctl.active.set(Some(i));
+    settle_sides(ctl);
     ctl.hist.set_value(Hist::default());
     install(ctl, &f);
     set_scroll_top(ctl, 0);
@@ -2004,10 +2087,17 @@ fn publish_tabs(ctl: Ctl) {
                 name: doc.name,
                 dirty: doc.dirty,
                 stale: doc.stale,
+                pane: doc.pane,
             })
             .collect::<Vec<_>>()
     });
     ctl.tabs.set(tabs);
+}
+
+/// One side's tabs, in order — what that side's strip iterates over.
+fn side_tabs(ctl: Ctl, side: u8) -> Vec<TabView> {
+    ctl.tabs
+        .with(|t| t.iter().filter(|x| x.pane == side).copied().collect())
 }
 
 fn index_of(ctl: Ctl, id: u32) -> Option<usize> {
@@ -2122,7 +2212,13 @@ fn stash_active(ctl: Ctl) {
             caret: 0,
         }
     };
-    let scroll = if text { scroll_top(ctl) } else { 0 };
+    // A binary keeps its place too: it is what the other side's still of it
+    // shows, and where the hex view comes back to.
+    let scroll = match ctl.kind.get_untracked() {
+        _ if text => scroll_top(ctl),
+        DocKind::Binary => ctl.hex_ref.get_untracked().map_or(0, |e| e.scroll_top()),
+        _ => 0,
+    };
     // Neither `Hist` nor `HexDoc` is worth cloning: move them out and leave
     // defaults behind.
     let mut hist = Hist::default();
@@ -2197,6 +2293,10 @@ fn activate(ctl: Ctl, i: usize) {
     }
     ctl.hist.update_value(|h| h.shadow = Some(snap.clone()));
 
+    // Before the status push: the side this lands on decides the menu's
+    // "Move to …" label.
+    settle_sides(ctl);
+    refresh_peek(ctl);
     recount(ctl);
     history_flags(ctl);
     push_status(ctl);
@@ -2208,6 +2308,18 @@ fn activate(ctl: Ctl, i: usize) {
     request_animation_frame(move || {
         // A second switch may have overtaken this frame.
         if ctl.switch_gen.get_value() != generation {
+            return;
+        }
+        if kind == DocKind::Binary {
+            // Rows are only built for the window in view, so the scroll has
+            // to be in place before that window is worked out.
+            if let Some(el) = ctl.hex_ref.get_untracked() {
+                el.set_scroll_top(scroll);
+                // The kind-change effect focuses the grid too, but going from
+                // one binary to another is no change of kind.
+                let _ = el.focus();
+            }
+            hex_recompute_window(ctl);
             return;
         }
         restore_caret_from(ctl, &snap);
@@ -2236,7 +2348,15 @@ fn switch_to_id(ctl: Ctl, id: u32) {
 /// under the ambient owner is a trap: a tab opened from a handler inside a
 /// `<Show>` or `<For>` gets signals that are disposed when that branch
 /// unmounts, and every later read panics with "already disposed".
-fn make_doc(ctl: Ctl, id: u32, name: &str, path: &str, dirty: bool, kind: DocKind) -> Doc {
+fn make_doc(
+    ctl: Ctl,
+    id: u32,
+    name: &str,
+    path: &str,
+    dirty: bool,
+    kind: DocKind,
+    pane: u8,
+) -> Doc {
     let build = || Doc {
         id,
         name: RwSignal::new(name.to_string()),
@@ -2254,6 +2374,7 @@ fn make_doc(ctl: Ctl, id: u32, name: &str, path: &str, dirty: bool, kind: DocKin
         size: 0,
         data: String::new(),
         hex: hex::HexDoc::default(),
+        pane,
     };
     match ctl.owner.get_value() {
         Some(o) => o.with(build),
@@ -2269,12 +2390,20 @@ fn new_tab(ctl: Ctl, name: &str, path: &str, md: &str, dirty: bool) {
         ctl.next_id.set_value(n + 1);
         n
     };
-    let doc = make_doc(ctl, id, name, path, dirty, DocKind::Markdown);
-    let i = ctl.docs.with_value(Vec::len);
-    ctl.docs.update_value(|d| d.push(doc));
+    let doc = make_doc(
+        ctl,
+        id,
+        name,
+        path,
+        dirty,
+        DocKind::Markdown,
+        focus_side_now(ctl),
+    );
+    let i = insert_doc(ctl, doc);
     publish_tabs(ctl);
 
     ctl.active.set(Some(i));
+    settle_sides(ctl);
     ctl.kind.set(DocKind::Markdown);
     ctl.doc_size.set(0);
     ctl.data.set(String::new());
@@ -2338,25 +2467,43 @@ fn close_tab_forced(ctl: Ctl, id: u32) {
         // No stash: the state is being discarded.
         quiesce(ctl);
     }
+    // Whoever takes this tab's place at the front of its side, decided while
+    // its neighbours can still be told apart from the other side's.
+    let side = side_of(ctl, id);
+    let heir = neighbour(ctl, id);
     ctl.docs.update_value(|d| {
         d.remove(i);
     });
-    publish_tabs(ctl);
+    if ctl.front.get_untracked()[side as usize] == Some(id) {
+        ctl.front.update(|f| f[side as usize] = heir);
+    }
 
     let n = ctl.docs.with_value(Vec::len);
     if n == 0 {
+        publish_tabs(ctl);
         enter_empty_state(ctl);
         return;
     }
     let cur = ctl.active.get_untracked().unwrap_or(0);
     if was_active {
-        let next = i.min(n - 1);
-        ctl.active.set(Some(next));
+        // Focus stays on this side while it has anything left; otherwise it
+        // crosses to what the other side was showing. The side that emptied
+        // is dissolved first, so "the other side" is the only one left.
+        ctl.active.set(None);
+        settle_sides(ctl);
+        publish_tabs(ctl);
+        let next = heir
+            .or(ctl.front.get_untracked()[0])
+            .and_then(|id| index_of(ctl, id))
+            .unwrap_or(0);
         activate(ctl, next);
     } else {
         if cur > i {
             ctl.active.set(Some(cur - 1)); // indices shifted under us
         }
+        settle_sides(ctl);
+        publish_tabs(ctl);
+        refresh_peek(ctl);
         // `any_dirty` may have changed even though the active tab didn't.
         sync_active_doc(ctl);
     }
@@ -2367,6 +2514,8 @@ fn close_tab_forced(ctl: Ctl, id: u32) {
 /// status bar, the undo buttons or the next save.
 fn enter_empty_state(ctl: Ctl) {
     ctl.active.set(None);
+    ctl.front.set([None, None]);
+    refresh_peek(ctl);
     ctl.doc_name.set(String::new());
     ctl.doc_path.set(String::new());
     ctl.dirty.set(false);
@@ -2433,23 +2582,32 @@ fn cycle_tab(ctl: Ctl, delta: isize) {
 /// revealing it cannot shrink the strip and create the overflow that
 /// justified it — that feedback loop flickers at a knife-edge window width.
 fn recompute_overflow(ctl: Ctl) {
-    let Some(strip) = ctl.tabstrip_ref.get_untracked() else {
-        return;
-    };
-    let el: &Element = strip.unchecked_ref();
-    let over = el.scroll_width() > el.client_width();
-    if ctl.tabs_overflow.get_untracked() != over {
-        ctl.tabs_overflow.set(over);
+    for side in 0..2 {
+        let Some(strip) = ctl.tabstrip_ref[side].get_untracked() else {
+            continue;
+        };
+        let el: &Element = strip.unchecked_ref();
+        let over = el.scroll_width() > el.client_width();
+        if ctl.tabs_overflow[side].get_untracked() != over {
+            ctl.tabs_overflow[side].set(over);
+        }
     }
 }
 
-/// Keep the active tab in view, scrolling only when it is actually outside
-/// the strip (`scroll_into_view` re-aligns even when it is already visible).
+/// Keep each side's front tab in view, scrolling only when it is actually
+/// outside its strip (`scroll_into_view` re-aligns even when it is already
+/// visible).
 fn scroll_active_tab_into_view(ctl: Ctl) {
-    let Some(strip) = ctl.tabstrip_ref.get_untracked() else {
+    for side in 0..2 {
+        scroll_front_into_view(ctl, side);
+    }
+}
+
+fn scroll_front_into_view(ctl: Ctl, side: usize) {
+    let Some(strip) = ctl.tabstrip_ref[side].get_untracked() else {
         return;
     };
-    let Ok(Some(tab)) = strip.query_selector(".tab.active") else {
+    let Ok(Some(tab)) = strip.query_selector(".tab.front") else {
         return;
     };
     let Some(tab) = tab.dyn_ref::<web_sys::HtmlElement>() else {
@@ -2465,6 +2623,659 @@ fn scroll_active_tab_into_view(ctl: Ctl) {
     } else if l + w > sl + cw {
         strip.set_scroll_left(l + w - cw);
     }
+}
+
+// ---------- side by side ----------
+//
+// There is still exactly one live editor. A split window puts it on the side
+// the active document is on, and fills the other side with a *still*: the
+// stashed markup of the document at the front of that side, in the same box
+// with the same classes, so it looks exactly as the editor would. Pressing on
+// the still makes its document active, which moves the live editor across —
+// every `fn foo(ctl: Ctl)` keeps meaning "the document being edited", and a
+// split costs one more `innerHTML` rather than a second editor.
+
+/// Reactive: the window shows two sides.
+fn is_split(ctl: Ctl) -> bool {
+    ctl.tabs.with(|t| t.iter().any(|x| x.pane == 1))
+}
+
+fn is_split_now(ctl: Ctl) -> bool {
+    ctl.docs.with_value(|d| d.iter().any(|x| x.pane == 1))
+}
+
+/// Reactive: the side holding the live editor, which is the active
+/// document's side.
+fn focus_side(ctl: Ctl) -> u8 {
+    ctl.active
+        .get()
+        .and_then(|i| ctl.tabs.with(|t| t.get(i).map(|x| x.pane)))
+        .unwrap_or(0)
+}
+
+fn focus_side_now(ctl: Ctl) -> u8 {
+    ctl.active
+        .get_untracked()
+        .and_then(|i| ctl.docs.with_value(|d| d.get(i).map(|x| x.pane)))
+        .unwrap_or(0)
+}
+
+fn side_of(ctl: Ctl, id: u32) -> u8 {
+    ctl.docs
+        .with_value(|d| d.iter().find(|x| x.id == id).map_or(0, |x| x.pane))
+}
+
+/// What the side without focus should be showing, if the window is split.
+fn peek_doc_now(ctl: Ctl) -> Option<u32> {
+    if !is_split_now(ctl) {
+        return None;
+    }
+    ctl.front.get_untracked()[1 - focus_side_now(ctl) as usize]
+}
+
+/// The tab beside `id` on its own side: the one that slides into its slot
+/// when it leaves, else the one before it. Who that side shows next.
+fn neighbour(ctl: Ctl, id: u32) -> Option<u32> {
+    ctl.docs.with_value(|d| {
+        let i = d.iter().position(|x| x.id == id)?;
+        let side = d[i].pane;
+        d.get(i + 1)
+            .filter(|x| x.pane == side)
+            .or_else(|| {
+                i.checked_sub(1)
+                    .and_then(|j| d.get(j))
+                    .filter(|x| x.pane == side)
+            })
+            .map(|x| x.id)
+    })
+}
+
+/// Where in `docs` a document arriving on `side` goes: before the `at`-th of
+/// that side's tabs, or after the last when `at` is `None`. `panes` are the
+/// sides of the documents already there, which are grouped left then right.
+fn slot_for(panes: &[u8], side: u8, at: Option<usize>) -> usize {
+    let start = panes.iter().position(|&p| p >= side).unwrap_or(panes.len());
+    let end = panes
+        .iter()
+        .rposition(|&p| p <= side)
+        .map_or(start, |p| p + 1)
+        .max(start);
+    match at {
+        Some(k) => (start + k).min(end),
+        None => end,
+    }
+}
+
+/// Add a new document at the end of its side's tabs. Returns its index.
+fn insert_doc(ctl: Ctl, doc: Doc) -> usize {
+    let mut i = 0;
+    ctl.docs.update_value(|d| {
+        let panes: Vec<u8> = d.iter().map(|x| x.pane).collect();
+        i = slot_for(&panes, doc.pane, None);
+        d.insert(i, doc);
+    });
+    i
+}
+
+/// Move a document to `side`, at `at` among that side's tabs. This reorders
+/// `docs`, so it re-points `active` itself; the caller republishes the tabs.
+fn place_doc(ctl: Ctl, id: u32, side: u8, at: Option<usize>) {
+    let active = active_doc_id(ctl);
+    ctl.docs.update_value(|d| {
+        let Some(from) = d.iter().position(|x| x.id == id) else {
+            return;
+        };
+        let mut doc = d.remove(from);
+        doc.pane = side;
+        let panes: Vec<u8> = d.iter().map(|x| x.pane).collect();
+        d.insert(slot_for(&panes, side, at), doc);
+    });
+    if let Some(a) = active {
+        let i = index_of(ctl, a);
+        if ctl.active.get_untracked() != i {
+            ctl.active.set(i);
+        }
+    }
+}
+
+/// Restore the rules about sides after anything that might have broken them:
+/// a window is split only while both sides hold a tab, and the left side is
+/// the one that survives; each side's front is one of its own tabs; and the
+/// focused side's front is the active document.
+fn settle_sides(ctl: Ctl) {
+    let left = ctl
+        .docs
+        .with_value(|d| d.iter().filter(|x| x.pane == 0).count());
+    let mut front = ctl.front.get_untracked();
+    if left == 0 && ctl.docs.with_value(|d| !d.is_empty()) {
+        // Everything is on the right, so renumbering keeps `docs` grouped.
+        ctl.docs
+            .update_value(|d| d.iter_mut().for_each(|x| x.pane = 0));
+        front = [front[1], None];
+    }
+    let active = active_doc_id(ctl);
+    let fixed = ctl.docs.with_value(|d| {
+        let mut f = front;
+        if let Some(a) = active.and_then(|a| d.iter().find(|x| x.id == a)) {
+            f[a.pane as usize] = Some(a.id);
+        }
+        for side in 0..2u8 {
+            let s = side as usize;
+            if !f[s].is_some_and(|id| d.iter().any(|x| x.id == id && x.pane == side)) {
+                f[s] = d.iter().find(|x| x.pane == side).map(|x| x.id);
+            }
+        }
+        f
+    });
+    if fixed != ctl.front.get_untracked() {
+        ctl.front.set(fixed);
+    }
+}
+
+/// After tabs have changed sides: settle, repaint both strips and the still,
+/// and tell the menu.
+fn sides_changed(ctl: Ctl) {
+    settle_sides(ctl);
+    publish_tabs(ctl);
+    refresh_peek(ctl);
+    push_status(ctl);
+}
+
+/// What a side shows once `id` has left it: whatever it was showing before
+/// this began (`shown`), unless that is what left — then the tab beside it.
+/// Right-clicking a background tab and sending it across should not change
+/// what the side it came from was showing.
+fn heir_of(ctl: Ctl, id: u32, shown: Option<u32>) -> Option<u32> {
+    let side = side_of(ctl, id);
+    shown
+        .filter(|&s| s != id && index_of(ctl, s).is_some() && side_of(ctl, s) == side)
+        .or_else(|| neighbour(ctl, id))
+}
+
+/// The front of the side `id` is on — taken before anything is switched, for
+/// `heir_of`.
+fn front_of_side(ctl: Ctl, id: u32) -> Option<u32> {
+    ctl.front.get_untracked()[side_of(ctl, id) as usize]
+}
+
+/// Put a document on `side`, at `at` among that side's tabs, or last. Moving
+/// it to the side it is already on reorders it. `shown` is what its side was
+/// showing before the move began; see `heir_of`.
+///
+/// It is made active first. Focus travelling with the document is what lets
+/// the live editor go across with it, rather than the document having to be
+/// stashed on one side and re-rendered on the other.
+fn move_to_side(ctl: Ctl, id: u32, side: u8, at: Option<usize>, shown: Option<u32>) {
+    if ctl.docs.with_value(Vec::len) < 2 {
+        return;
+    }
+    switch_to_id(ctl, id);
+    if active_doc_id(ctl) != Some(id) {
+        return;
+    }
+    let from = side_of(ctl, id);
+    if from != side {
+        let heir = heir_of(ctl, id, shown);
+        ctl.front.update(|f| f[from as usize] = heir);
+    }
+    place_doc(ctl, id, side, at);
+    sides_changed(ctl);
+    focus_current(ctl);
+}
+
+/// Split Right, or once split, Move to Left / Right Side. A side left with
+/// nothing on it is dissolved, so moving the last tab across joins the sides.
+fn send_to_other_side(ctl: Ctl, id: u32) {
+    let side = side_of(ctl, id);
+    move_to_side(ctl, id, 1 - side, None, front_of_side(ctl, id));
+}
+
+/// A tab dropped on the left half of an unsplit window keeps the left side
+/// to itself, and everything else moves right.
+fn split_left(ctl: Ctl, id: u32, shown: Option<u32>) {
+    if ctl.docs.with_value(Vec::len) < 2 {
+        return;
+    }
+    switch_to_id(ctl, id);
+    if active_doc_id(ctl) != Some(id) {
+        return;
+    }
+    let heir = heir_of(ctl, id, shown);
+    ctl.docs.update_value(|d| {
+        for x in d.iter_mut() {
+            x.pane = u8::from(x.id != id);
+        }
+        // Stable, so both sides keep the order their tabs had.
+        d.sort_by_key(|x| x.pane);
+    });
+    ctl.active.set(index_of(ctl, id));
+    ctl.front.set([Some(id), heir]);
+    sides_changed(ctl);
+    focus_current(ctl);
+}
+
+/// Everything back on one side: the right side's tabs follow the left's.
+fn join_sides(ctl: Ctl) {
+    if !is_split_now(ctl) {
+        return;
+    }
+    // Grouped by side already, so this is only a renumbering.
+    ctl.docs
+        .update_value(|d| d.iter_mut().for_each(|x| x.pane = 0));
+    sides_changed(ctl);
+}
+
+/// What sending a tab across is called. The backend names the View menu item
+/// the same way.
+fn side_label(split: bool, side: u8) -> &'static str {
+    match (split, side) {
+        (false, _) => "Split Right",
+        (true, 0) => "Move to Right Side",
+        (true, _) => "Move to Left Side",
+    }
+}
+
+/// Fill the still with whatever the side without focus should be showing.
+///
+/// Only a change of document repaints it. Nothing changes a document's stash
+/// except taking it out of the live editor, and a document leaving the editor
+/// lands somewhere other than the still it was just shown in — so the same
+/// id always means the same picture.
+fn refresh_peek(ctl: Ctl) {
+    let want = peek_doc_now(ctl);
+    if ctl.peek_shown.get_value() == want {
+        return;
+    }
+    ctl.peek_shown.set_value(want);
+    let wys = ctl.peek_wys_ref.get_untracked();
+    let src = ctl.peek_src_ref.get_untracked();
+    let asset = ctl.peek_asset_ref.get_untracked();
+    // All three emptied, not just hidden: a surface the still isn't showing
+    // has no business holding a megabyte of some other document's markup.
+    if let Some(el) = &wys {
+        el.set_inner_html("");
+    }
+    if let Some(el) = &src {
+        el.set_text_content(None);
+    }
+    if let Some(el) = &asset {
+        el.set_inner_html("");
+    }
+    let Some(i) = want.and_then(|id| index_of(ctl, id)) else {
+        return;
+    };
+    // DOM writes only in here; the signals are set after the borrow.
+    let shown = ctl.docs.with_value(|d| {
+        let doc = d.get(i)?;
+        let mode = match (&doc.kind, &doc.snap) {
+            (DocKind::Markdown | DocKind::Text, Snap::Wys { html, .. }) => {
+                if let Some(el) = &wys {
+                    el.set_inner_html(html);
+                }
+                Mode::Wysiwyg
+            }
+            (DocKind::Markdown | DocKind::Text, Snap::Src { text, .. }) => {
+                if let Some(el) = &src {
+                    el.set_text_content(Some(text));
+                }
+                Mode::Source
+            }
+            (DocKind::Image, _) => {
+                if let Some(el) = &asset {
+                    still_image(el, &doc.data);
+                }
+                Mode::Wysiwyg
+            }
+            (DocKind::Binary, _) => {
+                if let Some(el) = &asset {
+                    el.set_inner_html(&hex_still(&doc.hex, doc.scroll));
+                }
+                Mode::Wysiwyg
+            }
+            (DocKind::Oversized, _) => {
+                if let Some(el) = &asset {
+                    el.set_inner_html(&format!(
+                        "<div class=\"asset-view\"><div class=\"empty-state\">\
+                         <p class=\"empty-hint\">Too large to open</p>\
+                         <p class=\"empty-sub\">{} is {}.</p></div></div>",
+                        html_escape(&doc.name.get_untracked()),
+                        human_size(doc.size),
+                    ));
+                }
+                Mode::Wysiwyg
+            }
+        };
+        Some((doc.kind, mode, doc.scroll))
+    });
+    let Some((kind, mode, scroll)) = shown else {
+        return;
+    };
+    ctl.peek_kind.set(kind);
+    ctl.peek_mode.set(mode);
+    // A frame on, when the surface the signals just chose is displayed and
+    // can be scrolled.
+    request_animation_frame(move || {
+        if ctl.peek_shown.get_value() != want || !kind.is_text() {
+            return;
+        }
+        if let Some(el) = peek_still(ctl) {
+            el.set_scroll_top(scroll);
+        }
+    });
+}
+
+/// The still surface in use for a text document, WYSIWYG or source.
+fn peek_still(ctl: Ctl) -> Option<web_sys::HtmlDivElement> {
+    match ctl.peek_mode.get_untracked() {
+        Mode::Wysiwyg => ctl.peek_wys_ref.get_untracked(),
+        Mode::Source => ctl.peek_src_ref.get_untracked(),
+    }
+}
+
+/// An image's still. Built as elements rather than markup: the `data:` URL can
+/// run to twenty megabytes, and formatting it into a string would copy it
+/// once more for nothing.
+fn still_image(holder: &Element, data: &str) {
+    let doc = document();
+    let (Ok(view), Ok(img)) = (doc.create_element("div"), doc.create_element("img")) else {
+        return;
+    };
+    view.set_class_name("asset-view");
+    img.set_class_name("asset-image");
+    let _ = img.set_attribute("alt", "");
+    let _ = img.set_attribute("src", data);
+    let _ = view.append_child(&img);
+    let _ = holder.append_child(&view);
+}
+
+/// A binary's still: a screenful of rows from where it was left, as plain
+/// markup. Every byte carries its offset, so a press on one can put the
+/// cursor there once the side is live.
+fn hex_still(h: &hex::HexDoc, scroll: i32) -> String {
+    use std::fmt::Write;
+    // More than any pane is tall; the still does not scroll.
+    const ROWS: usize = 120;
+    let rows = h.rows();
+    let top = (scroll.max(0) as usize / HEX_ROW_H).min(rows.saturating_sub(1));
+    let mut out = String::from("<div class=\"hex-view peek-hex\">");
+    for row in top..(top + ROWS).min(rows) {
+        let start = row * hex::ROW;
+        let _ = write!(
+            out,
+            "<div class=\"hex-row\"><span class=\"hex-offset\">{}</span><span class=\"hex-bytes\">",
+            hex::offset_label(start)
+        );
+        for i in 0..hex::ROW {
+            let label = h.byte(start + i).map(hex::hex_byte).unwrap_or_default();
+            let gap = if i % 8 == 7 { " gap" } else { "" };
+            let _ = write!(
+                out,
+                "<span class=\"hex-cell{gap}\" data-at=\"{}\">{label}</span>",
+                start + i
+            );
+        }
+        out.push_str("</span><span class=\"hex-ascii\">");
+        for i in 0..hex::ROW {
+            let ch = h.byte(start + i).map(hex::ascii_byte).unwrap_or(' ');
+            let _ = write!(
+                out,
+                "<span class=\"hex-char\" data-at=\"{}\">{}</span>",
+                start + i,
+                html_escape(&ch.to_string())
+            );
+        }
+        out.push_str("</span></div>");
+    }
+    out.push_str("</div>");
+    out
+}
+
+/// The still was scrolled by hand. Its document keeps the position, so that
+/// however it is focused next — a press on the still or on its tab — it
+/// comes back where it was being read rather than where it was left.
+fn note_peek_scroll(ctl: Ctl) {
+    let Some(id) = ctl.peek_shown.get_value() else {
+        return;
+    };
+    let Some(top) = peek_still(ctl).map(|e| e.scroll_top()) else {
+        return;
+    };
+    ctl.docs.update_value(|d| {
+        if let Some(x) = d.iter_mut().find(|x| x.id == id) {
+            x.scroll = top;
+        }
+    });
+}
+
+/// The text offset under a point on a still, in the measure `Snap` keeps a
+/// caret in — so it lands on the same character once the live editor holds
+/// the same markup.
+fn still_offset_at(still: &Element, x: f64, y: f64) -> Option<u32> {
+    let range = tauri_api::caret_range_from_point(x, y).ok().flatten()?;
+    let mut node = range.start_container().ok()?;
+    let mut offset = range.start_offset().ok()?;
+    // In a diagram, or anything else the editor keeps the caret out of: aim
+    // at its doorstep instead.
+    let el = node
+        .dyn_ref::<Element>()
+        .cloned()
+        .or_else(|| node.parent_element());
+    if let Some(block) = el
+        .and_then(|e| e.closest("[contenteditable=false]").ok().flatten())
+        .filter(|b| still.contains(Some(b.as_ref())))
+    {
+        let parent = block.parent_node()?;
+        offset = children(&parent)
+            .iter()
+            .position(|c| c.is_same_node(Some(block.as_ref())))? as u32;
+        node = parent;
+    }
+    history::text_offset_of(still, &node, offset)
+}
+
+/// A press on the still: make its document the one being edited, with the
+/// caret where the press landed.
+fn focus_peek(ctl: Ctl, x: f64, y: f64) {
+    let Some(id) = ctl.peek_shown.get_value() else {
+        return;
+    };
+    let Some(i) = index_of(ctl, id) else {
+        return;
+    };
+    let kind = ctl.docs.with_value(|d| d[i].kind);
+    // Everything is read off the still now: the switch refills it with the
+    // document going the other way.
+    let mut hex_at = None;
+    if kind.is_text() {
+        if let Some(still) = peek_still(ctl) {
+            let scroll = still.scroll_top();
+            let caret = still_offset_at(still.unchecked_ref(), x, y);
+            ctl.docs.update_value(|d| {
+                d[i].scroll = scroll;
+                if let Some(c) = caret {
+                    d[i].snap.set_caret(c);
+                }
+            });
+        }
+    } else if kind == DocKind::Binary {
+        hex_at = document()
+            .element_from_point(x as f32, y as f32)
+            .and_then(|e| e.closest("[data-at]").ok().flatten())
+            .and_then(|e| e.get_attribute("data-at"))
+            .and_then(|s| s.parse::<usize>().ok());
+    }
+    switch_to(ctl, i);
+    if let Some(at) = hex_at {
+        // After `activate`'s own frame has put the rows back.
+        request_animation_frame(move || {
+            request_animation_frame(move || {
+                if active_doc_id(ctl) == Some(id) {
+                    hex_set_cursor(ctl, at);
+                }
+            })
+        });
+    }
+}
+
+/// Where a tab dragged to (x, y) would land, and the mark that says so.
+fn drop_target_at(ctl: Ctl, id: u32, x: f64, y: f64) -> (Option<DropTarget>, Option<Mark>) {
+    let none = (None, None);
+    let Some(el) = document().element_from_point(x as f32, y as f32) else {
+        return none;
+    };
+    let own = side_of(ctl, id);
+    let count = ctl.docs.with_value(Vec::len);
+    // A tab strip: between two tabs, or after the last.
+    if let Some(bar) = el.closest(".tabbar").ok().flatten() {
+        let side: u8 = match bar.get_attribute("data-side").as_deref() {
+            Some("1") => 1,
+            _ => 0,
+        };
+        let others: Vec<Element> = bar
+            .query_selector_all(".tab")
+            .map(|list| {
+                (0..list.length())
+                    .filter_map(|i| list.item(i).and_then(|n| n.dyn_into::<Element>().ok()))
+                    .filter(|t| t.get_attribute("data-id") != Some(id.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Alone in its own strip: there is nowhere in it to go.
+        let Some(last) = others.last() else {
+            return none;
+        };
+        let at = others
+            .iter()
+            .position(|t| {
+                let r = t.get_bounding_client_rect();
+                x < r.left() + r.width() / 2.0
+            })
+            .unwrap_or(others.len());
+        let edge = match others.get(at) {
+            Some(t) => t.get_bounding_client_rect().left() - 2.0,
+            None => last.get_bounding_client_rect().right(),
+        };
+        let r = bar.get_bounding_client_rect();
+        return (
+            Some(DropTarget::Strip { side, at }),
+            Some((edge - 1.0, r.top() + 4.0, 3.0, r.height() - 8.0)),
+        );
+    }
+    // A document area: across to the other side, or, unsplit, either half.
+    let Some(pane) = el.closest(".pane").ok().flatten() else {
+        return none;
+    };
+    if count < 2 {
+        return none;
+    }
+    let r = pane.get_bounding_client_rect();
+    if is_split_now(ctl) {
+        let side: u8 = match pane.get_attribute("data-side").as_deref() {
+            Some("1") => 1,
+            _ => 0,
+        };
+        if side == own {
+            return none;
+        }
+        return (
+            Some(DropTarget::Side(side)),
+            Some((r.left(), r.top(), r.width(), r.height())),
+        );
+    }
+    let half = r.width() / 2.0;
+    let side = u8::from(x >= r.left() + half);
+    (
+        Some(DropTarget::Side(side)),
+        Some((r.left() + half * f64::from(side), r.top(), half, r.height())),
+    )
+}
+
+fn drop_tab(ctl: Ctl, id: u32, target: DropTarget, shown: Option<u32>) {
+    match target {
+        DropTarget::Strip { side, at } => move_to_side(ctl, id, side, Some(at), shown),
+        DropTarget::Side(side) if is_split_now(ctl) => move_to_side(ctl, id, side, None, shown),
+        DropTarget::Side(0) => split_left(ctl, id, shown),
+        DropTarget::Side(_) => move_to_side(ctl, id, 1, None, shown),
+    }
+}
+
+fn cancel_drag(ctl: Ctl) -> bool {
+    let was = ctl.drag_arm.get_value().is_some();
+    ctl.drag_arm.set_value(None);
+    if ctl.drag.get_untracked().is_some() {
+        ctl.drag.set(None);
+    }
+    if ctl.resizing.get_untracked() {
+        ctl.resizing.set(false);
+    }
+    was
+}
+
+/// The pointer moved anywhere in the window: carry a dragged tab or the
+/// divider along with it.
+fn on_pointer_move(ctl: Ctl, e: web_sys::MouseEvent) {
+    let (x, y) = (f64::from(e.client_x()), f64::from(e.client_y()));
+    if ctl.resizing.get_untracked() {
+        resize_split(ctl, x);
+        return;
+    }
+    let Some(arm) = ctl.drag_arm.get_value() else {
+        return;
+    };
+    // Released somewhere the release never reached us.
+    if e.buttons() & 1 == 0 {
+        cancel_drag(ctl);
+        return;
+    }
+    if ctl.drag.get_untracked().is_none() {
+        if (x - arm.x).hypot(y - arm.y) < DRAG_SLOP {
+            return;
+        }
+        // The press that armed this may have raised a question — the tab's
+        // file changed on disk — and nothing moves behind one.
+        if modal_open(ctl) {
+            ctl.drag_arm.set_value(None);
+            return;
+        }
+    }
+    let (target, mark) = drop_target_at(ctl, arm.id, x, y);
+    ctl.drag.set(Some(TabDrag {
+        id: arm.id,
+        name: arm.name,
+        x,
+        y,
+        target,
+        mark,
+    }));
+}
+
+fn on_pointer_up(ctl: Ctl) {
+    if ctl.resizing.get_untracked() {
+        ctl.resizing.set(false);
+        return;
+    }
+    let arm = ctl.drag_arm.get_value();
+    ctl.drag_arm.set_value(None);
+    // No drag: it was a click, and the press already did what a click does.
+    let Some(drag) = ctl.drag.get_untracked() else {
+        return;
+    };
+    ctl.drag.set(None);
+    if let Some(target) = drag.target {
+        drop_tab(ctl, drag.id, target, arm.and_then(|a| a.shown));
+    }
+}
+
+fn resize_split(ctl: Ctl, x: f64) {
+    let Some(main) = ctl.main_ref.get_untracked() else {
+        return;
+    };
+    let r = main.get_bounding_client_rect();
+    if r.width() <= 0.0 {
+        return;
+    }
+    ctl.split_ratio
+        .set(((x - r.left()) / r.width()).clamp(0.2, 0.8));
 }
 
 // ---------- find / replace ----------
@@ -2557,6 +3368,56 @@ fn ta_find(ctl: Ctl, backwards: bool) -> bool {
     true
 }
 
+/// `window.find`, but only ever landing in the live editor.
+///
+/// It searches the whole page, and the page now holds a second document: the
+/// still on the other side of a split window. A match there would select
+/// text that cannot be edited, and replace-all would count it, fail to
+/// replace it, and stop short. So step over anything outside the editor —
+/// at most once per match the page holds, which is all a wrapping search can
+/// visit before it comes round again. A miss puts the selection back where
+/// it was.
+fn find_in_editor(ctl: Ctl, q: &str, cs: bool, backwards: bool) -> bool {
+    let Some(editor) = editor_el(ctl) else {
+        return false;
+    };
+    let sel = window().get_selection().ok().flatten();
+    let before = sel
+        .as_ref()
+        .and_then(|s| s.get_range_at(0).ok())
+        .and_then(|r| r.clone_range().dyn_into::<web_sys::Range>().ok());
+    // Counted only once a match lands outside: replace-all comes through
+    // here once per replacement, and almost every match is in the editor.
+    let mut bound = None;
+    let mut tries = 0;
+    while tauri_api::window_find(q, cs, backwards, true) {
+        let landed = window()
+            .get_selection()
+            .ok()
+            .flatten()
+            .and_then(|s| s.anchor_node());
+        if editor.contains(landed.as_ref()) {
+            return true;
+        }
+        tries += 1;
+        let bound = *bound.get_or_insert_with(|| {
+            let page = document()
+                .body()
+                .and_then(|b| b.text_content())
+                .unwrap_or_default();
+            count_matches(&page, q, cs)
+        });
+        if tries > bound {
+            break;
+        }
+    }
+    if let (Some(sel), Some(range)) = (sel, before) {
+        let _ = sel.remove_all_ranges();
+        let _ = sel.add_range(&range);
+    }
+    false
+}
+
 fn find_next(ctl: Ctl, backwards: bool) {
     let q = ctl.find_q.get_untracked();
     if q.is_empty() {
@@ -2564,7 +3425,7 @@ fn find_next(ctl: Ctl, backwards: bool) {
     }
     match eff_mode(ctl) {
         Mode::Wysiwyg => {
-            tauri_api::window_find(&q, ctl.case_sens.get_untracked(), backwards, true);
+            find_in_editor(ctl, &q, ctl.case_sens.get_untracked(), backwards);
         }
         Mode::Source => {
             ta_find(ctl, backwards);
@@ -2660,7 +3521,7 @@ fn replace_all(ctl: Ctl) {
             }
             focus_current(ctl);
             for _ in 0..total {
-                if !tauri_api::window_find(&q, cs, false, true) {
+                if !find_in_editor(ctl, &q, cs, false) {
                     break;
                 }
                 if selection_matches_query(ctl) {
@@ -3340,12 +4201,18 @@ fn do_action(ctl: Ctl, action: &str) {
         "export_pdf" => do_export_pdf(ctl),
         "print" => do_print(ctl),
         "close_tab" => {
-            if let Some(id) = active_id(ctl) {
+            if let Some(id) = active_doc_id(ctl) {
                 close_tab(ctl, id);
             }
         }
         "next_tab" => cycle_tab(ctl, 1),
         "prev_tab" => cycle_tab(ctl, -1),
+        "split_move" => {
+            if let Some(id) = active_doc_id(ctl) {
+                send_to_other_side(ctl, id);
+            }
+        }
+        "unsplit" => join_sides(ctl),
         // The hex editor keeps its own history: 200 snapshots of a megabyte is
         // not an undo stack, it is a memory leak with a keyboard shortcut.
         "undo" if kind == DocKind::Binary => hex_undo(ctl),
@@ -3517,6 +4384,256 @@ fn project_pane(ctl: Ctl) -> impl IntoView {
                 </Show>
             </div>
         </aside>
+    }
+}
+
+/// One side's tab strip. The left one is the only one until the window is
+/// split; each side's sits over its own column.
+fn tab_bar(ctl: Ctl, side: u8) -> impl IntoView {
+    let s = side as usize;
+    view! {
+        <div
+            class="tabbar"
+            class:side-1=side == 1
+            class:hidden=move || !has_doc(ctl) || (side == 1 && !is_split(ctl))
+            data-side=side.to_string()
+            on:contextmenu=move |e: web_sys::MouseEvent| e.prevent_default()
+        >
+            <div class="tabstrip" node_ref=ctl.tabstrip_ref[s]>
+                <For each=move || side_tabs(ctl, side) key=|t| t.id let(tab)>
+                    {tab_item(ctl, tab)}
+                </For>
+            </div>
+            <button
+                class="tb-btn tab-more"
+                class:invisible=move || !ctl.tabs_overflow[s].get()
+                title="All documents on this side"
+                on:mousedown=|e: web_sys::MouseEvent| e.prevent_default()
+                on:click=move |e: web_sys::MouseEvent| {
+                    let Some(el) = e
+                        .current_target()
+                        .and_then(|t| t.dyn_into::<Element>().ok()) else { return };
+                    let r = el.get_bounding_client_rect();
+                    let vw = window()
+                        .inner_width()
+                        .ok()
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(800.0);
+                    // Anchored from the right so the menu grows leftward
+                    // and can never spill off-screen.
+                    ctl.tab_ctx.set(None);
+                    ctl.tab_menu.set(Some((side, (vw - r.right()).max(4.0), r.bottom() + 2.0)));
+                }
+            >
+                "»"
+            </button>
+        </div>
+    }
+}
+
+fn tab_item(ctl: Ctl, tab: TabView) -> impl IntoView {
+    view! {
+        <div
+            class="tab"
+            class:active=move || active_id(ctl) == Some(tab.id)
+            // What its side is showing — the active tab on the focused side,
+            // the still's on the other.
+            class:front=move || ctl.front.with(|f| f[tab.pane as usize] == Some(tab.id))
+            class:dirty=move || tab.dirty.get()
+            class:stale=move || tab.stale.get()
+            class:dragging=move || ctl.drag.with(|d| d.is_some_and(|d| d.id == tab.id))
+            data-id=tab.id.to_string()
+            title=move || {
+                let p = index_of(ctl, tab.id)
+                    .and_then(|i| ctl.docs.with_value(|d| d.get(i).map(|x| x.path)))
+                    .map(|s| s.get())
+                    .unwrap_or_default();
+                let base = if p.is_empty() {
+                    format!("{} — unsaved", tab.name.get())
+                } else {
+                    p
+                };
+                if tab.stale.get() {
+                    format!("{base}\nChanged on disk — click to be asked")
+                } else {
+                    base
+                }
+            }
+            // Keep the selection inside the editor: it is the
+            // caret we are about to stash, and a bare click on
+            // the strip would collapse it to offset 0.
+            on:mousedown=move |e: web_sys::MouseEvent| {
+                match e.button() {
+                    // Middle click closes. preventDefault here
+                    // (not on auxclick) beats X11 autoscroll.
+                    1 => {
+                        e.prevent_default();
+                        close_tab(ctl, tab.id);
+                    }
+                    0 => {
+                        e.prevent_default();
+                        // It may be the start of a drag, which needs to know
+                        // what this side showed before the switch below.
+                        let shown = front_of_side(ctl, tab.id);
+                        // Clicking the tab you are already on
+                        // is how a dismissed prompt is asked
+                        // for again — `switch_to_id` is a
+                        // no-op there, so nothing else would
+                        // come of it. With one tab open it is
+                        // the only way back to the question.
+                        if active_doc_id(ctl) == Some(tab.id) {
+                            maybe_prompt_disk(ctl);
+                        } else {
+                            switch_to_id(ctl, tab.id);
+                        }
+                        ctl.drag_arm.set_value(Some(DragArm {
+                            id: tab.id,
+                            name: tab.name,
+                            x: f64::from(e.client_x()),
+                            y: f64::from(e.client_y()),
+                            shown,
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+            on:auxclick=|e: web_sys::MouseEvent| e.prevent_default()
+            on:contextmenu=move |e: web_sys::MouseEvent| {
+                e.prevent_default();
+                e.stop_propagation();
+                ctl.tab_menu.set(None);
+                close_ctx_menu(ctl);
+                let win = window();
+                let vw = win.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(800.0);
+                let vh = win.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(600.0);
+                let x = f64::from(e.client_x()).min(vw - 220.0).max(0.0);
+                let y = f64::from(e.client_y()).min(vh - 130.0).max(0.0);
+                ctl.tab_ctx.set(Some((tab.id, x, y)));
+            }
+        >
+            <span class="tab-name">{move || tab.name.get()}</span>
+            <button
+                class="tab-x"
+                title="Close (Ctrl+W)"
+                on:mousedown=move |e: web_sys::MouseEvent| {
+                    e.stop_propagation();
+                    e.prevent_default();
+                }
+                on:click=move |e: web_sys::MouseEvent| {
+                    e.stop_propagation();
+                    close_tab(ctl, tab.id);
+                }
+            ></button>
+        </div>
+    }
+}
+
+/// The side without focus: a still of the document at its front, in the same
+/// box and with the same classes the live editor would give it. A press
+/// anywhere on it makes that document the one being edited.
+fn peek_pane(ctl: Ctl) -> impl IntoView {
+    let peek_side = move || 1 - focus_side(ctl);
+    let text = move || ctl.peek_kind.get().is_text();
+    view! {
+        <div
+            class="pane peek"
+            class:side-1=move || peek_side() == 1
+            class:hidden=move || !is_split(ctl)
+            data-side=move || peek_side().to_string()
+            on:mousedown=move |e: web_sys::MouseEvent| {
+                if e.button() != 0 {
+                    return;
+                }
+                // A press on a still's scrollbar is a scroll, not a request
+                // to edit — the still scrolls on its own.
+                if let Some(t) = e.target().and_then(|t| t.dyn_into::<Element>().ok()) {
+                    if t.class_list().contains("peek-still") && e.offset_x() >= t.client_width() {
+                        return;
+                    }
+                }
+                // Keeps the live editor's selection where it is until the
+                // switch has stashed it.
+                e.prevent_default();
+                focus_peek(ctl, f64::from(e.client_x()), f64::from(e.client_y()));
+            }
+        >
+            <div
+                class="editor markdown-body peek-still"
+                class:hidden=move || !text() || ctl.peek_mode.get() != Mode::Wysiwyg
+                class:md-full-width=move || ctl.md_full_width.get()
+                class:md-numbered=move || ctl.md_numbered.get()
+                class:md-style-ogma=move || ctl.md_style.get() == MdStyle::Ogma
+                class:md-style-manuscript=move || ctl.md_style.get() == MdStyle::Manuscript
+                class:md-style-compact=move || ctl.md_style.get() == MdStyle::Compact
+                class:md-style-typewriter=move || ctl.md_style.get() == MdStyle::Typewriter
+                node_ref=ctl.peek_wys_ref
+                on:scroll=move |_| note_peek_scroll(ctl)
+            ></div>
+            <div
+                class="editor source peek-still"
+                class:hidden=move || !text() || ctl.peek_mode.get() != Mode::Source
+                node_ref=ctl.peek_src_ref
+                on:scroll=move |_| note_peek_scroll(ctl)
+            ></div>
+            <div
+                class="peek-asset"
+                class:hidden=move || text()
+                node_ref=ctl.peek_asset_ref
+            ></div>
+        </div>
+    }
+}
+
+/// The divider between the sides, to drag (the left side gets 20–80% of the
+/// width) or double-click back to halves. `top` is its stretch between the
+/// tab strips; the other runs between the documents.
+fn split_handle(ctl: Ctl, top: bool) -> impl IntoView {
+    view! {
+        <div
+            class="split-handle"
+            class:top=top
+            class:hidden=move || !is_split(ctl)
+            title="Drag to resize; double-click to make the sides equal"
+            on:mousedown=move |e: web_sys::MouseEvent| {
+                if e.button() == 0 {
+                    e.prevent_default();
+                    ctl.resizing.set(true);
+                }
+            }
+            on:dblclick=move |_| ctl.split_ratio.set(0.5)
+        ></div>
+    }
+}
+
+/// While a tab is being dragged: a label that follows the pointer, and a mark
+/// where it would land — a bar between two tabs, or a whole side lit up.
+fn drag_feedback(ctl: Ctl) -> impl IntoView {
+    view! {
+        <Show when=move || ctl.drag.with(Option::is_some)>
+            <div
+                class="drop-mark"
+                class:zone=move || {
+                    ctl.drag.with(|d| matches!(d.and_then(|d| d.target), Some(DropTarget::Side(_))))
+                }
+                class:hidden=move || ctl.drag.with(|d| d.and_then(|d| d.mark).is_none())
+                style=move || {
+                    let (l, t, w, h) = ctl
+                        .drag
+                        .with(|d| d.and_then(|d| d.mark))
+                        .unwrap_or_default();
+                    format!("left:{l}px;top:{t}px;width:{w}px;height:{h}px")
+                }
+            ></div>
+            <div
+                class="drag-ghost"
+                style=move || {
+                    let (x, y) = ctl.drag.with(|d| d.map_or((0.0, 0.0), |d| (d.x, d.y)));
+                    format!("left:{}px;top:{}px", x + 12.0, y + 10.0)
+                }
+            >
+                {move || ctl.drag.with(|d| d.map(|d| d.name.get())).unwrap_or_default()}
+            </div>
+        </Show>
     }
 }
 
@@ -3763,7 +4880,8 @@ fn heading_menu(ctl: Ctl) -> impl IntoView {
 /// strip jump when you switched to one.
 fn format_bar(ctl: Ctl) -> impl IntoView {
     let mode_is = move |m: Mode| ctl.mode.get() == m;
-    let wysiwyg = move || ctl.mode.get() == Mode::Wysiwyg;
+    // Markdown being rendered, which is all Wide and the style menu act on.
+    let wysiwyg = move || ctl.kind.get() == DocKind::Markdown && ctl.mode.get() == Mode::Wysiwyg;
     view! {
         <div class="toolbar" class:hidden=move || !shows_format_bar(ctl)>
             <button
@@ -3896,8 +5014,8 @@ pub fn App() -> impl IntoView {
         md_full_width: RwSignal::new(false),
         md_style: RwSignal::new(MdStyle::Default),
         md_numbered: RwSignal::new(false),
-        tabs_overflow: RwSignal::new(false),
-        tabstrip_ref: NodeRef::new(),
+        tabs_overflow: [RwSignal::new(false), RwSignal::new(false)],
+        tabstrip_ref: [NodeRef::new(), NodeRef::new()],
         disk_modal: RwSignal::new(None),
         last_watched: StoredValue::new(Vec::new()),
         kind: RwSignal::new(DocKind::Markdown),
@@ -3915,15 +5033,28 @@ pub fn App() -> impl IntoView {
         project_root: RwSignal::new(String::new()),
         tree: RwSignal::new(Vec::new()),
         owner: StoredValue::new_local(Owner::current()),
+        front: RwSignal::new([None, None]),
+        split_ratio: RwSignal::new(0.5),
+        peek_shown: StoredValue::new(None),
+        peek_kind: RwSignal::new(DocKind::Markdown),
+        peek_mode: RwSignal::new(Mode::Wysiwyg),
+        peek_wys_ref: NodeRef::new(),
+        peek_src_ref: NodeRef::new(),
+        peek_asset_ref: NodeRef::new(),
+        main_ref: NodeRef::new(),
+        drag_arm: StoredValue::new(None),
+        drag: RwSignal::new(None),
+        resizing: RwSignal::new(false),
     };
 
     // The first document exists before the view does: `sync_active_doc`
     // indexes `docs[active]`, and the editor's init effect must not run
     // against an empty tab list.
-    let first = make_doc(ctl, 0, "Untitled", "", false, DocKind::Markdown);
+    let first = make_doc(ctl, 0, "Untitled", "", false, DocKind::Markdown, 0);
     ctl.docs.update_value(|d| d.push(first));
     ctl.next_id.set_value(1);
     ctl.active.set(Some(0));
+    ctl.front.set([Some(0), None]);
     publish_tabs(ctl);
 
     // Track whether the caret sits inside a table (drives the table toolbar
@@ -3961,13 +5092,25 @@ pub fn App() -> impl IntoView {
 
     // Keep the active tab in view, and re-measure the strip when the tab list
     // or the window changes. Layout is only settled next frame.
+    // Moving the divider changes both strips' widths without changing a tab.
     Effect::new(move |_| {
         let _ = ctl.tabs.get();
         let _ = ctl.active.get();
+        let _ = ctl.front.get();
+        let _ = ctl.split_ratio.get();
         request_animation_frame(move || {
             scroll_active_tab_into_view(ctl);
             recompute_overflow(ctl);
         });
+    });
+
+    // A dragged tab or the divider follows the pointer anywhere in the
+    // window, not just over what it started on.
+    window_event_listener(leptos::ev::mousemove, move |e| on_pointer_move(ctl, e));
+    window_event_listener(leptos::ev::mouseup, move |_| on_pointer_up(ctl));
+    // Alt+Tab mid-drag: the release will happen somewhere else entirely.
+    window_event_listener(leptos::ev::blur, move |_| {
+        cancel_drag(ctl);
     });
     // Coming back to the window re-asks about a file whose prompt was
     // dismissed rather than answered. The backend re-checks every watched
@@ -4012,6 +5155,7 @@ pub fn App() -> impl IntoView {
     Effect::new(move |_| {
         let _ = ctl.kind.get();
         let _ = ctl.project_open.get();
+        let _ = is_split(ctl);
         request_animation_frame(move || {
             hex_recompute_window(ctl);
             // The grid is not a text field: without focus it gets no keys.
@@ -4103,7 +5247,7 @@ pub fn App() -> impl IntoView {
             }
         }
         if key == "Escape" {
-            if close_overlays(ctl) {
+            if cancel_drag(ctl) || close_overlays(ctl) {
                 e.prevent_default();
             }
             return;
@@ -4145,6 +5289,9 @@ pub fn App() -> impl IntoView {
             ("tab", true, false) => "prev_tab",
             ("pagedown", false, false) => "next_tab",
             ("pageup", false, false) => "prev_tab",
+            // The dedup window matters more here than anywhere: a double
+            // fire would send the tab across and straight back.
+            ("\\", false, false) => "split_move",
             ("z", false, false) => "undo",
             ("z", true, false) => "redo",
             ("y", false, false) => "redo",
@@ -4369,120 +5516,29 @@ pub fn App() -> impl IntoView {
     };
 
     view! {
-        <div class="app">
+        <div
+            class="app"
+            class:dragging=move || ctl.drag.with(Option::is_some)
+            class:resizing=move || ctl.resizing.get()
+        >
             <div class="body">
             {project_pane(ctl)}
-            <div class="main">
+            // A grid: the tab strips side by side, the two bars across the
+            // full width, and the documents underneath. See styles.css.
             <div
-                class="tabbar"
-                class:hidden=move || !has_doc(ctl)
-                on:contextmenu=move |e: web_sys::MouseEvent| e.prevent_default()
-            >
-                <div class="tabstrip" node_ref=ctl.tabstrip_ref>
-                    <For each=move || ctl.tabs.get() key=|t| t.id let(tab)>
-                        <div
-                            class="tab"
-                            class:active=move || active_id(ctl) == Some(tab.id)
-                            class:dirty=move || tab.dirty.get()
-                            class:stale=move || tab.stale.get()
-                            title=move || {
-                                let p = index_of(ctl, tab.id)
-                                    .and_then(|i| ctl.docs.with_value(|d| d.get(i).map(|x| x.path)))
-                                    .map(|s| s.get())
-                                    .unwrap_or_default();
-                                let base = if p.is_empty() {
-                                    format!("{} — unsaved", tab.name.get())
-                                } else {
-                                    p
-                                };
-                                if tab.stale.get() {
-                                    format!("{base}\nChanged on disk — click to be asked")
-                                } else {
-                                    base
-                                }
-                            }
-                            // Keep the selection inside the editor: it is the
-                            // caret we are about to stash, and a bare click on
-                            // the strip would collapse it to offset 0.
-                            on:mousedown=move |e: web_sys::MouseEvent| {
-                                match e.button() {
-                                    // Middle click closes. preventDefault here
-                                    // (not on auxclick) beats X11 autoscroll.
-                                    1 => {
-                                        e.prevent_default();
-                                        close_tab(ctl, tab.id);
-                                    }
-                                    0 => {
-                                        e.prevent_default();
-                                        // Clicking the tab you are already on
-                                        // is how a dismissed prompt is asked
-                                        // for again — `switch_to_id` is a
-                                        // no-op there, so nothing else would
-                                        // come of it. With one tab open it is
-                                        // the only way back to the question.
-                                        if active_doc_id(ctl) == Some(tab.id) {
-                                            maybe_prompt_disk(ctl);
-                                        } else {
-                                            switch_to_id(ctl, tab.id);
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            on:auxclick=|e: web_sys::MouseEvent| e.prevent_default()
-                            on:contextmenu=move |e: web_sys::MouseEvent| {
-                                e.prevent_default();
-                                e.stop_propagation();
-                                ctl.tab_menu.set(None);
-                                close_ctx_menu(ctl);
-                                let win = window();
-                                let vw = win.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(800.0);
-                                let vh = win.inner_height().ok().and_then(|v| v.as_f64()).unwrap_or(600.0);
-                                let x = f64::from(e.client_x()).min(vw - 220.0).max(0.0);
-                                let y = f64::from(e.client_y()).min(vh - 60.0).max(0.0);
-                                ctl.tab_ctx.set(Some((tab.id, x, y)));
-                            }
-                        >
-                            <span class="tab-name">{move || tab.name.get()}</span>
-                            <button
-                                class="tab-x"
-                                title="Close (Ctrl+W)"
-                                on:mousedown=move |e: web_sys::MouseEvent| {
-                                    e.stop_propagation();
-                                    e.prevent_default();
-                                }
-                                on:click=move |e: web_sys::MouseEvent| {
-                                    e.stop_propagation();
-                                    close_tab(ctl, tab.id);
-                                }
-                            ></button>
-                        </div>
-                    </For>
-                </div>
-                <button
-                    class="tb-btn tab-more"
-                    class:invisible=move || !ctl.tabs_overflow.get()
-                    title="All open documents"
-                    on:mousedown=|e: web_sys::MouseEvent| e.prevent_default()
-                    on:click=move |e: web_sys::MouseEvent| {
-                        let Some(el) = e
-                            .current_target()
-                            .and_then(|t| t.dyn_into::<Element>().ok()) else { return };
-                        let r = el.get_bounding_client_rect();
-                        let vw = window()
-                            .inner_width()
-                            .ok()
-                            .and_then(|v| v.as_f64())
-                            .unwrap_or(800.0);
-                        // Anchored from the right so the menu grows leftward
-                        // and can never spill off-screen.
-                        ctl.tab_ctx.set(None);
-                        ctl.tab_menu.set(Some(((vw - r.right()).max(4.0), r.bottom() + 2.0)));
+                class="main"
+                node_ref=ctl.main_ref
+                style=move || {
+                    if is_split(ctl) {
+                        let r = ctl.split_ratio.get();
+                        format!("grid-template-columns:minmax(0,{r}fr) minmax(0,{}fr)", 1.0 - r)
+                    } else {
+                        String::new()
                     }
-                >
-                    "»"
-                </button>
-            </div>
+                }
+            >
+            {tab_bar(ctl, 0)}
+            {tab_bar(ctl, 1)}
 
             {format_bar(ctl)}
 
@@ -4548,7 +5604,15 @@ pub fn App() -> impl IntoView {
                 <button class="tb-btn" title="Close (Esc)" on:click=move |_| { close_overlays(ctl); }>"✕"</button>
             </div>
 
-            <div class="editor-wrap">
+            // Either this or the live editor can be drawn on either side; the
+            // grid places them by class, not by order here.
+            {peek_pane(ctl)}
+
+            <div
+                class="editor-wrap pane live"
+                class:side-1=move || focus_side(ctl) == 1
+                data-side=move || focus_side(ctl).to_string()
+            >
                 <div
                     class="editor wysiwyg markdown-body"
                     class:hidden=move || !shows_wysiwyg(ctl)
@@ -4624,6 +5688,8 @@ pub fn App() -> impl IntoView {
                     </div>
                 </Show>
             </div>
+            {split_handle(ctl, false)}
+            {split_handle(ctl, true)}
             </div>
             </div>
 
@@ -4688,6 +5754,39 @@ pub fn App() -> impl IntoView {
                         format!("left:{x}px;top:{y}px")
                     }
                 >
+                    // The same command as View → Split Right, for this tab
+                    // rather than the active one, and named the same way.
+                    <button
+                        class="ctx-item"
+                        prop:disabled=move || ctl.tabs.with(|t| t.len() < 2)
+                        on:click=move |_| {
+                            let id = ctl.tab_ctx.get_untracked().map(|(id, _, _)| id);
+                            ctl.tab_ctx.set(None);
+                            if let Some(id) = id {
+                                send_to_other_side(ctl, id);
+                            }
+                        }
+                    >
+                        {move || {
+                            let id = ctl.tab_ctx.get().map(|(id, _, _)| id);
+                            let side = ctl.tabs.with(|t| {
+                                t.iter().find(|x| Some(x.id) == id).map_or(0, |x| x.pane)
+                            });
+                            side_label(is_split(ctl), side)
+                        }}
+                    </button>
+                    <Show when=move || is_split(ctl)>
+                        <button
+                            class="ctx-item"
+                            on:click=move |_| {
+                                ctl.tab_ctx.set(None);
+                                join_sides(ctl);
+                            }
+                        >
+                            "Join Sides"
+                        </button>
+                    </Show>
+                    <div class="ctx-sep"></div>
                     <button
                         class="ctx-item"
                         title=move || {
@@ -4727,11 +5826,18 @@ pub fn App() -> impl IntoView {
                 <div
                     class="ctxmenu tabmenu"
                     style=move || {
-                        let (right, top) = ctl.tab_menu.get().unwrap_or((6.0, 75.0));
+                        let (_, right, top) = ctl.tab_menu.get().unwrap_or((0, 6.0, 75.0));
                         format!("right:{right}px;top:{top}px")
                     }
                 >
-                    <For each=move || ctl.tabs.get() key=|t| t.id let(tab)>
+                    <For
+                        each=move || {
+                            let side = ctl.tab_menu.get().map_or(0, |(side, _, _)| side);
+                            side_tabs(ctl, side)
+                        }
+                        key=|t| t.id
+                        let(tab)
+                    >
                         <button
                             class="ctx-item"
                             class:active=move || active_id(ctl) == Some(tab.id)
@@ -4751,6 +5857,8 @@ pub fn App() -> impl IntoView {
                     </For>
                 </div>
             </Show>
+
+            {drag_feedback(ctl)}
 
             <Show when=move || ctl.pending.get().is_some()>
                 <div class="overlay">
@@ -4897,5 +6005,43 @@ pub fn App() -> impl IntoView {
                 </div>
             </Show>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_new_tab_goes_last_on_its_own_side() {
+        let docs = [0, 0, 1, 1];
+        assert_eq!(slot_for(&docs, 0, None), 2);
+        assert_eq!(slot_for(&docs, 1, None), 4);
+    }
+
+    #[test]
+    fn a_position_counts_within_its_side() {
+        let docs = [0, 0, 0, 1, 1];
+        assert_eq!(slot_for(&docs, 0, Some(0)), 0);
+        assert_eq!(slot_for(&docs, 0, Some(2)), 2);
+        assert_eq!(slot_for(&docs, 1, Some(0)), 3);
+        assert_eq!(slot_for(&docs, 1, Some(1)), 4);
+    }
+
+    #[test]
+    fn a_position_past_the_end_of_a_side_stops_there() {
+        // Never into the other side's run: `docs` stays grouped.
+        assert_eq!(slot_for(&[0, 0, 1], 0, Some(9)), 2);
+        assert_eq!(slot_for(&[0, 0, 1], 1, Some(9)), 3);
+    }
+
+    #[test]
+    fn an_empty_side_starts_where_it_would_be() {
+        assert_eq!(slot_for(&[0, 0], 1, None), 2);
+        assert_eq!(slot_for(&[0, 0], 1, Some(0)), 2);
+        assert_eq!(slot_for(&[1, 1], 0, None), 0);
+        assert_eq!(slot_for(&[1, 1], 0, Some(3)), 0);
+        assert_eq!(slot_for(&[], 0, None), 0);
+        assert_eq!(slot_for(&[], 1, Some(2)), 0);
     }
 }

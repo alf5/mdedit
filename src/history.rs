@@ -21,6 +21,22 @@ pub enum Snap {
     },
 }
 
+impl Snap {
+    /// Move the caret, leaving the content alone. For a source snapshot that
+    /// collapses the selection to that point.
+    pub fn set_caret(&mut self, at: u32) {
+        match self {
+            Snap::Wys { caret, .. } => *caret = at,
+            Snap::Src {
+                sel_start, sel_end, ..
+            } => {
+                *sel_start = at;
+                *sel_end = at;
+            }
+        }
+    }
+}
+
 /// Capture the WYSIWYG editor. Checkbox `checked` properties are mirrored
 /// into attributes first — innerHTML only serializes attributes.
 pub fn capture_wys(editor: &Element) -> Snap {
@@ -64,15 +80,18 @@ pub fn caret_text_offset(root: &Element) -> u32 {
     let Some(anchor) = sel.anchor_node() else {
         return 0;
     };
-    if !root.contains(Some(&anchor)) {
-        return 0;
+    text_offset_of(root, &anchor, sel.anchor_offset()).unwrap_or(0)
+}
+
+/// Absolute UTF-16 text offset of a DOM position (`node`, `offset`) within
+/// `root` — the same measure `restore_caret_at` takes, so a position read off
+/// one copy of some markup lands on the same character in another.
+pub fn text_offset_of(root: &Element, node: &Node, offset: u32) -> Option<u32> {
+    if !root.contains(Some(node)) {
+        return None;
     }
     let mut acc = 0u32;
-    if walk_to_anchor(root.unchecked_ref(), &anchor, sel.anchor_offset(), &mut acc) {
-        acc
-    } else {
-        0
-    }
+    walk_to_anchor(root.unchecked_ref(), node, offset, &mut acc).then_some(acc)
 }
 
 fn walk_to_anchor(node: &Node, anchor: &Node, anchor_off: u32, acc: &mut u32) -> bool {

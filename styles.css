@@ -255,6 +255,19 @@ body {
   color: var(--text);
 }
 
+/* What the side without focus is showing: still the sheet in front of its
+   strip, but without the accent that says where typing goes. */
+.tab.front:not(.active) {
+  background: var(--bg);
+  border-color: var(--border);
+  border-top: 2px solid var(--border);
+  color: var(--text);
+}
+
+.tab.dragging {
+  opacity: 0.45;
+}
+
 .tab-name {
   flex: 1;
   min-width: 0;
@@ -397,12 +410,49 @@ body {
 }
 
 /* The tabs, the findbar and the editor, to the right of the pane. min-width:0
-   again: without it a long tab title would push the pane off-screen. */
+   again: without it a long tab title would push the pane off-screen.
+
+   A grid rather than a column so the window can be split: row 1 holds a tab
+   strip per side, rows 2 and 3 the format and find bars across the full
+   width, row 4 the documents. The bars span both sides on purpose — one per
+   side would appear and vanish as focus crossed over, moving both documents
+   up and down with it. Split, app.rs sets the two columns inline; unsplit
+   there is just this one. */
 .main {
   flex: 1;
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto auto auto minmax(0, 1fr);
   min-width: 0;
+}
+
+.main > .tabbar {
+  grid-row: 1;
+  grid-column: 1;
+}
+
+.main > .toolbar {
+  grid-row: 2;
+  grid-column: 1 / -1;
+}
+
+.main > .findbar {
+  grid-row: 3;
+  grid-column: 1 / -1;
+}
+
+/* Either the live editor or the still, on either side: which is where is
+   decided by the side-1 class, not by DOM order. */
+.pane {
+  grid-row: 4;
+  grid-column: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.main > .side-1 {
+  grid-column: 2;
+  border-left: 1px solid var(--border);
 }
 
 .project {
@@ -664,17 +714,17 @@ body {
   white-space: pre-wrap;
 }
 
-/* Diagram editing affordances. Scoped to `.editor` rather than living beside
-   the diagram's own styles in `document.css`, so an exported document doesn't
-   invite clicks that do nothing. */
-.editor .mermaid-diagram {
+/* Diagram editing affordances. Scoped to the live editor rather than living
+   beside the diagram's own styles in `document.css`, so neither an exported
+   document nor the other side's still invites clicks that do nothing. */
+.editor.wysiwyg .mermaid-diagram {
   /* The caret must not land inside the SVG; the block is edited by clicking
      it, which swaps in a source textarea. */
   user-select: none;
   cursor: pointer;
 }
 
-.editor .mermaid-diagram:hover {
+.editor.wysiwyg .mermaid-diagram:hover {
   border-color: var(--border);
   background: var(--bg-soft);
 }
@@ -694,6 +744,121 @@ body {
   font-size: 85%;
   line-height: 1.45;
   resize: vertical;
+}
+
+/* ---------- side by side ---------- */
+
+/* Laid out like `.editor-wrap`, the live side. */
+.pane.peek {
+  display: flex;
+  overflow: hidden;
+}
+
+/* The other side's document as it was left: the same markup in the same box
+   as the live editor, so focusing it moves nothing. WebKit gives an editable
+   element break-word wrapping and its own line-break rule, and a textarea
+   breaks long words too; the still copies them, or its lines would wrap in
+   different places from the editor it stands in for.
+
+   Not `user-select: none`, though a press never selects anything here: Find
+   steps over matches in the still by searching on from them, and a match the
+   selection cannot move onto is found again, forever. */
+.peek-still {
+  overflow-wrap: break-word;
+  -webkit-line-break: after-white-space;
+  cursor: text;
+}
+
+.peek-asset {
+  flex: 1;
+  display: flex;
+  min-width: 0;
+}
+
+/* A screenful of rows, not the virtualized grid: it does not scroll. */
+.peek-hex {
+  overflow: hidden;
+}
+
+/* Over the seam between the sides, not beside it: grid column 2 starts where
+   the right side does, and the negative margin straddles its border. One
+   between the documents and one between the tab strips; the bars in between
+   span both sides, so there is no seam there to hold. */
+.split-handle {
+  grid-row: 4;
+  grid-column: 2;
+  justify-self: start;
+  position: relative;
+  z-index: 5;
+  width: 6px;
+  margin-left: -3px;
+  cursor: col-resize;
+}
+
+.split-handle.top {
+  grid-row: 1;
+}
+
+.split-handle:hover,
+.app.resizing .split-handle {
+  background: var(--accent);
+  opacity: 0.5;
+}
+
+.app.resizing,
+.app.resizing * {
+  cursor: col-resize !important;
+  user-select: none !important;
+  -webkit-user-select: none !important;
+}
+
+.app.dragging,
+.app.dragging * {
+  cursor: grabbing !important;
+}
+
+/* A dragged tab's label, following the pointer. Neither it nor the mark may
+   take the pointer's hits: the drop target is whatever is under them. */
+.drag-ghost {
+  position: fixed;
+  z-index: 160;
+  pointer-events: none;
+  max-width: 240px;
+  padding: 5px 10px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--bg-raised);
+  box-shadow: var(--shadow);
+  color: var(--text);
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Where it would land: a bar between two tabs... */
+.drop-mark {
+  position: fixed;
+  z-index: 159;
+  pointer-events: none;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+/* ...or a whole side, washed with the accent. The wash is a pseudo-element
+   so its transparency doesn't fade the outline too. */
+.drop-mark.zone {
+  background: transparent;
+  border: 2px solid var(--accent);
+  border-radius: 6px;
+}
+
+.drop-mark.zone::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--accent);
+  opacity: 0.12;
 }
 
 

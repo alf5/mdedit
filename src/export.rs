@@ -5,7 +5,7 @@
 //! mermaid diagram is already inline SVG, because that is how the editor
 //! draws it (see [`crate::mermaid`]). The file therefore opens identically
 //! offline, in any browser, and follows the reader's light/dark preference —
-//! diagram colors included, since they resolve through the `--mmd-*` custom
+//! diagram colors included, since they resolve through the `--pele-*` custom
 //! properties rather than being baked in.
 //!
 //! The diagrams also keep their `data-mermaid` source attribute, so an
@@ -273,7 +273,7 @@ mod tests {
     fn embeds_the_document_stylesheet() {
         let out = build_document("x", "", "");
         assert!(out.contains(".markdown-body table th"));
-        assert!(out.contains("--mmd-node-fill"));
+        assert!(out.contains("--pele-surface-alt"));
         assert!(out.contains("prefers-color-scheme: dark"));
         // Alternate render styles travel with the file.
         assert!(out.contains("md-numbered"));

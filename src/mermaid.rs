@@ -1,91 +1,115 @@
 //! Mermaid diagram rendering.
 //!
-//! A ```` ```mermaid ```` fence is rendered to inline SVG by `mermaid-svg`
-//! (pure Rust — no Node, no `mermaid.js`) and wrapped in a
-//! `div.mermaid-diagram` that carries the original source in `data-mermaid`.
-//! The serializer reads that attribute back, so the diagram round-trips to
-//! markdown exactly as typed no matter what the SVG looks like.
-
-use mermaid_svg::{ast::Diagram, parse, render_diagram_with, Theme};
-use std::borrow::Cow;
+//! A ```` ```mermaid ```` fence is rendered to inline SVG by Pele and wrapped
+//! in a `div.mermaid-diagram` that carries the original source in
+//! `data-mermaid`. The serializer reads that attribute back, so the diagram
+//! round-trips to markdown exactly as typed no matter what the SVG looks like.
+//!
+//! Pele is JavaScript — the one part of mdedit that is — vendored at
+//! `vendor/pele/pele.js` and imported through wasm-bindgen, which ships it in
+//! the build's `snippets/`. It renders synchronously, so a fence still becomes
+//! markup in the same pass as the markdown around it. Colors and fonts come
+//! from the `--pele-*` custom properties `document.css` sets, so a diagram
+//! follows the light/dark scheme, and print, without being re-rendered.
 
 /// Class on the wrapper div; also the serializer's and the editor's hook.
 pub const WRAPPER_CLASS: &str = "mermaid-diagram";
 /// Attribute holding the verbatim fence body.
 pub const SOURCE_ATTR: &str = "data-mermaid";
 
-/// The diagram's colors come from CSS custom properties so a diagram follows
-/// the app's light/dark scheme without re-rendering. `styles.css` defines the
-/// `--mmd-*` properties under both schemes; the literal after each comma is
-/// the upstream Mermaid default, used if a property is ever missing.
-fn theme() -> Theme {
-    let v = |name: &str, fallback: &str| -> Cow<'static, str> {
-        Cow::Owned(format!("var({name}, {fallback})"))
-    };
-    Theme {
-        fg: v("--mmd-fg", "#333"),
-        fg_muted: v("--mmd-fg-muted", "#666"),
-        bg: v("--mmd-bg", "#fff"),
-        actor_fill: v("--mmd-node-fill", "#ECECFF"),
-        actor_stroke: v("--mmd-node-stroke", "#9370DB"),
-        lifeline: v("--mmd-node-stroke", "#9370DB"),
-        arrow_stroke: v("--mmd-edge", "#333"),
-        note_fill: v("--mmd-note-fill", "#FFF5AD"),
-        note_stroke: v("--mmd-note-stroke", "#aaaa33"),
-        activation_fill: v("--mmd-node-fill", "#ECECFF"),
-        activation_stroke: v("--mmd-node-stroke", "#9370DB"),
-        frame_label_fill: v("--mmd-node-fill", "#ECECFF"),
-        flow_node_fill: v("--mmd-node-fill", "#ECECFF"),
-        flow_node_stroke: v("--mmd-node-stroke", "#9370DB"),
-        flow_edge_stroke: v("--mmd-edge", "#333"),
-        flow_label_bg: v("--mmd-label-bg", "#e8e8e8"),
-        flow_cluster_fill: v("--mmd-cluster-fill", "#ffffde"),
-        flow_cluster_stroke: v("--mmd-cluster-stroke", "#aaaa33"),
-        font_family: Cow::Borrowed("inherit"),
-        // The categorical scales (pie, git, journey…) are saturated hues that
-        // read on either background, so they keep their upstream values.
-        ..Theme::default_theme()
+/// The faces Pele measures label text in, which have to be the faces the
+/// labels are then drawn in or text spills out of its box. `document.css`
+/// sets `--pele-font` and `--pele-font-mono` to these same stacks: the
+/// document's own body face, and its code face.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+const FONT: &str =
+    "-apple-system, BlinkMacSystemFont, \"Segoe UI\", \"Noto Sans\", Helvetica, Arial, sans-serif";
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+const FONT_MONO: &str = "ui-monospace, SFMono-Regular, \"SF Mono\", Menlo, Consolas, monospace";
+
+#[cfg(target_arch = "wasm32")]
+mod pele {
+    use wasm_bindgen::prelude::*;
+
+    #[wasm_bindgen(module = "/vendor/pele/pele.js")]
+    extern "C" {
+        /// `render(source, options)`: `{ svg, width, height, type, … }`, or a
+        /// thrown `PeleError` whose message already says where the source
+        /// went wrong.
+        #[wasm_bindgen(catch)]
+        pub fn render(source: &str, options: &JsValue) -> Result<JsValue, JsValue>;
     }
 }
 
-/// Parse and draw one diagram.
-///
-/// This goes the long way round — parse, then render — rather than calling
-/// `render_with`, because a gantt chart has to be adjusted in between. See
-/// [`disarm_today_marker`].
+/// Draw one diagram with Pele.
+#[cfg(target_arch = "wasm32")]
 fn render_svg(src: &str) -> Result<String, String> {
-    let mut diagram = parse(src).map_err(|e| e.to_string())?;
-    disarm_today_marker(&mut diagram);
-    render_diagram_with(&diagram, &theme()).map_err(|e| e.to_string())
+    use js_sys::{Object, Reflect};
+    use wasm_bindgen::JsValue;
+
+    thread_local! {
+        static DRAWN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    // Anything Pele does give an id is prefixed with this. Every drawing gets
+    // its own, so two diagrams on one page — or one in each side of a split
+    // window — can never answer for each other's ids.
+    let n = DRAWN.with(|c| {
+        c.set(c.get().wrapping_add(1));
+        c.get()
+    });
+    let opts = Object::new();
+    for (key, value) in [
+        ("idPrefix", format!("mmd{n}")),
+        ("fontFamily", FONT.to_string()),
+        ("fontFamilyMono", FONT_MONO.to_string()),
+    ] {
+        let _ = Reflect::set(&opts, &key.into(), &JsValue::from_str(&value));
+    }
+    let drawn = pele::render(src, &opts).map_err(|e| {
+        Reflect::get(&e, &"message".into())
+            .ok()
+            .and_then(|m| m.as_string())
+            .or_else(|| e.as_string())
+            .unwrap_or_else(|| "The diagram could not be drawn.".to_string())
+    })?;
+    Reflect::get(&drawn, &"svg".into())
+        .ok()
+        .and_then(|s| s.as_string())
+        .ok_or_else(|| "The diagram could not be drawn.".to_string())
 }
 
-/// Turn off a gantt chart's `todayMarker`.
-///
-/// `wasm32-unknown-unknown` has no clock: `SystemTime::now()` is compiled in
-/// as an unconditional panic. mermaid-svg reads it to place the marker, and
-/// with `panic = "abort"` that trap takes down the whole app — one gantt
-/// chart anywhere in a document and nothing renders at all. `todayMarker off`
-/// is the only lever the crate gives us to skip that call, so the cost of
-/// staying alive is that gantt charts draw no "today" line.
-fn disarm_today_marker(diagram: &mut Diagram) {
-    if let Diagram::Gantt(g) = diagram {
-        g.today_marker = Some("off".to_string());
-    }
+/// Off wasm — under `cargo test` — there is no JavaScript to run. An empty
+/// drawing stands in for Pele so that everything around it (finding fences,
+/// the wrapper, the source attribute) stays testable on the host. Pele itself
+/// is exercised in the app.
+#[cfg(not(target_arch = "wasm32"))]
+fn render_svg(_src: &str) -> Result<String, String> {
+    Ok("<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>".to_string())
 }
 
 /// Render one fence body to the wrapper div. A diagram that fails to parse
 /// keeps its source visible with the error above it, rather than vanishing.
 pub fn render_block(src: &str) -> String {
+    wrap(src, render_svg(src))
+}
+
+/// The wrapper around a drawing, or around the reason there isn't one.
+///
+/// The newlines just inside it draw nothing, but they keep the block's text
+/// apart from its neighbours'. Pele's SVG has no whitespace at its edges, and
+/// the word count — which takes each diagram's labels back out of the page's
+/// text — would otherwise see two adjacent diagrams' labels as one word.
+fn wrap(src: &str, drawn: Result<String, String>) -> String {
     let attr = escape_attr(src);
-    match render_svg(src) {
+    match drawn {
         Ok(svg) => format!(
             "<div class=\"{WRAPPER_CLASS}\" contenteditable=\"false\" \
-             {SOURCE_ATTR}=\"{attr}\">{svg}</div>"
+             {SOURCE_ATTR}=\"{attr}\">\n{svg}\n</div>"
         ),
         Err(e) => format!(
             "<div class=\"{WRAPPER_CLASS} mermaid-error\" contenteditable=\"false\" \
-             {SOURCE_ATTR}=\"{attr}\"><p class=\"mermaid-error-msg\">{}</p>\
-             <pre><code class=\"language-mermaid\">{}</code></pre></div>",
+             {SOURCE_ATTR}=\"{attr}\">\n<p class=\"mermaid-error-msg\">{}</p>\
+             <pre><code class=\"language-mermaid\">{}</code></pre>\n</div>",
             escape_text(&e),
             escape_text(src)
         ),
@@ -129,9 +153,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn renders_a_flowchart_to_svg() {
-        let html = render_block("graph TD\n  A[Start] --> B[End]\n");
-        assert!(html.contains("<svg"));
+    fn a_drawing_is_wrapped_as_an_uneditable_block() {
+        let html = wrap("graph TD\n  A --> B\n", Ok("<svg></svg>".to_string()));
+        assert!(html.contains("<svg></svg>"));
         assert!(html.contains(WRAPPER_CLASS));
         assert!(html.contains("contenteditable=\"false\""));
         assert!(!html.contains("mermaid-error"));
@@ -146,48 +170,16 @@ mod tests {
     }
 
     #[test]
-    fn bad_source_degrades_to_an_error_block() {
-        let html = render_block("not a diagram at all\n");
+    fn a_failure_degrades_to_an_error_block() {
+        let html = wrap(
+            "not a diagram at all\n",
+            Err("No diagram type detected for the <given> text.".to_string()),
+        );
         assert!(html.contains("mermaid-error"));
-        // The source is still recoverable from the attribute.
+        // The reason is shown, escaped, and the source is still recoverable
+        // from the attribute.
+        assert!(html.contains("for the &lt;given&gt; text."));
         assert!(html.contains("data-mermaid=\"not a diagram at all&#10;\""));
-    }
-
-    /// A gantt chart must never reach `SystemTime::now()` — on wasm that call
-    /// is a trap that aborts the app. Renders natively here, so it can only
-    /// check that the marker is off; the wasm behaviour rides on that.
-    #[test]
-    fn gantt_today_marker_is_disarmed() {
-        let src = "gantt\n  dateFormat YYYY-MM-DD\n  section S\n  Task :a1, 2026-01-01, 30d\n";
-        let mut d = parse(src).unwrap();
-        disarm_today_marker(&mut d);
-        match &d {
-            Diagram::Gantt(g) => assert_eq!(g.today_marker.as_deref(), Some("off")),
-            _ => panic!("expected a gantt diagram"),
-        }
-        let html = render_block(src);
-        assert!(html.contains("<svg"));
-        assert!(!html.contains("mermaid-error"));
-        // The marker element must not be emitted at all.
-        assert!(!html.contains("\"today\""));
-    }
-
-    /// An explicit `todayMarker` in the source is overridden, not honoured —
-    /// any value other than `off` still reaches the clock.
-    #[test]
-    fn explicit_today_marker_is_overridden() {
-        let src = "gantt\n  dateFormat YYYY-MM-DD\n  todayMarker stroke:red\n  section S\n  T :a1, 2026-01-01, 9d\n";
-        let mut d = parse(src).unwrap();
-        disarm_today_marker(&mut d);
-        match &d {
-            Diagram::Gantt(g) => assert_eq!(g.today_marker.as_deref(), Some("off")),
-            _ => panic!("expected a gantt diagram"),
-        }
-    }
-
-    #[test]
-    fn colors_come_from_css_properties() {
-        let html = render_block("graph TD\n  A --> B\n");
-        assert!(html.contains("var(--mmd-node-fill"));
+        assert!(html.contains("<code class=\"language-mermaid\">not a diagram at all\n</code>"));
     }
 }

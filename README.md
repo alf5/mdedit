@@ -1,7 +1,8 @@
 # mdedit
 
 A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
-(Rust/WASM frontend). No JavaScript frameworks — the whole app is Rust.
+(Rust/WASM frontend). No JavaScript frameworks — the whole app is Rust, apart
+from the [Pele](https://pele.run) diagram renderer, vendored in `vendor/pele/`.
 
 ![build](https://github.com/alf5/mdedit/actions/workflows/build.yml/badge.svg)
 
@@ -43,13 +44,13 @@ A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
 - **GitHub-flavored markdown**: tables, task lists (clickable checkboxes),
   strikethrough, footnotes, alerts (`> [!NOTE]` …), fenced code blocks.
 - **Mermaid diagrams**: a ```` ```mermaid ```` fence renders inline as SVG —
-  flowcharts, sequence, state, class, ER, gantt, pie and the rest of the 23
-  diagram types, drawn by the pure-Rust `mermaid-svg` crate (no `mermaid.js`,
-  no Node). Click a diagram to edit its source, click away to re-render;
-  colors follow the light/dark theme. A diagram that fails to parse shows the
-  error above its source instead of disappearing. (Gantt charts draw no
-  "today" marker: reading the clock means `SystemTime::now()`, which is a
-  hard panic on `wasm32-unknown-unknown`.)
+  every diagram type built into Mermaid 12.1 (flowchart, sequence, state,
+  class, ER, gantt, pie, mindmap, timeline, sankey, C4 and the rest), drawn by
+  [Pele](https://pele.run) 1.8.0 (no `mermaid.js`, nothing fetched at run
+  time). Click a diagram to edit its source, click away to re-render; colors
+  follow the light/dark theme through Pele's `--pele-*` CSS variables, set in
+  `document.css`. A diagram that fails to parse shows Pele's error, with its
+  line, above the source instead of disappearing.
 - **Formatting toolbar**: bold, italic, strikethrough, inline code, headings,
   bullet/numbered/task lists, blockquote, code block, links, images, tables,
   horizontal rules — works in both WYSIWYG and source mode. Shown only for

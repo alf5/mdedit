@@ -130,6 +130,17 @@ pub fn restore_caret_at(root: &Element, offset: u32) {
     let Some(sel) = window().get_selection().ok().flatten() else {
         return;
     };
+    // An offset on a block boundary fits the end of one block and the start of
+    // the next. An open block always held the caret when the snapshot was
+    // taken, so that settles it.
+    if let Ok(Some(raw)) = root.query_selector(&format!(".{}", crate::reveal::RAW_CLASS)) {
+        let start = text_offset_of(root, raw.unchecked_ref(), 0).unwrap_or(0);
+        let len = utf16_len(raw.unchecked_ref());
+        if (start..=start + len).contains(&offset) {
+            crate::reveal::select_in_raw(&raw, offset - start, offset - start);
+            return;
+        }
+    }
     let Ok(range) = leptos::prelude::document().create_range() else {
         return;
     };

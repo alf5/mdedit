@@ -12,7 +12,10 @@ use crate::export;
 use crate::hex;
 use crate::history::{self, Snap};
 use crate::markdown::to_html;
+use crate::reveal;
 use crate::serialize::{dom_to_markdown, html_to_markdown};
+use crate::table::{self, Align, MenuEntry};
+use crate::table_ui;
 use crate::tauri_api::{self, SaveArgs, TitleArgs};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -130,7 +133,6 @@ struct Ctl {
     url_modal: RwSignal<Option<UrlKind>>,
     url_val: RwSignal<String>,
     url_text: RwSignal<String>,
-    in_table: RwSignal<bool>,
     ctx_menu: RwSignal<Option<(f64, f64)>>,
     editor_ref: NodeRef<html::Div>,
     ta_ref: NodeRef<html::Textarea>,
@@ -138,6 +140,11 @@ struct Ctl {
     url_ref: NodeRef<html::Input>,
     saved_range: StoredValue<Option<web_sys::Range>, LocalStorage>,
     ctx_cell: StoredValue<Option<Element>, LocalStorage>,
+    /// The table menu's items for the cell it opened on, its type-to-filter
+    /// text, and the item the arrow keys have reached in what's showing.
+    ctx_items: StoredValue<Vec<MenuEntry>>,
+    ctx_filter: RwSignal<String>,
+    ctx_hl: RwSignal<Option<usize>>,
     /// Set by Ctrl+Shift+V just before the paste event it triggers.
     plain_paste: StoredValue<bool>,
     hist: StoredValue<Hist>,
@@ -174,6 +181,11 @@ struct Ctl {
     md_style: RwSignal<MdStyle>,
     /// Hierarchical heading and list numbers, layered on any style.
     md_numbered: RwSignal<bool>,
+    /// View > Show Markdown at Cursor. Applies to every document.
+    reveal: RwSignal<bool>,
+    /// View > Theme: a `themes.css` id, or empty for the system's palette.
+    /// Applies to the whole window and goes with every export.
+    theme: RwSignal<String>,
     /// One per side, like everything else about a tab strip.
     tabs_overflow: [RwSignal<bool>; 2],
     tabstrip_ref: [NodeRef<html::Div>; 2],
@@ -297,6 +309,8 @@ struct Status {
     source: bool,
     full_width: bool,
     numbered: bool,
+    reveal: bool,
+    theme: String,
     style: String,
     overwrite: bool,
     split: bool,
@@ -628,7 +642,7 @@ fn diagram_texts(ctl: Ctl) -> Vec<String> {
     let Some(el) = editor_el(ctl) else {
         return Vec::new();
     };
-    let sel = format!(".{}", crate::mermaid::WRAPPER_CLASS);
+    let sel = format!(".{},.{}", crate::mermaid::WRAPPER_CLASS, crate::math::CLASS);
     let Ok(list) = el.query_selector_all(&sel) else {
         return Vec::new();
     };
@@ -740,6 +754,8 @@ fn push_status(ctl: Ctl) {
     let source = markdown && ctl.mode.get_untracked() == Mode::Source;
     let full_width = ctl.md_full_width.get_untracked();
     let numbered = ctl.md_numbered.get_untracked();
+    let reveal = ctl.reveal.get_untracked();
+    let theme = ctl.theme.get_untracked();
     let style = ctl.md_style.get_untracked().as_str().to_string();
     let overwrite = ctl.hex_overwrite.get_untracked();
     let split = is_split_now(ctl);
@@ -757,6 +773,8 @@ fn push_status(ctl: Ctl) {
         source,
         full_width,
         numbered,
+        reveal,
+        theme: theme.clone(),
         style: style.clone(),
         overwrite,
         split,
@@ -778,6 +796,8 @@ fn push_status(ctl: Ctl) {
             source,
             full_width,
             numbered,
+            reveal,
+            theme,
             style,
             overwrite,
             split,
@@ -825,7 +845,6 @@ fn toggle_mode(ctl: Ctl) {
     }
     recount(ctl);
     focus_current(ctl);
-    update_in_table(ctl);
     history_sync(ctl);
     push_status(ctl);
 }
@@ -921,6 +940,7 @@ fn apply_snap_now(ctl: Ctl, snap: &Snap) {
             if let Some(el) = editor_el(ctl) {
                 el.set_inner_html(html);
                 enable_checkboxes(ctl);
+                table_ui::refresh();
             }
         }
         Snap::Src { text, .. } => {
@@ -992,7 +1012,6 @@ fn restore_snap(ctl: Ctl, snap: Snap) {
     // would dirty it.
     mark_dirty(ctl);
     recount(ctl);
-    update_in_table(ctl);
 }
 
 fn history_undo(ctl: Ctl) {
@@ -1190,6 +1209,7 @@ fn rendered_document(ctl: Ctl) -> Option<String> {
         &ctl.doc_name.get_untracked(),
         &body,
         &export_body_class(ctl),
+        &ctl.theme.get_untracked(),
     ))
 }
 
@@ -2171,6 +2191,7 @@ fn sync_active_doc(ctl: Ctl) {
 
 /// Bring the live DOM to rest so it can be handed to another document.
 fn quiesce(ctl: Ctl) {
+    reveal::close_all();
     // A diagram open for editing keeps its source in the textarea's *value
     // property*, and `inner_html()` serializes a textarea's initial child
     // text, not its value. Stashing over an open diagram would silently blank
@@ -2188,6 +2209,7 @@ fn quiesce(ctl: Ctl) {
         }
     }
     // These hold live handles into the DOM we are about to replace.
+    table_ui::refresh();
     close_ctx_menu(ctl);
     ctl.saved_range.set_value(None);
     ctl.url_modal.set(None);
@@ -2325,7 +2347,6 @@ fn activate(ctl: Ctl, i: usize) {
         restore_caret_from(ctl, &snap);
         // Last: focusing and restoring the caret can scroll the container.
         set_scroll_top(ctl, scroll);
-        update_in_table(ctl);
     });
 }
 
@@ -2538,7 +2559,6 @@ fn enter_empty_state(ctl: Ctl) {
     ctl.can_redo.set(false);
     ctl.words.set(0);
     ctl.chars.set(0);
-    ctl.in_table.set(false);
     // `window.find` searches the whole page, so leaving find open here would
     // let Enter start selecting toolbar chrome.
     ctl.find_open.set(false);
@@ -3299,7 +3319,13 @@ fn open_find(ctl: Ctl, with_replace: bool) {
 fn close_overlays(ctl: Ctl) -> bool {
     let mut closed = false;
     if ctl.ctx_menu.get_untracked().is_some() {
-        close_ctx_menu(ctl);
+        // A filter goes first, so Escape backs out one step at a time.
+        if ctl.ctx_filter.get_untracked().is_empty() {
+            dismiss_ctx_menu(ctl);
+        } else {
+            ctl.ctx_filter.set(String::new());
+            ctl.ctx_hl.set(None);
+        }
         closed = true;
     } else if ctl.heading_menu.get_untracked().is_some() {
         ctl.heading_menu.set(None);
@@ -3754,6 +3780,7 @@ const TABLE_MD: &str = "\n| Col 1 | Col 2 | Col 3 |\n| --- | --- | --- |\n|  |  
 const TABLE_HTML: &str = "<table><thead><tr><th>Col 1</th><th>Col 2</th><th>Col 3</th></tr></thead><tbody><tr><td><br></td><td><br></td><td><br></td></tr><tr><td><br></td><td><br></td><td><br></td></tr></tbody></table><p><br></p>";
 
 fn fmt_action(ctl: Ctl, action: &str) {
+    reveal::close_for_command();
     // Modal-opening actions mutate nothing yet; they commit on confirm.
     if matches!(action, "fmt_link" | "fmt_image") {
         open_url_modal(
@@ -3838,6 +3865,8 @@ fn fmt_action(ctl: Ctl, action: &str) {
 const MERMAID_SOURCE_CLASS: &str = "mermaid-source";
 /// The source that textarea opened with, for change detection on close.
 const MERMAID_ORIG_ATTR: &str = "data-mermaid-orig";
+/// An open formula's source exactly as it was in the file.
+const MATH_RAW_ATTR: &str = "data-math-raw";
 
 /// The open diagram-source textarea, if one has focus.
 fn focused_mermaid_source() -> Option<HtmlTextAreaElement> {
@@ -3853,6 +3882,7 @@ fn focused_mermaid_source() -> Option<HtmlTextAreaElement> {
 fn open_mermaid_source(ctl: Ctl, wrapper: &Element) -> Option<()> {
     let src = wrapper.get_attribute(crate::mermaid::SOURCE_ATTR)?;
     let src = src.trim_end_matches('\n');
+    reveal::close_all();
     let parent = wrapper.parent_node()?;
     // Snapshot the diagram as it stands — this is what undo returns to.
     history_sync(ctl);
@@ -3874,8 +3904,52 @@ fn open_mermaid_source(ctl: Ctl, wrapper: &Element) -> Option<()> {
     Some(())
 }
 
-/// Render the open textarea back into a diagram. Blanking the source deletes
-/// the block, which is the only way to remove a diagram from WYSIWYG mode.
+/// Swap a rendered formula for a textarea holding its source. It shares a
+/// diagram's class, so everything that closes or saves an open diagram covers
+/// it too; `data-math-kind` tells them apart.
+fn open_math_source(ctl: Ctl, math: &Element) -> Option<()> {
+    use crate::math::{DISPLAY_CLASS, INLINE_KIND, SOURCE_ATTR, SOURCE_KIND_ATTR};
+    let src = math.get_attribute(SOURCE_ATTR)?;
+    let display = math.class_list().contains(DISPLAY_CLASS);
+    reveal::close_all();
+    let parent = math.parent_node()?;
+    history_sync(ctl);
+    let ta = document()
+        .create_element("textarea")
+        .ok()?
+        .dyn_into::<HtmlTextAreaElement>()
+        .ok()?;
+    ta.set_class_name(MERMAID_SOURCE_CLASS);
+    let kind = if display { DISPLAY_CLASS } else { INLINE_KIND };
+    let _ = ta.class_list().add_1(kind);
+    let _ = ta.set_attribute(SOURCE_KIND_ATTR, kind);
+    let _ = ta.set_attribute("contenteditable", "false");
+    // `$$` on its own lines leaves newlines at the source's ends. They'd only
+    // be clutter in here, and closing an untouched formula puts them back.
+    let shown = src.trim_matches('\n');
+    let _ = ta.set_attribute(MERMAID_ORIG_ATTR, shown);
+    let _ = ta.set_attribute(MATH_RAW_ATTR, &src);
+    let rows = if display {
+        shown.lines().count().max(1) + 1
+    } else {
+        1
+    };
+    let _ = ta.set_attribute("rows", &rows.to_string());
+    ta.set_spellcheck(false);
+    ta.set_value(shown);
+    if !display {
+        // As wide as what's in it, near enough, so the line barely reflows.
+        let chars = src.chars().count().clamp(4, 60) + 2;
+        let _ = ta.set_attribute("cols", &chars.to_string());
+    }
+    parent.replace_child(ta.unchecked_ref(), math).ok()?;
+    let _ = ta.focus();
+    Some(())
+}
+
+/// Render the open textarea back into a diagram or formula. Blanking the
+/// source deletes it, which is the only way to remove a diagram from WYSIWYG
+/// mode.
 fn close_mermaid_source(ctl: Ctl, ta: &HtmlTextAreaElement) -> Option<()> {
     let src = ta.value();
     let changed = ta.get_attribute(MERMAID_ORIG_ATTR).as_deref() != Some(src.as_str());
@@ -3884,7 +3958,15 @@ fn close_mermaid_source(ctl: Ctl, ta: &HtmlTextAreaElement) -> Option<()> {
         parent.remove_child(ta).ok()?;
     } else {
         let holder = document().create_element("div").ok()?;
-        holder.set_inner_html(&crate::mermaid::render_block(&src));
+        let html = match ta.get_attribute(crate::math::SOURCE_KIND_ATTR) {
+            Some(kind) => {
+                let raw = ta.get_attribute(MATH_RAW_ATTR).filter(|_| !changed);
+                let src = raw.as_deref().unwrap_or(&src);
+                crate::math::render(src, kind == crate::math::DISPLAY_CLASS)
+            }
+            None => crate::mermaid::render_block(&src),
+        };
+        holder.set_inner_html(&html);
         let node = holder.first_child()?;
         parent.replace_child(&node, ta).ok()?;
     }
@@ -3908,33 +3990,20 @@ fn selection_element() -> Option<Element> {
         .or_else(|| node.parent_element())
 }
 
-/// (cell, row, table) — only for cells inside the WYSIWYG editor.
-fn cell_from(el: &Element) -> Option<(Element, Element, Element)> {
+/// The table cell an element is in, only inside the WYSIWYG editor.
+fn cell_from(el: &Element) -> Option<Element> {
     let cell = el.closest("td,th").ok().flatten()?;
     cell.closest(".editor.wysiwyg").ok().flatten()?;
-    let row = cell.closest("tr").ok().flatten()?;
-    let table = cell.closest("table").ok().flatten()?;
-    Some((cell, row, table))
+    Some(cell)
 }
 
 /// The cell an operation targets: the right-clicked cell while the context
 /// menu is open, otherwise the selection's cell.
-fn active_cell(ctl: Ctl) -> Option<(Element, Element, Element)> {
+fn active_cell(ctl: Ctl) -> Option<Element> {
     if let Some(c) = ctl.ctx_cell.get_value() {
         return cell_from(&c);
     }
     selection_element().and_then(|e| cell_from(&e))
-}
-
-fn row_cells(row: &Element) -> Vec<Element> {
-    children(row.unchecked_ref())
-        .into_iter()
-        .filter_map(|n| n.dyn_into::<Element>().ok())
-        .filter(|e| {
-            let t = e.tag_name().to_uppercase();
-            t == "TD" || t == "TH"
-        })
-        .collect()
 }
 
 fn children(node: &web_sys::Node) -> Vec<web_sys::Node> {
@@ -3942,163 +4011,93 @@ fn children(node: &web_sys::Node) -> Vec<web_sys::Node> {
     (0..list.length()).filter_map(|i| list.item(i)).collect()
 }
 
-fn caret_into(el: &Element) {
-    let _ = el.scroll_into_view_with_bool(false);
-    if let (Ok(range), Ok(Some(sel))) = (document().create_range(), window().get_selection()) {
-        let _ = range.set_start(el.unchecked_ref::<web_sys::Node>(), 0);
-        range.collapse_with_to_start(true);
-        let _ = sel.remove_all_ranges();
-        let _ = sel.add_range(&range);
+/// Run a table operation on the cell the menu or the caret points at.
+fn with_table_cell(ctl: Ctl, op: impl FnOnce(&Element)) {
+    if let Some(cell) = active_cell(ctl) {
+        op(&cell);
     }
 }
 
-fn new_cell(tag: &str) -> Option<Element> {
-    let el = document().create_element(tag).ok()?;
-    el.set_inner_html("<br>");
-    Some(el)
+/// Both routes to a table action pass through here: the right-click menu, and
+/// the app menu, whose items can't be greyed per cell.
+fn table_action_allowed(ctl: Ctl, action: &str) -> bool {
+    active_cell(ctl)
+        .and_then(|c| table_ui::menu_facts(&c))
+        .is_some_and(|f| table::menu_allows(&f, action))
 }
 
-fn table_changed(ctl: Ctl) {
-    mark_dirty(ctl);
-    recount(ctl);
-    history_sync(ctl);
+/// Dismissing the menu without choosing anything puts the caret back.
+fn dismiss_ctx_menu(ctl: Ctl) {
+    if ctl.ctx_menu.get_untracked().is_some() {
+        restore_selection(ctl);
+    }
+    close_ctx_menu(ctl);
 }
 
-fn table_insert_row(ctl: Ctl, below: bool) {
-    let Some((_, row, table)) = active_cell(ctl) else {
+fn table_menu_showing(ctl: Ctl) -> Vec<MenuEntry> {
+    let filter = ctl.ctx_filter.get();
+    ctl.ctx_items
+        .with_value(|items| table::menu_visible(items, &filter))
+}
+
+/// Run a menu item. The caret goes back first: operations that place their own
+/// caret need the editor focused, and the rest should leave it where it was.
+fn run_table_menu(ctl: Ctl, action: &str) {
+    restore_selection(ctl);
+    do_action(ctl, action);
+    close_ctx_menu(ctl);
+    table_ui::sync_focus();
+}
+
+fn table_menu_key(ctl: Ctl, e: &web_sys::KeyboardEvent) {
+    if e.ctrl_key() || e.meta_key() || e.alt_key() || e.is_composing() {
         return;
+    }
+    let key = e.key();
+    let showing = move || {
+        let filter = ctl.ctx_filter.get_untracked();
+        ctl.ctx_items
+            .with_value(|items| table::menu_visible(items, &filter))
     };
-    history_commit(ctl);
-    let cols = row_cells(&row).len().max(1);
-    let Ok(tr) = document().create_element("tr") else {
-        return;
-    };
-    for _ in 0..cols {
-        if let Some(td) = new_cell("td") {
-            let _ = tr.append_child(&td);
+    match key.as_str() {
+        "ArrowDown" | "ArrowUp" => {
+            let next = table::step_menu(&showing(), ctl.ctx_hl.get_untracked(), key == "ArrowDown");
+            ctl.ctx_hl.set(next);
         }
-    }
-    let in_head = row.closest("thead").ok().flatten().is_some();
-    if in_head {
-        // The header must stay first; both directions insert at the top of
-        // the body.
-        if let Some(tbody) = table.query_selector("tbody").ok().flatten() {
-            let _ = tbody.insert_before(&tr, tbody.first_child().as_ref());
-        } else {
-            let _ = table.append_child(&tr);
+        "Enter" => {
+            let visible = showing();
+            let at = ctl
+                .ctx_hl
+                .get_untracked()
+                .or_else(|| table::step_menu(&visible, None, true));
+            if let Some(MenuEntry::Item(item)) = at.and_then(|i| visible.get(i).copied()) {
+                if item.enabled {
+                    run_table_menu(ctl, item.action);
+                }
+            }
         }
-    } else if below {
-        let _ = row.after_with_node_1(&tr);
-    } else {
-        let _ = row.before_with_node_1(&tr);
-    }
-    if let Some(first) = row_cells(&tr).into_iter().next() {
-        caret_into(&first);
-    }
-    table_changed(ctl);
-}
-
-fn table_insert_col(ctl: Ctl, right: bool) {
-    let Some((cell, row, table)) = active_cell(ctl) else {
-        return;
-    };
-    let cells = row_cells(&row);
-    let Some(idx) = cells.iter().position(|c| c == &cell) else {
-        return;
-    };
-    history_commit(ctl);
-    let insert_at = if right { idx + 1 } else { idx };
-    let Ok(rows) = table.query_selector_all("tr") else {
-        return;
-    };
-    let mut caret_target: Option<Element> = None;
-    for i in 0..rows.length() {
-        let Some(tr) = rows.item(i).and_then(|n| n.dyn_into::<Element>().ok()) else {
-            continue;
-        };
-        let in_head = tr.closest("thead").ok().flatten().is_some();
-        let Some(nc) = new_cell(if in_head { "th" } else { "td" }) else {
-            continue;
-        };
-        let tr_cells = row_cells(&tr);
-        let at = insert_at.min(tr_cells.len());
-        if at >= tr_cells.len() {
-            let _ = tr.append_child(&nc);
-        } else {
-            let _ = tr.insert_before(&nc, Some(tr_cells[at].unchecked_ref()));
+        "Backspace" => {
+            ctl.ctx_filter.update(|f| {
+                f.pop();
+            });
+            ctl.ctx_hl.set(None);
         }
-        if tr == row {
-            caret_target = Some(nc);
+        // Escape is the window listener's, in `close_overlays`.
+        "Escape" => return,
+        _ if key.chars().count() == 1 => {
+            ctl.ctx_filter.update(|f| f.push_str(&key));
+            ctl.ctx_hl.set(table::step_menu(&showing(), None, true));
         }
+        _ => {}
     }
-    if let Some(c) = caret_target {
-        caret_into(&c);
-    }
-    table_changed(ctl);
-}
-
-fn table_delete_row(ctl: Ctl) {
-    let Some((_, row, _)) = active_cell(ctl) else {
-        return;
-    };
-    if row.closest("thead").ok().flatten().is_some() {
-        return; // a GFM table cannot lose its header row
-    }
-    history_commit(ctl);
-    row.remove();
-    table_changed(ctl);
-}
-
-fn table_delete_col(ctl: Ctl) {
-    let Some((cell, row, table)) = active_cell(ctl) else {
-        return;
-    };
-    let cells = row_cells(&row);
-    if cells.len() <= 1 {
-        history_commit(ctl);
-        table.remove();
-        table_changed(ctl);
-        return;
-    }
-    let Some(idx) = cells.iter().position(|c| c == &cell) else {
-        return;
-    };
-    let Ok(rows) = table.query_selector_all("tr") else {
-        return;
-    };
-    history_commit(ctl);
-    for i in 0..rows.length() {
-        let Some(tr) = rows.item(i).and_then(|n| n.dyn_into::<Element>().ok()) else {
-            continue;
-        };
-        let tr_cells = row_cells(&tr);
-        if let Some(c) = tr_cells.get(idx) {
-            c.remove();
-        }
-    }
-    table_changed(ctl);
-}
-
-fn table_delete_table(ctl: Ctl) {
-    let Some((_, _, table)) = active_cell(ctl) else {
-        return;
-    };
-    history_commit(ctl);
-    table.remove();
-    table_changed(ctl);
-}
-
-fn update_in_table(ctl: Ctl) {
-    let inside =
-        eff_mode(ctl) == Mode::Wysiwyg && selection_element().and_then(|e| cell_from(&e)).is_some();
-    if ctl.in_table.get_untracked() != inside {
-        ctl.in_table.set(inside);
-    }
+    e.prevent_default();
 }
 
 fn close_ctx_menu(ctl: Ctl) {
     ctl.ctx_menu.set(None);
     ctl.ctx_cell.set_value(None);
+    ctl.ctx_filter.set(String::new());
+    ctl.ctx_hl.set(None);
 }
 
 // ---------- smart paste ----------
@@ -4155,8 +4154,15 @@ fn do_action(ctl: Ctl, action: &str) {
     if !has_doc_now(ctl)
         && !matches!(
             action,
-            "new" | "open" | "import_html" | "import_docx" | "open_folder" | "toggle_project"
+            "new"
+                | "open"
+                | "import_html"
+                | "import_docx"
+                | "open_folder"
+                | "toggle_project"
+                | "toggle_reveal"
         )
+        && !action.starts_with("theme_")
     {
         return;
     }
@@ -4182,6 +4188,9 @@ fn do_action(ctl: Ctl, action: &str) {
         return;
     }
     if !kind.is_text() && matches!(action, "find" | "replace" | "select_all" | "save_as") {
+        return;
+    }
+    if action.starts_with("tbl_") && !table_action_allowed(ctl, action) {
         return;
     }
     match action {
@@ -4234,6 +4243,30 @@ fn do_action(ctl: Ctl, action: &str) {
             ctl.md_numbered.update(|v| *v = !*v);
             push_status(ctl);
         }
+        a if a.starts_with("theme_") => {
+            let theme = a["theme_".len()..].to_string();
+            ctl.theme.set(theme.clone());
+            push_status(ctl);
+            spawn_local(async move {
+                let args = serde_wasm_bindgen::to_value(&tauri_api::ThemeArgs { theme }).unwrap();
+                let _ = tauri_api::invoke("set_theme", args).await;
+            });
+        }
+        "toggle_reveal" => {
+            let on = !ctl.reveal.get_untracked();
+            if !on {
+                reveal::close_all();
+            }
+            ctl.reveal.set(on);
+            push_status(ctl);
+            spawn_local(async move {
+                let args = serde_wasm_bindgen::to_value(&tauri_api::RevealArgs { on }).unwrap();
+                let _ = tauri_api::invoke("set_reveal", args).await;
+            });
+            if on {
+                reveal::sync();
+            }
+        }
         "md_style_ogma" => {
             ctl.md_style.set(MdStyle::Ogma);
             push_status(ctl);
@@ -4254,13 +4287,25 @@ fn do_action(ctl: Ctl, action: &str) {
             ctl.md_style.set(MdStyle::Typewriter);
             push_status(ctl);
         }
-        "tbl_row_above" => table_insert_row(ctl, false),
-        "tbl_row_below" => table_insert_row(ctl, true),
-        "tbl_col_left" => table_insert_col(ctl, false),
-        "tbl_col_right" => table_insert_col(ctl, true),
-        "tbl_del_row" => table_delete_row(ctl),
-        "tbl_del_col" => table_delete_col(ctl),
-        "tbl_del_table" => table_delete_table(ctl),
+        "tbl_add_row" => with_table_cell(ctl, table_ui::add_row),
+        "tbl_add_col" => with_table_cell(ctl, table_ui::add_col),
+        "tbl_del_row" => with_table_cell(ctl, table_ui::delete_row),
+        "tbl_del_col" => with_table_cell(ctl, table_ui::delete_col),
+        "tbl_del_table" => with_table_cell(ctl, table_ui::delete_table),
+        "tbl_move_row_up" => with_table_cell(ctl, |c| table_ui::move_row(c, -1)),
+        "tbl_move_row_down" => with_table_cell(ctl, |c| table_ui::move_row(c, 1)),
+        "tbl_move_col_left" => with_table_cell(ctl, |c| table_ui::move_col(c, -1)),
+        "tbl_move_col_right" => with_table_cell(ctl, |c| table_ui::move_col(c, 1)),
+        "tbl_dup_row" => with_table_cell(ctl, table_ui::duplicate_row),
+        "tbl_dup_col" => with_table_cell(ctl, table_ui::duplicate_col),
+        "tbl_align_none" => with_table_cell(ctl, |c| table_ui::set_align(c, Align::None)),
+        "tbl_align_left" => with_table_cell(ctl, |c| table_ui::set_align(c, Align::Left)),
+        "tbl_align_center" => with_table_cell(ctl, |c| table_ui::set_align(c, Align::Center)),
+        "tbl_align_right" => with_table_cell(ctl, |c| table_ui::set_align(c, Align::Right)),
+        "tbl_sort_asc" => with_table_cell(ctl, |c| table_ui::sort_by_col(c, false)),
+        "tbl_sort_desc" => with_table_cell(ctl, |c| table_ui::sort_by_col(c, true)),
+        "tbl_copy_md" => with_table_cell(ctl, table_ui::copy_markdown),
+        "tbl_dup_table" => with_table_cell(ctl, table_ui::duplicate_table),
         a if a.starts_with("fmt_") => fmt_action(ctl, a),
         _ => {}
     }
@@ -4789,7 +4834,7 @@ fn tb_btn(
         <button
             class=format!("tb-btn {class}")
             title=tip
-            // One line disables all 20 format and table buttons in the empty
+            // One line disables all the format buttons in the empty
             // frame, and again for a tab holding something that has no
             // markdown to format.
             prop:disabled=move || !has_doc(ctl) || ctl.kind.get() != DocKind::Markdown
@@ -4920,15 +4965,6 @@ fn format_bar(ctl: Ctl) -> impl IntoView {
             {tb_btn(ctl, "fmt_image", "", "🖼", "Insert image")}
             {tb_btn(ctl, "fmt_table", "", "⊞", "Insert table")}
             {tb_btn(ctl, "fmt_hr", "", "―", "Horizontal rule")}
-            <span class="tb-group" class:hidden=move || !ctl.in_table.get()>
-                <span class="tb-sep"></span>
-                {tb_btn(ctl, "tbl_row_above", "tb-text", "Row ↑", "Insert row above")}
-                {tb_btn(ctl, "tbl_row_below", "tb-text", "Row ↓", "Insert row below")}
-                {tb_btn(ctl, "tbl_col_left", "tb-text", "Col ←", "Insert column left")}
-                {tb_btn(ctl, "tbl_col_right", "tb-text", "Col →", "Insert column right")}
-                {tb_btn(ctl, "tbl_del_row", "tb-text", "− Row", "Delete row")}
-                {tb_btn(ctl, "tbl_del_col", "tb-text", "− Col", "Delete column")}
-            </span>
             <span class="tb-spacer"></span>
             <select
                 class="tb-select"
@@ -4990,7 +5026,6 @@ pub fn App() -> impl IntoView {
         url_modal: RwSignal::new(None),
         url_val: RwSignal::new(String::new()),
         url_text: RwSignal::new(String::new()),
-        in_table: RwSignal::new(false),
         ctx_menu: RwSignal::new(None),
         editor_ref: NodeRef::new(),
         ta_ref: NodeRef::new(),
@@ -4998,6 +5033,9 @@ pub fn App() -> impl IntoView {
         url_ref: NodeRef::new(),
         saved_range: StoredValue::new_local(None),
         ctx_cell: StoredValue::new_local(None),
+        ctx_items: StoredValue::new(Vec::new()),
+        ctx_filter: RwSignal::new(String::new()),
+        ctx_hl: RwSignal::new(None),
         plain_paste: StoredValue::new(false),
         hist: StoredValue::new(Hist::default()),
         can_undo: RwSignal::new(false),
@@ -5014,6 +5052,8 @@ pub fn App() -> impl IntoView {
         md_full_width: RwSignal::new(false),
         md_style: RwSignal::new(MdStyle::Default),
         md_numbered: RwSignal::new(false),
+        reveal: RwSignal::new(false),
+        theme: RwSignal::new(String::new()),
         tabs_overflow: [RwSignal::new(false), RwSignal::new(false)],
         tabstrip_ref: [NodeRef::new(), NodeRef::new()],
         disk_modal: RwSignal::new(None),
@@ -5057,12 +5097,80 @@ pub fn App() -> impl IntoView {
     ctl.front.set([Some(0), None]);
     publish_tabs(ctl);
 
-    // Track whether the caret sits inside a table (drives the table toolbar
-    // group).
+    reveal::install_hooks(reveal::Hooks {
+        enabled: Box::new(move || {
+            ctl.reveal.get_untracked()
+                && has_doc_now(ctl)
+                && ctl.kind.get_untracked() == DocKind::Markdown
+                && eff_mode(ctl) == Mode::Wysiwyg
+                && !modal_open(ctl)
+        }),
+        commit: Box::new(move || history_commit(ctl)),
+        changed: Box::new(move || {
+            enable_checkboxes(ctl);
+            mark_dirty(ctl);
+            recount(ctl);
+            history_sync(ctl);
+        }),
+        settled: Box::new(move || {
+            enable_checkboxes(ctl);
+            recount(ctl);
+            history_sync(ctl);
+        }),
+        open_source: Box::new(move |el| {
+            if el.class_list().contains(crate::math::CLASS) {
+                open_math_source(ctl, el);
+            } else {
+                open_mermaid_source(ctl, el);
+            }
+        }),
+    });
+    // The theme lives on <html>, so app chrome, the editor and the other side's
+    // still all follow it.
+    Effect::new(move |_| {
+        let theme = ctl.theme.get();
+        if let Some(root) = document().document_element() {
+            if theme.is_empty() {
+                let _ = root.remove_attribute("data-theme");
+            } else {
+                let _ = root.set_attribute("data-theme", &theme);
+            }
+        }
+    });
+    spawn_local(async move {
+        if let Ok(v) = tauri_api::invoke_no_args("get_theme").await {
+            if let Some(theme) = v.as_string().filter(|t| !t.is_empty()) {
+                ctl.theme.set(theme);
+                push_status(ctl);
+            }
+        }
+    });
+
+    // The saved setting. The menu's tick follows on the next status push.
+    spawn_local(async move {
+        if let Ok(v) = tauri_api::invoke_no_args("get_reveal").await {
+            if v.as_bool() == Some(true) {
+                ctl.reveal.set(true);
+                push_status(ctl);
+            }
+        }
+    });
+
+    table_ui::install(table_ui::Hooks {
+        commit: Box::new(move || history_commit(ctl)),
+        changed: Box::new(move || {
+            mark_dirty(ctl);
+            recount(ctl);
+            history_sync(ctl);
+        }),
+    });
+
+    // Follow the caret: which block shows its markdown, and which cell is lit.
     {
         let cb = Closure::<dyn FnMut()>::new(move || {
             if has_doc_now(ctl) {
-                update_in_table(ctl);
+                reveal::sync();
+                table_ui::sync_focus();
             }
         });
         let _ = document()
@@ -5252,6 +5360,11 @@ pub fn App() -> impl IntoView {
             }
             return;
         }
+        // The table menu has the keyboard while it's open. Its own handler takes
+        // what it wants, and a shortcut must not act on the document behind it.
+        if ctl.ctx_menu.get_untracked().is_some() {
+            return;
+        }
         // Every shortcut below acts on the document behind an open question —
         // bolding it, saving it, closing its tab, opening another. Escape,
         // handled above, stays live: dismissing is itself an answer to give.
@@ -5327,6 +5440,7 @@ pub fn App() -> impl IntoView {
         mark_dirty(ctl);
         recount(ctl);
         history_sync(ctl);
+        table_ui::refresh();
     };
 
     // The webview keeps its own history; reroute it to ours (context-menu
@@ -5354,7 +5468,23 @@ pub fn App() -> impl IntoView {
         }
         // Inside a diagram's source the textarea owns the keyboard; Tab there
         // means "indent this line", not "indent the surrounding list".
-        if focused_mermaid_source().is_some() {
+        if let Some(ta) = focused_mermaid_source() {
+            // An inline formula is one line, so Enter means "done".
+            if e.key() == "Enter" && ta.class_list().contains(crate::math::INLINE_KIND) {
+                e.prevent_default();
+                let _ = ta.blur();
+            } else if reveal::leave_source(&ta, &e) {
+                e.prevent_default();
+            }
+            return;
+        }
+        if reveal::handle_key(&e) {
+            e.prevent_default();
+            return;
+        }
+        reveal::on_arrow(&e);
+        if table_ui::handle_key(&e) {
+            e.prevent_default();
             return;
         }
         // The modifier check matters: without it Ctrl+Tab indents a list here
@@ -5379,6 +5509,10 @@ pub fn App() -> impl IntoView {
     let on_editor_paste = move |e: web_sys::ClipboardEvent| {
         e.prevent_default();
         if let Some(dt) = e.clipboard_data() {
+            let plain = dt.get_data("text/plain").unwrap_or_default();
+            if reveal::paste_plain(&plain) {
+                return;
+            }
             history_commit(ctl);
             if let Some(md) = paste_markdown(ctl, &dt) {
                 let inline = insert_markdown_at_caret(&md);
@@ -5432,6 +5566,20 @@ pub fn App() -> impl IntoView {
                     open_mermaid_source(ctl, &w);
                     return;
                 }
+                let sel = format!(".{}", crate::math::CLASS);
+                if let Some(m) = el.closest(&sel).ok().flatten() {
+                    e.prevent_default();
+                    // With the setting on, an inline formula opens as part of
+                    // its line. A table cell doesn't open, so there it's
+                    // still edited on its own.
+                    let in_line = ctl.reveal.get_untracked()
+                        && !m.class_list().contains(crate::math::DISPLAY_CLASS)
+                        && m.closest("td,th").ok().flatten().is_none();
+                    if !in_line {
+                        open_math_source(ctl, &m);
+                    }
+                    return;
+                }
                 if el.closest("a").ok().flatten().is_some() {
                     e.prevent_default();
                 }
@@ -5480,10 +5628,17 @@ pub fn App() -> impl IntoView {
         let Some(el) = e.target().and_then(|t| t.dyn_into::<Element>().ok()) else {
             return;
         };
-        let Some((cell, _, _)) = cell_from(&el) else {
+        let Some(cell) = cell_from(&el) else {
             return; // outside a table: keep the default context menu
         };
         e.prevent_default();
+        let Some(facts) = table_ui::menu_facts(&cell) else {
+            return;
+        };
+        save_selection(ctl);
+        ctl.ctx_items.set_value(table::table_menu(&facts));
+        ctl.ctx_filter.set(String::new());
+        ctl.ctx_hl.set(None);
         ctl.ctx_cell.set_value(Some(cell));
         let win = window();
         let vw = win
@@ -5497,22 +5652,15 @@ pub fn App() -> impl IntoView {
             .and_then(|v| v.as_f64())
             .unwrap_or(600.0);
         let x = f64::from(e.client_x()).min(vw - 200.0).max(0.0);
-        let y = f64::from(e.client_y()).min(vh - 270.0).max(0.0);
+        let y = f64::from(e.client_y()).min(vh - 700.0).max(8.0);
         ctl.ctx_menu.set(Some((x, y)));
-    };
-
-    let ctx_item = move |action: &'static str, label: &'static str| {
-        view! {
-            <button
-                class="ctx-item"
-                on:click=move |_| {
-                    do_action(ctl, action);
-                    close_ctx_menu(ctl);
+        request_animation_frame(|| {
+            if let Ok(Some(menu)) = document().query_selector(".ctxmenu.table-menu") {
+                if let Ok(menu) = menu.dyn_into::<web_sys::HtmlElement>() {
+                    let _ = menu.focus();
                 }
-            >
-                {label}
-            </button>
-        }
+            }
+        });
     };
 
     view! {
@@ -5637,6 +5785,21 @@ pub fn App() -> impl IntoView {
                     on:beforeinput=on_before_input
                     on:keydown=on_editor_keydown
                     on:paste=on_editor_paste
+                    on:mousedown=move |e: web_sys::MouseEvent| {
+                        // A link in a table cell opens on press, ahead of the
+                        // caret landing in the cell.
+                        if let Some(url) = table_ui::link_on_press(&e) {
+                            e.prevent_default();
+                            spawn_local(async move {
+                                let args =
+                                    serde_wasm_bindgen::to_value(&tauri_api::LinkArgs { url })
+                                        .unwrap();
+                                if let Err(err) = tauri_api::invoke("open_link", args).await {
+                                    report_backend_error("Could not open link", &err);
+                                }
+                            });
+                        }
+                    }
                     on:click=on_editor_click
                     on:focusout=on_editor_focusout
                     on:contextmenu=on_editor_ctxmenu
@@ -5714,27 +5877,57 @@ pub fn App() -> impl IntoView {
             <Show when=move || ctl.ctx_menu.get().is_some()>
                 <div
                     class="ctx-backdrop"
-                    on:mousedown=move |_| close_ctx_menu(ctl)
+                    on:mousedown=move |_| dismiss_ctx_menu(ctl)
                     on:contextmenu=move |e: web_sys::MouseEvent| {
                         e.prevent_default();
-                        close_ctx_menu(ctl);
+                        dismiss_ctx_menu(ctl);
                     }
                 ></div>
                 <div
-                    class="ctxmenu"
+                    class="ctxmenu table-menu"
+                    tabindex="-1"
+                    on:keydown=move |e: web_sys::KeyboardEvent| table_menu_key(ctl, &e)
                     style=move || {
                         let (x, y) = ctl.ctx_menu.get().unwrap_or((0.0, 0.0));
                         format!("left:{x}px;top:{y}px")
                     }
                 >
-                    {ctx_item("tbl_row_above", "Insert row above")}
-                    {ctx_item("tbl_row_below", "Insert row below")}
-                    {ctx_item("tbl_col_left", "Insert column left")}
-                    {ctx_item("tbl_col_right", "Insert column right")}
-                    <div class="ctx-sep"></div>
-                    {ctx_item("tbl_del_row", "Delete row")}
-                    {ctx_item("tbl_del_col", "Delete column")}
-                    {ctx_item("tbl_del_table", "Delete table")}
+                    {move || {
+                        let filter = ctl.ctx_filter.get();
+                        (!filter.is_empty())
+                            .then(|| view! { <div class="ctx-filter">{filter}</div> })
+                    }}
+                    {move || {
+                        let showing = table_menu_showing(ctl);
+                        let hl = ctl.ctx_hl.get();
+                        if showing.is_empty() {
+                            return view! { <div class="ctx-empty">"No matches"</div> }.into_any();
+                        }
+                        showing
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, entry)| match entry {
+                                MenuEntry::Sep => view! { <div class="ctx-sep"></div> }.into_any(),
+                                MenuEntry::Item(item) => view! {
+                                    <button
+                                        class="ctx-item ctx-item-row"
+                                        class:ctx-hl=hl == Some(i)
+                                        tabindex="-1"
+                                        prop:disabled=!item.enabled
+                                        on:mousedown=|e: web_sys::MouseEvent| e.prevent_default()
+                                        on:click=move |_| run_table_menu(ctl, item.action)
+                                    >
+                                        <span>{item.label}</span>
+                                        <span class="ctx-tick">
+                                            {if item.ticked { "✓" } else { "" }}
+                                        </span>
+                                    </button>
+                                }
+                                .into_any(),
+                            })
+                            .collect_view()
+                            .into_any()
+                    }}
                 </div>
             </Show>
 

@@ -132,7 +132,7 @@ pub(crate) fn escape_text(s: &str) -> String {
 /// Escape for an attribute value. Newlines become `&#10;` so the source
 /// survives the browser's own re-serialization of `innerHTML` (which undo
 /// snapshots and clipboard copies go through).
-fn escape_attr(s: &str) -> String {
+pub(crate) fn escape_attr(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {

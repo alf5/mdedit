@@ -24,6 +24,23 @@ use web_sys::{Element, HtmlDocument, HtmlIFrameElement, HtmlInputElement};
 /// The editor's own document styles, verbatim. `index.html` links this same
 /// file, so an exported document and the editor can never drift apart.
 const DOC_CSS: &str = include_str!("../document.css");
+const THEMES_CSS: &str = include_str!("../themes.css");
+
+/// One theme's rule out of `themes.css`, so an export carries the palette it
+/// was written in without all the others. Empty for an unknown theme, or none.
+fn theme_rule(theme: &str) -> &'static str {
+    if theme.is_empty() {
+        return "";
+    }
+    let selector = format!(":root[data-theme=\"{theme}\"]");
+    let Some(start) = THEMES_CSS.find(&selector) else {
+        return "";
+    };
+    match THEMES_CSS[start..].find('}') {
+        Some(end) => &THEMES_CSS[start..start + end + 1],
+        None => "",
+    }
+}
 
 /// What a standalone page needs and the app gets from `styles.css` instead
 /// (which is all app chrome, and deliberately not embedded here).
@@ -81,22 +98,28 @@ pub fn body_from_markdown(md: &str) -> String {
 /// Wrap a cleaned body in the standalone page. `extra_class` is appended to
 /// `markdown-body` so an export keeps the editor's style and full-width
 /// setting; pass `""` for the default sheet.
-pub fn build_document(title: &str, body: &str, extra_class: &str) -> String {
+pub fn build_document(title: &str, body: &str, extra_class: &str, theme: &str) -> String {
     let title = crate::mermaid::escape_text(display_title(title));
     let class = if extra_class.is_empty() {
         "markdown-body".to_string()
     } else {
         format!("markdown-body {extra_class}")
     };
+    let rule = theme_rule(theme);
+    let html_attrs = if rule.is_empty() {
+        String::new()
+    } else {
+        format!(" data-theme=\"{}\"", crate::mermaid::escape_attr(theme))
+    };
     format!(
         "<!doctype html>\n\
-         <html lang=\"en\">\n\
+         <html lang=\"en\"{html_attrs}>\n\
          <head>\n\
          <meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
          <meta name=\"generator\" content=\"mdedit\">\n\
          <title>{title}</title>\n\
-         <style>\n{PAGE_CSS}\n{DOC_CSS}</style>\n\
+         <style>\n{PAGE_CSS}\n{DOC_CSS}\n{rule}\n</style>\n\
          </head>\n\
          <body>\n\
          <article class=\"{class}\">\n{body}\n</article>\n\
@@ -256,8 +279,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn carries_only_the_chosen_theme() {
+        let out = build_document("x", "", "", "dark-hard");
+        assert!(out.contains("<html lang=\"en\" data-theme=\"dark-hard\">"));
+        assert!(out.contains(":root[data-theme=\"dark-hard\"] {"));
+        assert!(out.contains("--bg: #1d2021;"));
+        assert!(!out.contains("data-theme=\"apple-light\""));
+    }
+
+    #[test]
+    fn no_theme_or_an_unknown_one_adds_nothing() {
+        for theme in ["", "no-such-theme"] {
+            let out = build_document("x", "", "", theme);
+            assert!(out.contains("<html lang=\"en\">"), "{theme}");
+            assert!(
+                !out.contains(":root[data-theme=\"apple-light\"]"),
+                "{theme}"
+            );
+            assert!(!out.contains(":root[data-theme=\"dark-hard\"]"), "{theme}");
+        }
+    }
+
+    #[test]
     fn wraps_the_body_in_a_standalone_page() {
-        let out = build_document("notes.md", "<p>hi</p>", "");
+        let out = build_document("notes.md", "<p>hi</p>", "", "");
         assert!(out.starts_with("<!doctype html>"));
         assert!(out.contains("<title>notes</title>"));
         assert!(out.contains("<article class=\"markdown-body\">"));
@@ -271,7 +316,7 @@ mod tests {
     /// depend on the app being installed to look right.
     #[test]
     fn embeds_the_document_stylesheet() {
-        let out = build_document("x", "", "");
+        let out = build_document("x", "", "", "");
         assert!(out.contains(".markdown-body table th"));
         assert!(out.contains("--pele-surface-alt"));
         assert!(out.contains("prefers-color-scheme: dark"));
@@ -294,17 +339,17 @@ mod tests {
 
     #[test]
     fn extra_classes_land_on_the_article() {
-        let out = build_document("x", "<p>hi</p>", "md-numbered md-full-width");
+        let out = build_document("x", "<p>hi</p>", "md-numbered md-full-width", "");
         assert!(out.contains("<article class=\"markdown-body md-numbered md-full-width\">"));
         assert!(out.contains("<p>hi</p>"));
     }
 
     #[test]
     fn titles_are_escaped_and_de_extensioned() {
-        assert!(build_document("a & b.md", "", "").contains("<title>a &amp; b</title>"));
-        assert!(build_document("", "", "").contains("<title>Untitled</title>"));
-        assert!(build_document("Untitled", "", "").contains("<title>Untitled</title>"));
+        assert!(build_document("a & b.md", "", "", "").contains("<title>a &amp; b</title>"));
+        assert!(build_document("", "", "", "").contains("<title>Untitled</title>"));
+        assert!(build_document("Untitled", "", "", "").contains("<title>Untitled</title>"));
         // Only the markdown extensions are stripped, not any trailing dot-word.
-        assert!(build_document("v1.2 notes", "", "").contains("<title>v1.2 notes</title>"));
+        assert!(build_document("v1.2 notes", "", "", "").contains("<title>v1.2 notes</title>"));
     }
 }

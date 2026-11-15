@@ -37,6 +37,21 @@ pub struct SaveArgs {
     pub path: Option<String>,
 }
 
+#[derive(Serialize)]
+pub struct LinkArgs {
+    pub url: String,
+}
+
+#[derive(Serialize)]
+pub struct ThemeArgs {
+    pub theme: String,
+}
+
+#[derive(Serialize)]
+pub struct RevealArgs {
+    pub on: bool,
+}
+
 /// Tauri v2 camelCases command arguments, so `any_dirty` has to be renamed or
 /// it arrives as a missing argument and the invoke is rejected.
 #[derive(Serialize)]
@@ -53,6 +68,8 @@ pub struct TitleArgs {
     pub source: bool,
     pub full_width: bool,
     pub numbered: bool,
+    pub reveal: bool,
+    pub theme: String,
     pub style: String,
     pub overwrite: bool,
     /// The window shows two sides.

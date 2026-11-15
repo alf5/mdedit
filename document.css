@@ -220,23 +220,23 @@
 }
 
 .markdown-body .markdown-alert-note {
-  border-left-color: #0969da;
+  border-left-color: var(--alert-note, #0969da);
 }
 
 .markdown-body .markdown-alert-tip {
-  border-left-color: #1a7f37;
+  border-left-color: var(--alert-tip, #1a7f37);
 }
 
 .markdown-body .markdown-alert-important {
-  border-left-color: #8250df;
+  border-left-color: var(--alert-important, #8250df);
 }
 
 .markdown-body .markdown-alert-warning {
-  border-left-color: #9a6700;
+  border-left-color: var(--alert-warning, #9a6700);
 }
 
 .markdown-body .markdown-alert-caution {
-  border-left-color: #d1242f;
+  border-left-color: var(--alert-caution, #d1242f);
 }
 
 .markdown-body ul,
@@ -265,24 +265,58 @@
   border-spacing: 0;
   margin-bottom: 16px;
   display: block;
+  width: max-content;
   max-width: 100%;
   overflow-x: auto;
+  font-size: 0.94em;
+}
+
+/* Saved column widths (`<!-- zen:cols=… -->`). They only hold exactly in fixed
+   layout, which needs a real table box rather than the block above. A table
+   wider than the page then scrolls with the page instead of on its own. */
+.markdown-body table:has(> colgroup) {
+  display: table;
+  table-layout: fixed;
+  max-width: none;
 }
 
 .markdown-body table th,
 .markdown-body table td {
   border: 1px solid var(--border);
-  padding: 6px 13px;
+  padding: 0.5em 0.75em;
   min-width: 40px;
+  /* Not `anywhere`, which would let auto layout shrink a column until words
+     break mid-word rather than scrolling the table. */
+  overflow-wrap: break-word;
+  vertical-align: top;
 }
 
 .markdown-body table th {
   font-weight: 600;
   background: var(--bg-soft);
+  text-align: left;
 }
 
-.markdown-body table tr:nth-child(2n) td {
-  background: var(--bg-soft);
+/* Math. Named math fonts first because plain `math` falls back to whatever
+   the system picks, and that varies. */
+.markdown-body math {
+  font-family: "Latin Modern Math", "STIX Two Math", "Cambria Math", "Libertinus Math",
+    "Noto Sans Math", math;
+}
+
+.markdown-body .math-display {
+  display: block;
+  margin: 12px 0;
+  padding: 4px 0;
+  /* Scrolls sideways if it's wide. Tall glyphs slightly overflowing their box
+     mustn't get it a vertical scrollbar too. */
+  overflow-x: auto;
+  overflow-y: hidden;
+  text-align: center;
+}
+
+.markdown-body .math-error code {
+  color: var(--danger, #cf222e);
 }
 
 .markdown-body img {
@@ -894,7 +928,10 @@
     margin: 18mm 16mm;
   }
 
-  :root {
+  /* `html:root[data-theme]` outranks a theme's `:root[data-theme="…"]` in
+     themes.css, which is how a dark theme still prints on white. */
+  :root,
+  html:root[data-theme] {
     color-scheme: light;
 
     --bg: #ffffff;
@@ -912,6 +949,12 @@
 
     --pele-surface-alt: #eaeef2;
     --pele-border: #8c959f;
+
+    --alert-note: #0969da;
+    --alert-tip: #1a7f37;
+    --alert-important: #8250df;
+    --alert-warning: #9a6700;
+    --alert-caution: #d1242f;
   }
 
   html,
@@ -964,6 +1007,19 @@
   .markdown-body .mermaid-diagram {
     break-inside: avoid;
     page-break-inside: avoid;
+  }
+
+  /* Paper doesn't scroll, so saved column widths give way to fitting the page.
+     `!important` because the widths are inline styles. */
+  .markdown-body table:has(> colgroup) {
+    display: table;
+    table-layout: auto;
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .markdown-body table col {
+    width: auto !important;
   }
 
   /* A table long enough to span pages repeats its header on each one. */

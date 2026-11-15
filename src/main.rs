@@ -4,8 +4,12 @@ mod export;
 mod hex;
 mod history;
 mod markdown;
+mod math;
 mod mermaid;
+mod reveal;
 mod serialize;
+mod table;
+mod table_ui;
 mod tauri_api;
 
 use app::*;

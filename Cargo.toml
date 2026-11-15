@@ -25,6 +25,13 @@ web-sys = { version = "0.3", features = [
     "HtmlTextAreaElement",
     "Node",
     "NodeList",
+    "Text",
+    "CharacterData",
+    "HtmlCollection",
+    "CssStyleDeclaration",
+    "PointerEvent",
+    "Navigator",
+    "Clipboard",
     "Selection",
     "Range",
     "DomTokenList",
@@ -40,6 +47,11 @@ web-sys = { version = "0.3", features = [
     "EventTarget",
 ] }
 base64 = "0.23.1"
+unicode-width = "0.2"
+math-core = "0.9"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
 
 [workspace]
 members = ["src-tauri"]

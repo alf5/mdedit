@@ -22,6 +22,7 @@ diffy = { version = "0.5", features = ["std"] }
 notify = "8"
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
 
 # A second launch forwards its argv to the running window as new tabs instead
 # of opening another process. Desktop-only, as the plugin's docs prescribe.

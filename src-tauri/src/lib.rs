@@ -3,10 +3,12 @@ mod detach;
 mod docx;
 mod pdf;
 mod project;
+mod themes;
 mod watch;
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use tauri_plugin_opener::OpenerExt;
 
 use serde::{Deserialize, Serialize};
 use tauri::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu};
@@ -31,6 +33,9 @@ struct DocState {
     pending_open: Vec<PathBuf>,
     /// Canonical paths, most-recent-first, capped at `RECENT_MAX`.
     recent: Vec<String>,
+    reveal: bool,
+    /// View > Theme: an id from `themes.rs`, or empty for the system's.
+    theme: String,
     /// Live handle to File ▸ Open Recent, repopulated in place at runtime.
     recent_menu: Option<Submenu<Wry>>,
     /// Menu entries that mean nothing with no document open.
@@ -64,6 +69,9 @@ struct ViewChecks {
     source: CheckMenuItem<Wry>,
     full_width: CheckMenuItem<Wry>,
     numbered: CheckMenuItem<Wry>,
+    reveal: CheckMenuItem<Wry>,
+    /// View > Theme: "Match System" first, then one item per theme.
+    themes: Vec<(String, CheckMenuItem<Wry>)>,
     style_ogma: CheckMenuItem<Wry>,
     style_github: CheckMenuItem<Wry>,
     style_manuscript: CheckMenuItem<Wry>,
@@ -490,6 +498,8 @@ fn set_title(
     source: bool,
     full_width: bool,
     numbered: bool,
+    reveal: bool,
+    theme: String,
     style: String,
     overwrite: bool,
     split: bool,
@@ -507,7 +517,7 @@ fn set_title(
     }
     set_doc_menus_enabled(&app, !name.is_empty(), markdown, text);
     set_view_ticks(
-        &app, project, source, full_width, numbered, &style, overwrite,
+        &app, project, source, full_width, numbered, reveal, &theme, &style, overwrite,
     );
     set_side_items(&app, split, side, multi);
 }
@@ -564,6 +574,12 @@ fn show_about(app: AppHandle) {
 struct Prefs {
     #[serde(default)]
     recent: Vec<String>,
+    /// View > Show Markdown at Cursor.
+    #[serde(default)]
+    reveal: bool,
+    /// View > Theme. Empty follows the system.
+    #[serde(default)]
+    theme: String,
 }
 
 fn prefs_path(app: &AppHandle) -> Option<PathBuf> {
@@ -574,34 +590,100 @@ fn prefs_path(app: &AppHandle) -> Option<PathBuf> {
 }
 
 /// Never fails loudly: a missing, unreadable or corrupt file just means
-/// "no recent documents".
-fn load_recent(app: &AppHandle) -> Vec<String> {
-    let Some(p) = prefs_path(app) else {
-        return Vec::new();
-    };
-    let Ok(text) = std::fs::read_to_string(p) else {
-        return Vec::new();
-    };
-    serde_json::from_str::<Prefs>(&text)
-        .map(|p| p.recent)
+/// the defaults.
+fn load_prefs(app: &AppHandle) -> Prefs {
+    prefs_path(app)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default()
 }
 
-/// Best effort — losing the recent list is never worth an error dialog, and a
+/// Best effort — losing the preferences is never worth an error dialog, and a
 /// read-only or missing config dir must not break anything.
-fn save_recent(app: &AppHandle) {
-    let recent = {
+fn save_prefs(app: &AppHandle) {
+    let prefs = {
         let state = app.state::<AppState>();
         let s = state.0.lock().unwrap();
-        s.recent.clone()
+        Prefs {
+            recent: s.recent.clone(),
+            reveal: s.reveal,
+            theme: s.theme.clone(),
+        }
     };
     let Some(p) = prefs_path(app) else { return };
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    if let Ok(text) = serde_json::to_string_pretty(&Prefs { recent }) {
+    if let Ok(text) = serde_json::to_string_pretty(&prefs) {
         let _ = std::fs::write(p, text);
     }
+}
+
+/// May this address be handed to the OS? It comes out of a document, which
+/// could be from anyone, so only web and mail links qualify: `file:` and custom
+/// schemes can launch things.
+fn is_openable_link(url: &str) -> bool {
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    let Some((scheme, rest)) = url.split_once(':') else {
+        return false;
+    };
+    match scheme.to_ascii_lowercase().as_str() {
+        "http" | "https" => rest.strip_prefix("//").is_some_and(|host| {
+            host.split(['/', '?', '#'])
+                .next()
+                .is_some_and(|h| !h.is_empty())
+        }),
+        "mailto" => !rest.is_empty(),
+        _ => false,
+    }
+}
+
+/// Open a link from a document in the OS's default handler.
+#[tauri::command]
+fn open_link(app: AppHandle, url: String) -> Result<(), String> {
+    if !is_openable_link(&url) {
+        return Err(format!("mdedit doesn't open this kind of link: {url}"));
+    }
+    app.opener()
+        .open_url(url, None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
+/// The saved View > Show Markdown at Cursor setting, read once at startup.
+#[tauri::command]
+fn get_reveal(state: State<AppState>) -> bool {
+    state.0.lock().unwrap().reveal
+}
+
+#[tauri::command]
+fn set_reveal(app: AppHandle, state: State<AppState>, on: bool) {
+    state.0.lock().unwrap().reveal = on;
+    save_prefs(&app);
+}
+
+/// The saved View > Theme choice, read once at startup. A theme that no
+/// longer exists comes back as the system's.
+#[tauri::command]
+fn get_theme(state: State<AppState>) -> String {
+    let theme = state.0.lock().unwrap().theme.clone();
+    if themes::is_known(&theme) {
+        theme
+    } else {
+        String::new()
+    }
+}
+
+#[tauri::command]
+fn set_theme(app: AppHandle, state: State<AppState>, theme: String) {
+    let theme = if themes::is_known(&theme) {
+        theme
+    } else {
+        String::new()
+    };
+    state.0.lock().unwrap().theme = theme;
+    save_prefs(&app);
 }
 
 /// Keep the tail: the last path components identify a file far better than
@@ -720,7 +802,7 @@ fn push_recent(app: &AppHandle, paths: &[PathBuf]) {
         }
         s.recent.truncate(RECENT_MAX);
     }
-    save_recent(app);
+    save_prefs(app);
     refresh_recent_menu(app);
 }
 
@@ -730,7 +812,7 @@ fn forget_recent(app: &AppHandle, path: &str) {
         let mut s = state.0.lock().unwrap();
         s.recent.retain(|p| p != path);
     }
-    save_recent(app);
+    save_prefs(app);
     refresh_recent_menu(app);
 }
 
@@ -809,12 +891,15 @@ fn set_doc_menus_enabled(app: &AppHandle, has_doc: bool, markdown: bool, text: b
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn set_view_ticks(
     app: &AppHandle,
     project: bool,
     source: bool,
     full_width: bool,
     numbered: bool,
+    reveal: bool,
+    theme: &str,
     style: &str,
     overwrite: bool,
 ) {
@@ -829,6 +914,10 @@ fn set_view_ticks(
     let _ = v.source.set_checked(source);
     let _ = v.full_width.set_checked(full_width);
     let _ = v.numbered.set_checked(numbered);
+    let _ = v.reveal.set_checked(reveal);
+    for (id, item) in &v.themes {
+        let _ = item.set_checked(id == theme);
+    }
     let _ = v.style_ogma.set_checked(style == "ogma");
     let _ = v.style_github.set_checked(style == "default");
     let _ = v.style_manuscript.set_checked(style == "manuscript");
@@ -984,6 +1073,52 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<MenuHandles> 
         false,
         None::<&str>,
     )?;
+    // Applies to every document, so unlike its neighbours it's never disabled.
+    let reveal = CheckMenuItem::with_id(
+        app,
+        "toggle_reveal",
+        "Show Markdown at Cursor",
+        true,
+        false,
+        None::<&str>,
+    )?;
+    // View > Theme: the system's palette, then each theme by family. The action
+    // id is `theme_` plus the theme's id; the frontend applies it.
+    let mut theme_checks: Vec<(String, CheckMenuItem<Wry>)> = Vec::new();
+    let theme_system =
+        CheckMenuItem::with_id(app, "theme_", "Match System", true, true, None::<&str>)?;
+    theme_checks.push((String::new(), theme_system.clone()));
+    let mut theme_families: Vec<Submenu<Wry>> = Vec::new();
+    for (family, items) in themes::FAMILIES {
+        let mut checks = Vec::new();
+        for (id, label) in *items {
+            let item = CheckMenuItem::with_id(
+                app,
+                format!("theme_{id}"),
+                *label,
+                true,
+                false,
+                None::<&str>,
+            )?;
+            theme_checks.push((id.to_string(), item.clone()));
+            checks.push(item);
+        }
+        let refs: Vec<&dyn tauri::menu::IsMenuItem<Wry>> = checks
+            .iter()
+            .map(|c| c as &dyn tauri::menu::IsMenuItem<Wry>)
+            .collect();
+        theme_families.push(Submenu::with_items(app, *family, true, &refs)?);
+    }
+    let theme_separator = PredefinedMenuItem::separator(app)?;
+    let mut theme_refs: Vec<&dyn tauri::menu::IsMenuItem<Wry>> =
+        vec![&theme_system, &theme_separator];
+    theme_refs.extend(
+        theme_families
+            .iter()
+            .map(|f| f as &dyn tauri::menu::IsMenuItem<Wry>),
+    );
+    let theme_menu = Submenu::with_items(app, "Theme", true, &theme_refs)?;
+
     let style_ogma =
         CheckMenuItem::with_id(app, "md_style_ogma", "Ogma", true, false, None::<&str>)?;
     let style_github =
@@ -1039,6 +1174,8 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<MenuHandles> 
         source: source_mode.clone(),
         full_width: full_width.clone(),
         numbered: numbered.clone(),
+        reveal: reveal.clone(),
+        themes: theme_checks,
         style_ogma: style_ogma.clone(),
         style_github: style_github.clone(),
         style_manuscript: style_manuscript.clone(),
@@ -1072,8 +1209,10 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<MenuHandles> 
             &project_pane,
             &PredefinedMenuItem::separator(app)?,
             &source_mode,
+            &reveal,
             &full_width,
             &numbered,
+            &theme_menu,
             &style_menu,
             // The hex editor's insert/overwrite switch. `Insert` is the key
             // everyone reaches for and is bound in the keymap, but Apple
@@ -1112,10 +1251,8 @@ fn build_menu(app: &AppHandle, recent: &[String]) -> tauri::Result<MenuHandles> 
             &MenuItem::with_id(app, "fmt_mermaid", "Mermaid Diagram", true, None::<&str>)?,
             &MenuItem::with_id(app, "fmt_hr", "Horizontal Rule", true, None::<&str>)?,
             &PredefinedMenuItem::separator(app)?,
-            &MenuItem::with_id(app, "tbl_row_above", "Row Above", true, None::<&str>)?,
-            &MenuItem::with_id(app, "tbl_row_below", "Row Below", true, None::<&str>)?,
-            &MenuItem::with_id(app, "tbl_col_left", "Column Left", true, None::<&str>)?,
-            &MenuItem::with_id(app, "tbl_col_right", "Column Right", true, None::<&str>)?,
+            &MenuItem::with_id(app, "tbl_add_row", "Table Row", true, None::<&str>)?,
+            &MenuItem::with_id(app, "tbl_add_col", "Table Column", true, None::<&str>)?,
             &PredefinedMenuItem::separator(app)?,
             &MenuItem::with_id(app, "tbl_del_row", "Delete Row", true, None::<&str>)?,
             &MenuItem::with_id(app, "tbl_del_col", "Delete Column", true, None::<&str>)?,
@@ -1265,6 +1402,7 @@ pub fn run() {
 
     builder
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .manage(AppState(Mutex::new(DocState::default())))
         .manage(watch::Watch::default())
         .invoke_handler(tauri::generate_handler![
@@ -1277,6 +1415,11 @@ pub fn run() {
             save_doc,
             save_doc_as,
             set_title,
+            get_reveal,
+            set_reveal,
+            get_theme,
+            set_theme,
+            open_link,
             force_close,
             show_about,
             watch_paths,
@@ -1292,12 +1435,15 @@ pub fn run() {
             let handle = app.handle();
             // Loaded before the menu is built so Open Recent is born
             // populated and nothing has to be mutated during setup.
-            let recent = load_recent(handle);
+            let prefs = load_prefs(handle);
+            let recent = prefs.recent;
             let h = build_menu(handle, &recent)?;
             app.set_menu(h.menu)?;
             let state = app.state::<AppState>();
             let mut s = state.0.lock().unwrap();
             s.recent = recent;
+            s.reveal = prefs.reveal;
+            s.theme = prefs.theme;
             s.recent_menu = Some(h.recent);
             s.doc_items = h.doc_items;
             s.text_items = h.text_items;
@@ -1329,7 +1475,7 @@ pub fn run() {
                         let state = app.state::<AppState>();
                         state.0.lock().unwrap().recent.clear();
                     }
-                    save_recent(app);
+                    save_prefs(app);
                     refresh_recent_menu(app);
                 }
                 "recent_none" => {}
@@ -1434,5 +1580,38 @@ mod containing_folder_tests {
     #[test]
     fn bare_filename_has_no_folder() {
         assert_eq!(containing_folder(Path::new("notes.md")), None);
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::is_openable_link;
+
+    #[test]
+    fn only_web_and_mail_links_open() {
+        for ok in [
+            "http://x.y",
+            "https://x.y/a?b=1#c",
+            "HTTPS://x.y",
+            "mailto:a@b.c",
+        ] {
+            assert!(is_openable_link(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "relative/path.md",
+            "#anchor",
+            "https:",
+            "https://",
+            "https:///path",
+            "mailto:",
+            "ftp://x.y",
+            "https://x.y/a b",
+            "zennotes://open",
+        ] {
+            assert!(!is_openable_link(bad), "{bad}");
+        }
     }
 }

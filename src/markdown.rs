@@ -1,3 +1,6 @@
+use std::collections::VecDeque;
+use std::iter::Peekable;
+
 use pulldown_cmark::{html, CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd};
 
 /// Render GitHub-flavored markdown to HTML.
@@ -12,9 +15,11 @@ pub fn to_html(md: &str) -> String {
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
     opts.insert(Options::ENABLE_GFM);
+    opts.insert(Options::ENABLE_MATH);
     let parser = Parser::new_ext(md, opts);
     let mut out = String::new();
-    html::push_html(&mut out, MermaidFences::new(parser));
+    let events = TableWidths::new(MermaidFences::new(parser)).map(render_math);
+    html::push_html(&mut out, events);
     out
 }
 
@@ -74,6 +79,92 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for MermaidFences<'a, I> {
     }
 }
 
+/// Swap a math event for the rendered formula.
+fn render_math(ev: Event<'_>) -> Event<'_> {
+    let (src, display) = match &ev {
+        Event::InlineMath(src) => (src, false),
+        Event::DisplayMath(src) => (src, true),
+        _ => return ev,
+    };
+    let html = crate::math::render(src, display);
+    Event::InlineHtml(CowStr::Boxed(html.into_boxed_str()))
+}
+
+/// Turns the `<!-- zen:cols=… -->` comment after a table into a `<colgroup>`
+/// inside it. The comment only arrives after the table's last row, so each
+/// table is held back until what follows it is known.
+struct TableWidths<'a, I: Iterator<Item = Event<'a>>> {
+    inner: Peekable<I>,
+    pending: VecDeque<Event<'a>>,
+}
+
+impl<'a, I: Iterator<Item = Event<'a>>> TableWidths<'a, I> {
+    fn new(inner: I) -> Self {
+        Self {
+            inner: inner.peekable(),
+            pending: VecDeque::new(),
+        }
+    }
+
+    /// Queue a whole table, given its opening event, with any widths applied.
+    fn hold_table(&mut self, start: Event<'a>) {
+        let mut table = vec![start];
+        for ev in self.inner.by_ref() {
+            let done = matches!(ev, Event::End(TagEnd::Table));
+            table.push(ev);
+            if done {
+                break;
+            }
+        }
+        // Only an HTML block can be the comment, and it arrives as start, text,
+        // end. Anything else stays unread, so a second table right after this
+        // one still comes through `next` and gets its own widths.
+        let mut after = Vec::new();
+        let mut widths = None;
+        if matches!(self.inner.peek(), Some(Event::Start(Tag::HtmlBlock))) {
+            let mut text = String::new();
+            for ev in self.inner.by_ref() {
+                let done = matches!(ev, Event::End(TagEnd::HtmlBlock));
+                if let Event::Html(t) = &ev {
+                    text.push_str(t);
+                }
+                after.push(ev);
+                if done {
+                    break;
+                }
+            }
+            widths = crate::table::parse_cols_comment(&text);
+        }
+        match widths {
+            Some(w) => {
+                let col = crate::table::colgroup_html(&w);
+                table.insert(1, Event::Html(CowStr::Boxed(col.into_boxed_str())));
+                self.pending.extend(table);
+            }
+            None => {
+                self.pending.extend(table);
+                self.pending.extend(after);
+            }
+        }
+    }
+}
+
+impl<'a, I: Iterator<Item = Event<'a>>> Iterator for TableWidths<'a, I> {
+    type Item = Event<'a>;
+
+    fn next(&mut self) -> Option<Event<'a>> {
+        if let Some(ev) = self.pending.pop_front() {
+            return Some(ev);
+        }
+        let ev = self.inner.next()?;
+        if matches!(ev, Event::Start(Tag::Table(_))) {
+            self.hold_table(ev);
+            return self.pending.pop_front();
+        }
+        Some(ev)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +212,82 @@ mod tests {
     fn indented_code_blocks_are_not_mermaid() {
         let html = to_html("    mermaid\n    graph TD\n");
         assert!(!html.contains("mermaid-diagram"));
+    }
+
+    #[test]
+    fn renders_math() {
+        let html = to_html("Energy $E = mc^2$ here\n\n$$\\frac{a}{b}$$\n");
+        assert!(html.contains("data-math=\"E = mc^2\""));
+        assert!(html.contains("<math"));
+        assert!(html.contains("math-display"));
+        assert!(html.contains("<mfrac"));
+    }
+
+    #[test]
+    fn math_in_a_table_cell_renders_and_keeps_its_pipe() {
+        let html = to_html("| a |\n|---|\n| $\\|x\\|$ |\n");
+        assert!(html.contains("data-math=\"|x|\""), "{html}");
+    }
+
+    #[test]
+    fn prices_are_not_math() {
+        for md in [
+            "It costs $5 and $6 today",
+            "$5",
+            "from $5 to $10.",
+            "a $ b $ c",
+        ] {
+            let html = to_html(md);
+            assert!(!html.contains("data-math"), "{md} became {html}");
+        }
+    }
+
+    #[test]
+    fn an_escaped_dollar_is_not_math() {
+        assert!(!to_html(r"\$a\$").contains("data-math"));
+    }
+
+    #[test]
+    fn a_width_comment_becomes_a_colgroup() {
+        let html = to_html("| a | b |\n|---|---|\n| 1 | 2 |\n<!-- zen:cols=120,auto -->\n\nafter");
+        assert!(html.contains("<table><colgroup><col style=\"width: 120px\"><col></colgroup>"));
+        assert!(!html.contains("zen:cols"));
+        assert!(html.contains("<td>2</td>"));
+        assert!(html.contains("<p>after</p>"));
+    }
+
+    #[test]
+    fn a_width_comment_after_a_blank_line_still_counts() {
+        let html = to_html("| a |\n|---|\n| 1 |\n\n<!-- zen:cols=90 -->\n");
+        assert!(html.contains("width: 90px"));
+    }
+
+    #[test]
+    fn an_unrelated_comment_after_a_table_stays() {
+        let html = to_html("| a |\n|---|\n| 1 |\n\n<!-- hello -->\n\nafter");
+        assert!(!html.contains("<colgroup>"));
+        assert!(html.contains("<!-- hello -->"));
+        assert!(html.contains("<p>after</p>"));
+    }
+
+    #[test]
+    fn whatever_follows_a_table_survives() {
+        let html = to_html("| a |\n|---|\n| 1 |\n\nafter\n\n| b |\n|---|\n| 2 |\n");
+        assert!(html.contains("<p>after</p>"));
+        assert_eq!(html.matches("<table>").count(), 2);
+        assert!(html.contains("<td>2</td>"));
+    }
+
+    #[test]
+    fn adjacent_tables_each_keep_their_own_widths() {
+        let html = to_html("| a |\n|---|\n| 1 |\n\n| b |\n|---|\n| 2 |\n<!-- zen:cols=90 -->\n");
+        assert_eq!(html.matches("<table>").count(), 2);
+        assert_eq!(html.matches("<colgroup>").count(), 1);
+        assert!(html.find("<td>1</td>").unwrap() < html.find("<colgroup>").unwrap());
+    }
+
+    #[test]
+    fn a_table_at_the_end_of_the_file_survives() {
+        assert!(to_html("| a |\n|---|\n| 1 |").ends_with("</table>\n"));
     }
 }

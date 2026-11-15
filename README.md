@@ -8,6 +8,35 @@ from the [Pele](https://pele.run) diagram renderer, vendored in `vendor/pele/`.
 
 ## Features
 
+- **Tables you can work with directly** — hover a table for `+` rails on its
+  right and bottom edges. Hover a header for its column's reorder grip and
+  resize line, or a body row for its row grip; a column border can be dragged
+  from the header row. `Tab` / `Shift+Tab` move between cells and `Tab` past the
+  last one adds a row; `Enter` goes down a column, `Up` / `Down` change row,
+  `Left` / `Right` stop at the cell's edges, `Shift+Enter` breaks a line in a
+  cell, and `Esc` leaves the table. A left press on a web or mail link in a cell
+  opens it. Right-click a cell to insert, move, duplicate, align, sort or delete,
+  or to copy the table as Markdown; the arrow keys and `Enter` work in that menu,
+  and typing filters it. Source columns are padded to line up, and column widths
+  are saved in a `<!-- zen:cols=… -->` comment after the table, the format
+  [ZenNotes-rs](https://github.com/alf5/ZenNotes-rs) uses, so they carry between
+  the two apps.
+- **Themes** — **View → Theme** offers the 34 colour themes from
+  [ZenNotes-rs](https://github.com/alf5/ZenNotes-rs) (Apple, Gruvbox,
+  Catppuccin, GitHub, Solarized, One, Nord, Tokyo Night, Kanagawa, Black Metal
+  and Rosé Pine), or **Match System** for the default GitHub palette that
+  follows the system's light or dark setting. The choice is remembered, applies
+  to the whole window, and goes with HTML exports; printing and PDF stay on
+  white. `themes.css` is generated from ZenNotes-rs, so it shouldn't be edited
+  by hand.
+- **Math** — `$…$` and `$$…$$` render as MathML, which the webview draws with
+  no JavaScript. Click a formula to edit its source. A lone `$5` stays a price.
+- **Show Markdown at Cursor** — **View → Show Markdown at Cursor** keeps the
+  document rendered except for the block holding the caret, which shows its
+  Markdown until the caret leaves. A list item shows its own text and keeps its
+  bullet and nested lists. Arrow keys also walk into diagrams and display math.
+  Tables stay rendered. The setting is remembered between runs; off is plain
+  WYSIWYG.
 - **Multiple documents in tabs** — a single row of tabs with a `»` menu on the
   right when they no longer fit. New and Open always add a tab, so nothing is
   ever discarded; opening a file that's already open just focuses its tab.
@@ -67,9 +96,9 @@ from the [Pele](https://pele.run) diagram renderer, vendored in `vendor/pele/`.
   each ticked when on — split right / move to the other side, join sides,
   next/previous document), Insert (link, image, table,
   mermaid diagram, hr, table rows/columns), Format, Help.
-- **Table editing**: insert row above/below and column left/right, delete
-  row/column/table — from the toolbar (shown while the caret is in a table),
-  the Insert menu, or a right-click context menu on any table cell.
+- **Table editing**: insert a row or column at the end and move it into place,
+  delete a row, column or table — from the Insert menu or a right-click context
+  menu on any table cell.
 - **Find & replace** (`Ctrl+F` / `Ctrl+H`) with match count, case toggle,
   replace one / all.
 - **Undo/redo** with its own snapshot history (covers table edits, checkbox
@@ -202,6 +231,17 @@ Build a stripped release binary and installers:
 
 ```sh
 cargo tauri build
+```
+
+Run the tests. The second set renders and serializes in a real DOM, so it needs
+`wasm-bindgen-cli` at the same version as the `wasm-bindgen` crate, plus
+chromedriver and Chromium (browser arguments are in `webdriver.json`):
+
+```sh
+cargo test --workspace
+
+CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+  cargo test --target wasm32-unknown-unknown --bin mdedit-ui
 ```
 
 ## CI

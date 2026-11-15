@@ -746,6 +746,201 @@ body {
   resize: vertical;
 }
 
+/* A formula is edited by clicking it, like a diagram. */
+.editor.wysiwyg .math {
+  cursor: pointer;
+  user-select: none;
+  border-radius: 3px;
+}
+
+.editor.wysiwyg .math:hover {
+  background: var(--bg-soft);
+}
+
+.editor .mermaid-source.math-display {
+  margin: 12px 0;
+  padding: 8px 12px;
+}
+
+.editor .mermaid-source.math-inline {
+  display: inline-block;
+  width: auto;
+  margin: 0 2px;
+  padding: 0 4px;
+  vertical-align: baseline;
+  resize: none;
+  white-space: nowrap;
+  overflow: hidden;
+  border-radius: 3px;
+}
+
+/* A block showing its markdown source while the caret is in it. */
+.editor .md-raw {
+  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.92em;
+  margin: 0 0 16px;
+  overflow-wrap: anywhere;
+}
+
+/* A list item keeps its bullet and nested lists. Only its own text opens. */
+.editor li > .md-raw {
+  display: inline;
+  margin: 0;
+}
+
+/* ---------- table editing ---------- */
+
+/* The hover controls. One fixed layer over the editor, and never inside it,
+   so none of this reaches the document. See `src/table_ui.rs`. The look and the
+   rules for what shows when follow ZenNotes (MIT). */
+.table-chrome,
+.table-focus {
+  position: fixed;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.table-chrome.hidden,
+.table-focus.hidden {
+  display: none;
+}
+
+/* The cell holding the caret. */
+.tc-focus {
+  position: absolute;
+  box-sizing: border-box;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.tc {
+  position: absolute;
+  box-sizing: border-box;
+  pointer-events: auto;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Reorder grips: above a header, left of a body row. Only the one under the
+   pointer shows, and none do while something is being dragged. */
+.tc-row,
+.tc-col {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-muted);
+  font-size: 9px;
+  line-height: 1;
+  cursor: grab;
+  opacity: 0;
+}
+
+.tc-row::before,
+.tc-col::before {
+  content: "⠿";
+}
+
+.tc-col::before {
+  transform: rotate(90deg);
+}
+
+.tc-row.on,
+.tc-col.on,
+.tc-row:hover,
+.tc-col:hover {
+  opacity: 1;
+}
+
+.tc-row:active,
+.tc-col:active {
+  background: color-mix(in srgb, var(--accent) 85%, transparent);
+  border-color: transparent;
+  color: var(--accent-text);
+  cursor: grabbing;
+}
+
+.tc-dragging .tc-row,
+.tc-dragging .tc-col {
+  opacity: 0;
+}
+
+/* Resize: straddles a header's right border and is always there to grab. The
+   line inside it lights up for the hovered header, and all of them light up
+   during a resize. */
+.tc-size {
+  cursor: col-resize;
+}
+
+.tc-size::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 2.5px;
+  width: 2px;
+  height: 100%;
+  background: transparent;
+  transition: background 0.12s ease;
+}
+
+.tc-size.on::after,
+.tc-size:hover::after,
+.tc-resizing .tc-size::after {
+  background: color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+/* Add rails, flush against the table: they show whenever it's hovered. */
+.tc-add-row,
+.tc-add-col {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--bg) 90%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1;
+  overflow: hidden;
+  cursor: pointer;
+  transition: background 0.1s ease, color 0.1s ease;
+}
+
+.tc-add-row:hover,
+.tc-add-col:hover {
+  background: color-mix(in srgb, var(--accent) 85%, transparent);
+  border-color: transparent;
+  color: var(--accent-text);
+}
+
+.tc-drop {
+  position: absolute;
+  background: var(--accent);
+  border-radius: 2px;
+}
+
+/* A drag can wander over the text, which shouldn't get selected or show its
+   own cursor while it's happening. */
+body.table-dragging,
+body.table-resizing {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+body.table-dragging,
+body.table-dragging * {
+  cursor: grabbing !important;
+}
+
+body.table-resizing,
+body.table-resizing * {
+  cursor: col-resize !important;
+}
+
 /* ---------- side by side ---------- */
 
 /* Laid out like `.editor-wrap`, the live side. */
@@ -907,12 +1102,6 @@ body {
 }
 
 /* ---------- table context menu ---------- */
-
-.tb-group {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-}
 
 .ctx-backdrop {
   position: fixed;
@@ -1136,4 +1325,41 @@ body {
 
 ::-webkit-scrollbar-track {
   background: transparent;
+}
+
+/* The table menu has more items than a short window has room for. */
+.ctxmenu {
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+}
+
+.ctxmenu.table-menu {
+  outline: none;
+}
+
+.ctx-item.ctx-hl {
+  background: var(--accent);
+  color: var(--accent-text);
+}
+
+.ctx-tick {
+  min-width: 1em;
+  text-align: right;
+}
+
+.ctx-filter {
+  margin: 0 2px 4px;
+  padding: 4px 8px;
+  border-radius: 5px;
+  background: var(--bg-soft);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+.ctx-empty {
+  padding: 6px 12px;
+  color: var(--text-muted);
+  font-size: 12px;
+  text-align: center;
 }

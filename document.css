@@ -22,25 +22,26 @@
   --shadow: 0 8px 24px rgba(31, 35, 40, 0.15);
   color-scheme: light dark;
 
-  /* Mermaid diagrams are drawn by Pele, whose SVG reads its colors and faces
-     from these — so a diagram re-colors on a scheme change, and for print,
-     without being re-rendered. Most follow the palette above and change with
+  /* Mermaid diagrams in an exported page are drawn by bezel-mermaid (a Rust
+     port of Pele), whose SVG reads its colors and faces from these — so a
+     diagram re-colors on a scheme change, and for print, without being
+     re-rendered. Most follow the palette above and change with
      it; the two the palette has no word for, a second surface and a firmer
      edge for shapes, are set per scheme. The faces must stay the ones
-     src/mermaid.rs measures labels in, or text spills out of its boxes. */
-  --pele-bg: var(--bg);
-  --pele-fg: var(--text);
-  --pele-muted: var(--text-muted);
-  --pele-line: var(--text);
-  --pele-surface: var(--bg-soft);
-  --pele-surface-alt: #eaeef2;
-  --pele-border: #8c959f;
-  --pele-accent: var(--accent);
-  --pele-critical: var(--danger);
-  --pele-error: var(--danger);
-  --pele-font: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans",
+     crates/mdedit-core/src/mermaid.rs measures labels in, or text spills
+     out of its boxes. */
+  --bezel-bg: var(--bg);
+  --bezel-fg: var(--text);
+  --bezel-muted: var(--text-muted);
+  --bezel-line: var(--text);
+  --bezel-surface: var(--bg-soft);
+  --bezel-surface-alt: #eaeef2;
+  --bezel-border: #8c959f;
+  --bezel-accent: var(--accent);
+  --bezel-critical: var(--danger);
+  --bezel-font: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans",
     Helvetica, Arial, sans-serif;
-  --pele-font-mono: var(--md-mono);
+  --bezel-font-mono: var(--md-mono);
 
   /* Faces shared by the extra markdown styles. Not downloaded fonts —
      whatever good serif / mono this machine already has. */
@@ -65,8 +66,8 @@
     --danger: #f85149;
     --shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
 
-    --pele-surface-alt: #212830;
-    --pele-border: #656c76;
+    --bezel-surface-alt: #212830;
+    --bezel-border: #656c76;
   }
 }
 
@@ -180,8 +181,8 @@
   overflow-x: auto;
 }
 
-/* No font-family here: Pele sets `--pele-font` on the SVG itself, and the
-   labels have to be drawn in the face they were measured in. */
+/* No font-family here: the renderer sets `--bezel-font` on the SVG itself,
+   and the labels have to be drawn in the face they were measured in. */
 .markdown-body .mermaid-diagram svg {
   max-width: 100%;
   height: auto;
@@ -947,8 +948,8 @@
     --danger: #d1242f;
     --shadow: none;
 
-    --pele-surface-alt: #eaeef2;
-    --pele-border: #8c959f;
+    --bezel-surface-alt: #eaeef2;
+    --bezel-border: #8c959f;
 
     --alert-note: #0969da;
     --alert-tip: #1a7f37;

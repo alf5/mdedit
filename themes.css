@@ -5,7 +5,8 @@
  * document.css defines, the way ZenNotes' own prose styles use it. Don't
  * edit by hand; regenerate instead.
  *
- * A theme is chosen in View -> Theme and lands on <html data-theme>. With no
+ * The app reads these palettes directly (crates/mdedit-core/src/themes.rs),
+ * and an HTML export carries the chosen one on <html data-theme>. With no
  * theme set, document.css's own GitHub palette follows the system's light
  * or dark setting. These selectors outrank that, and the print rules in
  * document.css outrank these.
@@ -31,8 +32,8 @@
   --alert-important: #af52de;
   --alert-warning: #ff9500;
   --alert-caution: #ff3b30;
-  --pele-surface-alt: #e5e5ea;
-  --pele-border: #aeaeb2;
+  --bezel-surface-alt: #e5e5ea;
+  --bezel-border: #aeaeb2;
 }
 
 /* Apple · Dark */
@@ -55,8 +56,8 @@
   --alert-important: #bf5af2;
   --alert-warning: #ffd60a;
   --alert-caution: #ff453a;
-  --pele-surface-alt: #3a3a3c;
-  --pele-border: #636366;
+  --bezel-surface-alt: #3a3a3c;
+  --bezel-border: #636366;
 }
 
 /* Gruvbox · Light · Hard */
@@ -79,8 +80,8 @@
   --alert-important: #945e80;
   --alert-warning: #b47109;
   --alert-caution: #c14a4a;
-  --pele-surface-alt: #e5d5ad;
-  --pele-border: #928374;
+  --bezel-surface-alt: #e5d5ad;
+  --bezel-border: #928374;
 }
 
 /* Gruvbox · Light · Medium */
@@ -103,8 +104,8 @@
   --alert-important: #945e80;
   --alert-warning: #b47109;
   --alert-caution: #c14a4a;
-  --pele-surface-alt: #e5d5ad;
-  --pele-border: #928374;
+  --bezel-surface-alt: #e5d5ad;
+  --bezel-border: #928374;
 }
 
 /* Gruvbox · Light · Soft */
@@ -127,8 +128,8 @@
   --alert-important: #945e80;
   --alert-warning: #b47109;
   --alert-caution: #c14a4a;
-  --pele-surface-alt: #e5d5ad;
-  --pele-border: #928374;
+  --bezel-surface-alt: #e5d5ad;
+  --bezel-border: #928374;
 }
 
 /* Gruvbox · Dark · Hard */
@@ -151,8 +152,8 @@
   --alert-important: #d3869b;
   --alert-warning: #d8a657;
   --alert-caution: #ea6962;
-  --pele-surface-alt: #3c3836;
-  --pele-border: #7c6f64;
+  --bezel-surface-alt: #3c3836;
+  --bezel-border: #7c6f64;
 }
 
 /* Gruvbox · Dark · Medium */
@@ -175,8 +176,8 @@
   --alert-important: #d3869b;
   --alert-warning: #d8a657;
   --alert-caution: #ea6962;
-  --pele-surface-alt: #3c3836;
-  --pele-border: #7c6f64;
+  --bezel-surface-alt: #3c3836;
+  --bezel-border: #7c6f64;
 }
 
 /* Gruvbox · Dark · Soft */
@@ -199,8 +200,8 @@
   --alert-important: #d3869b;
   --alert-warning: #d8a657;
   --alert-caution: #ea6962;
-  --pele-surface-alt: #3c3836;
-  --pele-border: #7c6f64;
+  --bezel-surface-alt: #3c3836;
+  --bezel-border: #7c6f64;
 }
 
 /* Catppuccin · Latte */
@@ -223,8 +224,8 @@
   --alert-important: #8839ef;
   --alert-warning: #df8e1d;
   --alert-caution: #d20f39;
-  --pele-surface-alt: #ccd0da;
-  --pele-border: #9ca0b0;
+  --bezel-surface-alt: #ccd0da;
+  --bezel-border: #9ca0b0;
 }
 
 /* Catppuccin · Frappé */
@@ -247,8 +248,8 @@
   --alert-important: #ca9ee6;
   --alert-warning: #e5c890;
   --alert-caution: #e78284;
-  --pele-surface-alt: #414559;
-  --pele-border: #737994;
+  --bezel-surface-alt: #414559;
+  --bezel-border: #737994;
 }
 
 /* Catppuccin · Macchiato */
@@ -271,8 +272,8 @@
   --alert-important: #c6a0f6;
   --alert-warning: #eed49f;
   --alert-caution: #ed8796;
-  --pele-surface-alt: #363a4f;
-  --pele-border: #6e738d;
+  --bezel-surface-alt: #363a4f;
+  --bezel-border: #6e738d;
 }
 
 /* Catppuccin · Mocha */
@@ -295,8 +296,8 @@
   --alert-important: #cba6f7;
   --alert-warning: #f9e2af;
   --alert-caution: #f38ba8;
-  --pele-surface-alt: #313244;
-  --pele-border: #6c7086;
+  --bezel-surface-alt: #313244;
+  --bezel-border: #6c7086;
 }
 
 /* GitHub · Light */
@@ -319,8 +320,8 @@
   --alert-important: #8250df;
   --alert-warning: #9a6700;
   --alert-caution: #d1242f;
-  --pele-surface-alt: #eaeef2;
-  --pele-border: #8d959e;
+  --bezel-surface-alt: #eaeef2;
+  --bezel-border: #8d959e;
 }
 
 /* GitHub · Light · High Contrast */
@@ -343,8 +344,8 @@
   --alert-important: #502d97;
   --alert-warning: #704b00;
   --alert-caution: #a60017;
-  --pele-surface-alt: #bec4d2;
-  --pele-border: #58606e;
+  --bezel-surface-alt: #bec4d2;
+  --bezel-border: #58606e;
 }
 
 /* GitHub · Dark */
@@ -367,8 +368,8 @@
   --alert-important: #a371f7;
   --alert-warning: #d29922;
   --alert-caution: #f85149;
-  --pele-surface-alt: #21262d;
-  --pele-border: #484f58;
+  --bezel-surface-alt: #21262d;
+  --bezel-border: #484f58;
 }
 
 /* GitHub · Dark · Dimmed */
@@ -391,8 +392,8 @@
   --alert-important: #b57edc;
   --alert-warning: #c69026;
   --alert-caution: #e5534b;
-  --pele-surface-alt: #373e47;
-  --pele-border: #535d68;
+  --bezel-surface-alt: #373e47;
+  --bezel-border: #535d68;
 }
 
 /* GitHub · Dark · High Contrast */
@@ -415,8 +416,8 @@
   --alert-important: #b887ff;
   --alert-warning: #f6a12f;
   --alert-caution: #ff6a69;
-  --pele-surface-alt: #1c212b;
-  --pele-border: #9ba3b2;
+  --bezel-surface-alt: #1c212b;
+  --bezel-border: #9ba3b2;
 }
 
 /* Solarized · Light */
@@ -439,8 +440,8 @@
   --alert-important: #6c71c4;
   --alert-warning: #b58900;
   --alert-caution: #dc322f;
-  --pele-surface-alt: #dfd7b6;
-  --pele-border: #839496;
+  --bezel-surface-alt: #dfd7b6;
+  --bezel-border: #839496;
 }
 
 /* Solarized · Dark */
@@ -463,8 +464,8 @@
   --alert-important: #6c71c4;
   --alert-warning: #b58900;
   --alert-caution: #dc322f;
-  --pele-surface-alt: #0e4954;
-  --pele-border: #657b83;
+  --bezel-surface-alt: #0e4954;
+  --bezel-border: #657b83;
 }
 
 /* One · Light */
@@ -487,8 +488,8 @@
   --alert-important: #a626a4;
   --alert-warning: #c18401;
   --alert-caution: #e45649;
-  --pele-surface-alt: #d3d3d5;
-  --pele-border: #b3b3b6;
+  --bezel-surface-alt: #d3d3d5;
+  --bezel-border: #b3b3b6;
 }
 
 /* One · Dark */
@@ -511,8 +512,8 @@
   --alert-important: #c678dd;
   --alert-warning: #e5c07b;
   --alert-caution: #e06c75;
-  --pele-surface-alt: #3e4451;
-  --pele-border: #5c6370;
+  --bezel-surface-alt: #3e4451;
+  --bezel-border: #5c6370;
 }
 
 /* Nord · Light */
@@ -535,8 +536,8 @@
   --alert-important: #b48ead;
   --alert-warning: #b99000;
   --alert-caution: #bf616a;
-  --pele-surface-alt: #c9d0dd;
-  --pele-border: #7b8595;
+  --bezel-surface-alt: #c9d0dd;
+  --bezel-border: #7b8595;
 }
 
 /* Nord · Dark */
@@ -559,8 +560,8 @@
   --alert-important: #b48ead;
   --alert-warning: #ebcb8b;
   --alert-caution: #bf616a;
-  --pele-surface-alt: #434c5e;
-  --pele-border: #4c566a;
+  --bezel-surface-alt: #434c5e;
+  --bezel-border: #4c566a;
 }
 
 /* Tokyo Night · Day */
@@ -583,8 +584,8 @@
   --alert-important: #7847bd;
   --alert-warning: #8c6c3e;
   --alert-caution: #f52a65;
-  --pele-surface-alt: #a8aecb;
-  --pele-border: #8990b3;
+  --bezel-surface-alt: #a8aecb;
+  --bezel-border: #8990b3;
 }
 
 /* Tokyo Night · Storm */
@@ -607,8 +608,8 @@
   --alert-important: #bb9af7;
   --alert-warning: #e0af68;
   --alert-caution: #f7768e;
-  --pele-surface-alt: #3b4261;
-  --pele-border: #545c7e;
+  --bezel-surface-alt: #3b4261;
+  --bezel-border: #545c7e;
 }
 
 /* Kanagawa · Wave */
@@ -631,8 +632,8 @@
   --alert-important: #957fb8;
   --alert-warning: #e6c384;
   --alert-caution: #e46876;
-  --pele-surface-alt: #2a2a37;
-  --pele-border: #54546d;
+  --bezel-surface-alt: #2a2a37;
+  --bezel-border: #54546d;
 }
 
 /* Kanagawa · Dragon */
@@ -655,8 +656,8 @@
   --alert-important: #a292a3;
   --alert-warning: #c4b28a;
   --alert-caution: #c4746e;
-  --pele-surface-alt: #282727;
-  --pele-border: #625e5a;
+  --bezel-surface-alt: #282727;
+  --bezel-border: #625e5a;
 }
 
 /* Kanagawa · Paper Ink (Custom) */
@@ -679,8 +680,8 @@
   --alert-important: #a292a3;
   --alert-warning: #c4b28a;
   --alert-caution: #c4746e;
-  --pele-surface-alt: #363646;
-  --pele-border: #737c73;
+  --bezel-surface-alt: #363646;
+  --bezel-border: #737c73;
 }
 
 /* Kanagawa · Lotus */
@@ -703,8 +704,8 @@
   --alert-important: #624c83;
   --alert-warning: #de9a00;
   --alert-caution: #c84053;
-  --pele-surface-alt: #d5cea3;
-  --pele-border: #a09cac;
+  --bezel-surface-alt: #d5cea3;
+  --bezel-border: #a09cac;
 }
 
 /* Black Metal · Black */
@@ -727,8 +728,8 @@
   --alert-important: #9b91a5;
   --alert-warning: #c6b282;
   --alert-caution: #c57a7a;
-  --pele-surface-alt: #1e1e1e;
-  --pele-border: #505050;
+  --bezel-surface-alt: #1e1e1e;
+  --bezel-border: #505050;
 }
 
 /* Black Metal · Day */
@@ -751,8 +752,8 @@
   --alert-important: #78668e;
   --alert-warning: #967838;
   --alert-caution: #a84e4e;
-  --pele-surface-alt: #e2e2e0;
-  --pele-border: #a8a8a6;
+  --bezel-surface-alt: #e2e2e0;
+  --bezel-border: #a8a8a6;
 }
 
 /* Rosé Pine · Rosé Pine */
@@ -775,8 +776,8 @@
   --alert-important: #c4a7e7;
   --alert-warning: #f6c177;
   --alert-caution: #eb6f92;
-  --pele-surface-alt: #26233a;
-  --pele-border: #524f67;
+  --bezel-surface-alt: #26233a;
+  --bezel-border: #524f67;
 }
 
 /* Rosé Pine · Moon */
@@ -799,8 +800,8 @@
   --alert-important: #c4a7e7;
   --alert-warning: #f6c177;
   --alert-caution: #eb6f92;
-  --pele-surface-alt: #393552;
-  --pele-border: #56526e;
+  --bezel-surface-alt: #393552;
+  --bezel-border: #56526e;
 }
 
 /* Rosé Pine · Dawn */
@@ -823,6 +824,6 @@
   --alert-important: #907aa9;
   --alert-warning: #ea9d34;
   --alert-caution: #b4637a;
-  --pele-surface-alt: #dfdad9;
-  --pele-border: #b6b1bf;
+  --bezel-surface-alt: #dfdad9;
+  --bezel-border: #b6b1bf;
 }

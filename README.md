@@ -1,8 +1,11 @@
 # mdedit
 
-A WYSIWYG Markdown editor built with **Tauri 2** (Rust backend) and **Leptos**
-(Rust/WASM frontend). No JavaScript frameworks — the whole app is Rust, apart
-from the [Pele](https://pele.run) diagram renderer, vendored in `vendor/pele/`.
+A WYSIWYG Markdown editor.
+
+> **Branch `v2-gpui`: mdedit 2 is being rewritten here** as a native app on
+> [gpui-kit](https://gpui-kit.com) (GPUI), with no webview and no JavaScript.
+> It is not usable yet. The feature list below describes v1 (on `main`) and
+> is v2's parity checklist; engineering notes are in `docs/v2-notes.md`.
 
 ![build](https://github.com/alf5/mdedit/actions/workflows/build.yml/badge.svg)
 
@@ -213,36 +216,19 @@ from the [Pele](https://pele.run) diagram renderer, vendored in `vendor/pele/`.
 
 ## Development
 
-Prerequisites: Rust (stable), the `wasm32-unknown-unknown` target,
-[trunk](https://trunkrs.dev) and [tauri-cli](https://tauri.app):
+Prerequisites: Rust 1.99 or later. On Linux, GPUI also needs Vulkan, Wayland
+or X11, xkbcommon and fontconfig development packages.
 
 ```sh
-rustup target add wasm32-unknown-unknown
-cargo install trunk tauri-cli
+cargo run -p mdedit          # the app
+cargo test --workspace       # everything; mdedit-core needs no display
 ```
 
-Run in development mode:
+The workspace:
 
-```sh
-cargo tauri dev
-```
-
-Build a stripped release binary and installers:
-
-```sh
-cargo tauri build
-```
-
-Run the tests. The second set renders and serializes in a real DOM, so it needs
-`wasm-bindgen-cli` at the same version as the `wasm-bindgen` crate, plus
-chromedriver and Chromium (browser arguments are in `webdriver.json`):
-
-```sh
-cargo test --workspace
-
-CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
-  cargo test --target wasm32-unknown-unknown --bin mdedit-ui
-```
+- `crates/mdedit-core`: the document model and logic. It has no UI and is
+  fully unit-tested.
+- `crates/mdedit`: the GPUI app.
 
 ## CI
 

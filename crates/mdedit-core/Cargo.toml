@@ -1,0 +1,29 @@
+[package]
+name = "mdedit-core"
+description = "mdedit's document model and logic: everything that needs no UI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
+math-core = "0.9"
+unicode-width = "0.2"
+# A pure-Rust port of Pele; its lib is called `mermaid`, renamed here so it
+# doesn't collide with our own `mermaid` module.
+pele = { package = "bezel-mermaid", version = "0.2.26" }
+latex-rust = "3.0.3"
+usvg = "0.46"
+diffy = { version = "0.5", features = ["std"] }
+notify = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+roxmltree = "0.20"
+dirs = "6"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+

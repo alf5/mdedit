@@ -1,5 +1,0 @@
-{
-  "goog:chromeOptions": {
-    "args": ["--headless=new", "--no-sandbox", "--password-store=basic"]
-  }
-}

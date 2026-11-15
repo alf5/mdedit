@@ -1,0 +1,16 @@
+[package]
+name = "mdedit"
+description = "A WYSIWYG Markdown editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "mdedit"
+path = "src/main.rs"
+
+[dependencies]
+mdedit-core.workspace = true
+gpui-kit.workspace = true

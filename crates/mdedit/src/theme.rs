@@ -124,7 +124,11 @@ pub fn config(name: &str, p: &Palette) -> ThemeConfig {
 
     // The kit's syntax colours for this mode, on the document's background
     // so code reads as part of the page.
-    let base = if p.dark { HighlightTheme::default_dark() } else { HighlightTheme::default_light() };
+    let base = if p.dark {
+        HighlightTheme::default_dark()
+    } else {
+        HighlightTheme::default_light()
+    };
     let mut hl = base.style.clone();
     hl.editor_background = Some(hsla(p.bg));
     hl.editor_foreground = Some(hsla(p.text));

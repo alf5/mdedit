@@ -4,16 +4,21 @@
 //! The app crate (`crates/mdedit`) draws these with GPUI; nothing here knows
 //! GPUI exists.
 
+pub mod buffer;
 pub mod detach;
 pub mod docx;
+pub mod edit;
 pub mod export;
+pub mod find;
 pub mod hex;
+pub mod history;
 pub mod markdown;
 pub mod math;
 pub mod mermaid;
 pub mod os;
 pub mod prefs;
 pub mod project;
+pub mod syntax;
 pub mod table;
 pub mod themes;
 pub mod watch;

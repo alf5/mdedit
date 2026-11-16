@@ -326,15 +326,25 @@ pub struct Row {
 pub fn rows(text: &str, syntax: &Syntax, rich: bool, open: Option<usize>) -> Vec<Row> {
     let lines = &syntax.lines;
     let mut out: Vec<Row> = Vec::with_capacity(lines.len());
+    // Widgets by first line, walked alongside the lines: looking each line
+    // up among all the widgets made a long document quadratic.
+    let mut by_start: Vec<usize> = (0..syntax.widgets.len()).collect();
+    by_start.sort_by_key(|&w| syntax.widgets[w].lines.start);
+    let mut next = by_start.iter().peekable();
     let mut i = 0;
     while i < lines.len() {
-        if rich
-            && let Some((w_ix, w)) = syntax
-                .widgets
-                .iter()
-                .enumerate()
-                .find(|(_, w)| w.lines.start == i)
+        while next
+            .peek()
+            .is_some_and(|&&w| syntax.widgets[w].lines.start < i)
         {
+            next.next();
+        }
+        if rich
+            && let Some(&&w_ix) = next.peek()
+            && syntax.widgets[w_ix].lines.start == i
+        {
+            let w = &syntax.widgets[w_ix];
+            next.next();
             let end = w.lines.end.min(lines.len());
             let is_open = open.is_some_and(|o| w.lines.contains(&o));
             if !is_open {

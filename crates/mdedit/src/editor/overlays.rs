@@ -2,6 +2,7 @@
 //! the `/` menu for inserting a block.
 
 use gpui_kit::component::ActiveTheme;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mdedit_core::buffer::{Change, Edit, Selection};
@@ -173,9 +174,11 @@ impl MarkdownEditor {
         let focus = self.focus.clone();
         let button = move |id: &'static str,
                            label: &'static str,
+                           tip: &'static str,
                            action: Box<dyn Action>,
                            style: fn(Div) -> Div| {
             let focus = focus.clone();
+            let shortcut = action.boxed_clone();
             style(
                 div()
                     .px(px(8.))
@@ -186,6 +189,11 @@ impl MarkdownEditor {
                     .child(label),
             )
             .id(id)
+            .tooltip(move |window, cx| {
+                Tooltip::new(tip)
+                    .action(&*shortcut, Some("MdEditor"))
+                    .build(window, cx)
+            })
             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                 cx.stop_propagation();
                 window.prevent_default();
@@ -209,30 +217,70 @@ impl MarkdownEditor {
                         .shadow_md()
                         .text_sm()
                         .text_color(fg)
-                        .child(button("tb-bold", "B", Box::new(Bold), |d| {
+                        .child(button("tb-bold", "B", "Bold", Box::new(Bold), |d| {
                             d.font_weight(FontWeight::BOLD)
                         }))
-                        .child(button("tb-italic", "I", Box::new(Italic), |d| d.italic()))
-                        .child(button("tb-strike", "S", Box::new(Strikethrough), |d| {
-                            d.line_through()
+                        .child(button("tb-italic", "I", "Italic", Box::new(Italic), |d| {
+                            d.italic()
                         }))
-                        .child(button("tb-code", "</>", Box::new(InlineCode), |d| {
-                            d.text_xs()
-                        }))
-                        .child(button("tb-link", "Link", Box::new(InsertLink), |d| d))
+                        .child(button(
+                            "tb-strike",
+                            "S",
+                            "Strikethrough",
+                            Box::new(Strikethrough),
+                            |d| d.line_through(),
+                        ))
+                        .child(button(
+                            "tb-code",
+                            "</>",
+                            "Inline Code",
+                            Box::new(InlineCode),
+                            |d| d.text_xs(),
+                        ))
+                        .child(button(
+                            "tb-link",
+                            "Link",
+                            "Link",
+                            Box::new(InsertLink),
+                            |d| d,
+                        ))
                         .child(sep())
-                        .child(button("tb-h1", "H1", Box::new(Heading { level: 1 }), |d| {
-                            d.font_weight(FontWeight::SEMIBOLD)
-                        }))
-                        .child(button("tb-h2", "H2", Box::new(Heading { level: 2 }), |d| {
-                            d.font_weight(FontWeight::SEMIBOLD)
-                        }))
-                        .child(button("tb-h3", "H3", Box::new(Heading { level: 3 }), |d| {
-                            d.font_weight(FontWeight::SEMIBOLD)
-                        }))
+                        .child(button(
+                            "tb-h1",
+                            "H1",
+                            "Heading 1",
+                            Box::new(Heading { level: 1 }),
+                            |d| d.font_weight(FontWeight::SEMIBOLD),
+                        ))
+                        .child(button(
+                            "tb-h2",
+                            "H2",
+                            "Heading 2",
+                            Box::new(Heading { level: 2 }),
+                            |d| d.font_weight(FontWeight::SEMIBOLD),
+                        ))
+                        .child(button(
+                            "tb-h3",
+                            "H3",
+                            "Heading 3",
+                            Box::new(Heading { level: 3 }),
+                            |d| d.font_weight(FontWeight::SEMIBOLD),
+                        ))
                         .child(sep())
-                        .child(button("tb-quote", "Quote", Box::new(Blockquote), |d| d))
-                        .child(button("tb-list", "List", Box::new(BulletList), |d| d)),
+                        .child(button(
+                            "tb-quote",
+                            "Quote",
+                            "Quote",
+                            Box::new(Blockquote),
+                            |d| d,
+                        ))
+                        .child(button(
+                            "tb-list",
+                            "List",
+                            "Bullet List",
+                            Box::new(BulletList),
+                            |d| d,
+                        )),
                 ),
             )
             .with_priority(1)

@@ -1309,6 +1309,7 @@ impl Workspace {
                                     .ghost()
                                     .xsmall()
                                     .icon(IconName::Close)
+                                    .tooltip("Close Tab")
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         cx.stop_propagation();
                                         this.close_doc(doc_for_close.clone(), window, cx);
@@ -1994,42 +1995,47 @@ impl Workspace {
             .iter()
             .rposition(|(_, _, _, line)| *line <= caret_line);
         let top = headings.iter().map(|h| h.0).min().unwrap_or(1);
+        // Only the visible headings are built: a long document's outline
+        // was most of the cost of a keystroke.
+        let count = headings.len();
+        let headings = std::rc::Rc::new(headings);
         div()
-            .id("outline")
             .size_full()
-            .overflow_y_scroll()
             .py(px(6.))
             .text_sm()
-            .children(
-                headings
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, (level, text, start, _))| {
-                        let editor = editor.clone();
-                        div()
-                            .id(("heading", i))
-                            .mx(px(6.))
-                            .pl(px(10. + (level - top) as f32 * 14.))
-                            .pr(px(8.))
-                            .py(px(4.))
-                            .rounded(px(5.))
-                            .cursor_pointer()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .text_color(if level <= top { fg } else { muted })
-                            .when(level <= top, |d| d.font_weight(FontWeight::MEDIUM))
-                            .hover(|s| s.bg(hover))
-                            .when(current == Some(i), |d| d.bg(active_bg).text_color(fg))
-                            .child(if text.is_empty() {
-                                "Untitled heading".to_string()
-                            } else {
-                                text
-                            })
-                            .on_click(move |_, window, cx| {
-                                editor.update(cx, |e, cx| e.reveal_offset(start, window, cx));
-                            })
-                    }),
+            .child(
+                uniform_list("outline", count, move |range, _, _| {
+                    range
+                        .map(|i| {
+                            let (level, text, start, _) = headings[i].clone();
+                            let editor = editor.clone();
+                            div()
+                                .id(("heading", i))
+                                .mx(px(6.))
+                                .pl(px(10. + (level - top) as f32 * 14.))
+                                .pr(px(8.))
+                                .py(px(4.))
+                                .rounded(px(5.))
+                                .cursor_pointer()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .text_color(if level <= top { fg } else { muted })
+                                .when(level <= top, |d| d.font_weight(FontWeight::MEDIUM))
+                                .hover(|s| s.bg(hover))
+                                .when(current == Some(i), |d| d.bg(active_bg).text_color(fg))
+                                .child(if text.is_empty() {
+                                    "Untitled heading".to_string()
+                                } else {
+                                    text
+                                })
+                                .on_click(move |_, window, cx| {
+                                    editor.update(cx, |e, cx| e.reveal_offset(start, window, cx));
+                                })
+                        })
+                        .collect()
+                })
+                .size_full(),
             )
             .into_any_element()
     }
@@ -2487,6 +2493,63 @@ mod tests {
         cx.run_until_parked();
         assert!(!doc.read_with(cx, |d, _| d.stale));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Typing into a 10,000-line document, a whole frame per keystroke.
+    /// Run it optimised: `cargo test --release -p mdedit -- --ignored typing_stays`.
+    #[gpui_kit::test]
+    #[ignore]
+    fn typing_stays_quick_in_a_long_document(cx: &mut TestAppContext) {
+        let chunk = "## Section\n\nA paragraph with **bold**, *italic*, `code` and a [link](https://x.y)\nthat runs onto a second line.\n\n- a bullet\n- another\n  - nested\n1. first\n- [ ] a task\n\n> A quote.\n\n| A | B |\n|---|--:|\n| a | 1 |\n\n```rust\nfn main() {}\n```\n\n";
+        let mut text = String::from("# Long\n\n");
+        while text.lines().count() < 10_000 {
+            text.push_str(chunk);
+        }
+        let (h, ws) = setup(cx);
+        let dir = scratch("perf");
+        std::fs::write(dir.join("long.md"), &text).unwrap();
+        cx.update_window(h, |_, window, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.open_paths(vec![dir.join("long.md")], window, cx)
+            })
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let editor = ws.read_with(cx, |ws, cx| {
+            ws.active_doc()
+                .unwrap()
+                .read(cx)
+                .markdown()
+                .unwrap()
+                .clone()
+        });
+        let mid = text[..text.len() / 2].rfind("A paragraph").unwrap();
+        cx.update_window(h, |_, window, cx| {
+            editor.update(cx, |e, cx| e.reveal_offset(mid, window, cx));
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+
+        let mut times = Vec::new();
+        for _ in 0..40 {
+            let t = std::time::Instant::now();
+            cx.update_window(h, |_, window, cx| {
+                window.input("x", cx);
+                window.render_frame(cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            times.push(t.elapsed().as_secs_f64() * 1000.);
+        }
+        times.sort_by(f64::total_cmp);
+        let median = times[times.len() / 2];
+        let worst = times[times.len() - 1];
+        eprintln!("10k lines: keystroke + frame median {median:.1} ms, worst {worst:.1} ms");
+        assert!(editor.read_with(cx, |e, _| e.text().matches('x').count() >= 40));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A 60 Hz frame is 16.7 ms; leave room for the platform's share.
+        assert!(median < 8., "median {median:.1} ms");
     }
 
     #[gpui_kit::test]

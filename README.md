@@ -31,18 +31,32 @@ nothing is converted back and forth behind your back.
 - **Lists that keep going**: `Enter` continues a list, a task list or a
   quote, and `Enter` on an empty item ends it. `Tab` and `Shift+Tab` indent
   and outdent. Task boxes tick with a click.
-- **Tables as a grid.**
-  - **Click a cell** to edit the table as Markdown, with the caret in that
-    cell.
-  - **Moving around:** `Tab` and `Shift+Tab` go between cells, and `Tab` past
-    the last cell adds a row. `Enter` goes down a column and `Esc` leaves.
-  - **Leaving the table** re-pads its columns so they line up.
+- **Tables you edit in place.** Type straight into the cells. In Live
+  mode the cell you're in shows its Markdown. A `|` you type is escaped, so
+  it stays text.
+  - **Keys:**
+    - `Tab` and `Shift+Tab` move between cells, and `Tab` past the last
+      cell adds a row.
+    - `Enter` goes down a column.
+    - `Up` and `Down` change row.
+    - `Left` and `Right` stop at the cell's edges.
+    - `Esc` leaves the table.
+  - **Hover a table** for its controls:
+    - `+` rails on the right and bottom edges add a column or a row.
+    - A grip above each header, or left of each row, drags it to a new
+      place.
+    - A header's right border drags to resize the column. Widths are saved
+      in a `<!-- zen:cols=… -->` comment after the table, the format
+      [ZenNotes-rs](https://github.com/alf5/ZenNotes-rs) uses.
   - **Right-click a cell** to:
-    - insert, duplicate or delete rows and columns
-    - align a column
+    - insert, move or duplicate rows and columns
+    - align a column (the current one is ticked)
     - sort by a column
     - copy the table as Markdown
-    - delete the table
+    - duplicate or delete the table
+    - delete a row or column
+  - **Columns line up in the source:** the table is padded when you leave
+    it.
 - **Diagrams and formulas.**
   - A ```` ```mermaid ```` fence draws as a diagram, using
     [bezel-mermaid](https://crates.io/crates/bezel-mermaid), a pure-Rust port

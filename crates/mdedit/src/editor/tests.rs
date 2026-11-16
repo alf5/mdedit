@@ -6,6 +6,7 @@ use gpui_kit::{
     WindowOptions, px, size,
 };
 use mdedit_core::buffer::Selection;
+use mdedit_core::display::RowWidget;
 use mdedit_core::prefs::{Mode, Prefs};
 use mdedit_core::themes;
 
@@ -249,41 +250,231 @@ fn hard_wrapped_paragraphs_flow(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn tables_open_as_source_and_tab_between_cells(cx: &mut TestAppContext) {
+fn tables_are_edited_in_their_grid(cx: &mut TestAppContext) {
     let src = "| a | b |\n|---|---|\n| 1 | 2 |\n\nafter";
     let (h, ed) = open(cx, src, Mode::Rendered);
-    caret(cx, &ed, src.len());
-    let closed = ed.read_with(cx, |e, _| e.rows.iter().any(|r| r.widget.is_some()));
-    assert!(closed, "with the caret elsewhere the table is a grid");
-    // Leaving the table padded it, so find the cell in today's text.
-    let one = text(cx, &ed).find('1').unwrap();
-    caret(cx, &ed, one);
-    let open_now = ed.read_with(cx, |e, _| e.rows.iter().all(|r| r.widget.is_none()));
-    assert!(open_now, "the caret in it shows its source");
-    keys(cx, h, &["tab"]);
+    let grid = |cx: &mut TestAppContext| {
+        ed.read_with(cx, |e, _| {
+            e.rows
+                .iter()
+                .any(|r| matches!(r.widget, Some(RowWidget::Closed(_))))
+                && e.geometry.lines.iter().any(|(_, _, l)| l.grid.is_some())
+        })
+    };
+    let one = src.find('1').unwrap();
+    caret(cx, &ed, one + 1);
     typed(cx, h, "x");
+    assert!(text(cx, &ed).contains("| 1x | 2 |"));
+    assert!(grid(cx), "the caret in it, the table is still a grid");
+    keys(cx, h, &["tab"]);
+    typed(cx, h, "y");
     keys(cx, h, &["tab"]);
     typed(cx, h, "new");
     keys(cx, h, &["escape"]);
     assert_eq!(
         text(cx, &ed),
-        "| a   | b   |\n| --- | --- |\n| 1   | x2  |\n| new |     |\n\nafter"
+        "| a   | b   |\n| --- | --- |\n| 1x  | 2y  |\n| new |     |\n\nafter"
     );
-    // Out of the table, it's a grid again.
-    let closed = ed.read_with(cx, |e, _| e.rows.iter().any(|r| r.widget.is_some()));
-    assert!(closed);
+    assert!(grid(cx));
+}
+
+#[gpui_kit::test]
+fn cells_keep_their_place(cx: &mut TestAppContext) {
+    let src = "| ab | cd |\n|----|----|\n| ef | gh |";
+    let (h, ed) = open(cx, src, Mode::Rendered);
+    let cd = src.find("cd").unwrap();
+    caret(cx, &ed, cd);
+    keys(cx, h, &["backspace", "left"]);
+    assert_eq!(
+        (text(cx, &ed).as_str(), head(cx, &ed)),
+        (src, cd),
+        "the cell's start holds"
+    );
+    caret(cx, &ed, cd - 3);
+    keys(cx, h, &["delete", "right"]);
+    assert_eq!(
+        (text(cx, &ed).as_str(), head(cx, &ed)),
+        (src, cd - 3),
+        "and its end"
+    );
+    // A caret put on a pipe lands in a cell.
+    caret(cx, &ed, cd - 2);
+    assert_eq!(head(cx, &ed), cd);
+    // Deleting across cells empties them but keeps the table.
+    let gh = src.find("gh").unwrap();
+    ed.update(cx, |e, cx| e.set_selection(Selection::new(3, gh + 1), cx));
+    keys(cx, h, &["backspace"]);
+    assert_eq!(text(cx, &ed), "| a |  |\n|----|----|\n|  | h |");
+    // A typed pipe is a character, not a new column.
+    caret(cx, &ed, 3);
+    typed(cx, h, "|");
+    assert!(text(cx, &ed).starts_with("| a\\| |"), "{}", text(cx, &ed));
+}
+
+#[gpui_kit::test]
+fn up_and_down_move_between_rows(cx: &mut TestAppContext) {
+    let src = "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n\nend";
+    let (h, ed) = open(cx, src, Mode::Rendered);
+    caret(cx, &ed, src.find('b').unwrap() + 1);
+    keys(cx, h, &["down"]);
+    let two = src.find('2').unwrap();
+    assert!(
+        (two..=two + 1).contains(&head(cx, &ed)),
+        "into the cell below"
+    );
+    keys(cx, h, &["down"]);
+    let four = src.find('4').unwrap();
+    assert!((four..=four + 1).contains(&head(cx, &ed)));
+    keys(cx, h, &["down"]);
+    assert!(
+        head(cx, &ed) > src.find("|\n\n").unwrap(),
+        "and out of the table"
+    );
+    keys(cx, h, &["up"]);
+    // Leaving padded the table, so find the cell again.
+    let four = text(cx, &ed).find('4').unwrap();
+    assert!(
+        (four..=four + 1).contains(&head(cx, &ed)),
+        "back into its last row"
+    );
 }
 
 #[gpui_kit::test]
 fn table_menu_commands_rewrite_the_table(cx: &mut TestAppContext) {
+    use super::table::TableOp;
     let src = "| n |\n|---|\n| 2 |\n| 1 |";
     let (_, ed) = open(cx, src, Mode::Rendered);
-    ed.update(cx, |e, cx| {
-        e.table_op(0, super::widgets::TableOp::Sort(false), 1, 0, cx)
-    });
+    ed.update(cx, |e, cx| e.table_op(0, TableOp::Sort(false), 1, 0, cx));
     assert_eq!(text(cx, &ed), "| n   |\n| --- |\n| 1   |\n| 2   |");
-    ed.update(cx, |e, cx| {
-        e.table_op(0, super::widgets::TableOp::ColRight, 1, 0, cx)
-    });
+    ed.update(cx, |e, cx| e.table_op(0, TableOp::AddCol, 1, 0, cx));
     assert!(text(cx, &ed).starts_with("| n   | Column 2 |"));
+    ed.update(cx, |e, cx| e.table_op(0, TableOp::MoveCol(1, 0), 0, 1, cx));
+    assert!(text(cx, &ed).starts_with("| Column 2 | n   |"));
+    ed.update(cx, |e, cx| e.table_op(0, TableOp::DuplicateRow, 1, 0, cx));
+    assert_eq!(text(cx, &ed).lines().count(), 5);
+}
+
+/// Where the first grid is, and its column and row edges.
+fn grid_geometry(
+    cx: &mut TestAppContext,
+    ed: &Entity<MarkdownEditor>,
+) -> (
+    Point<gpui_kit::Pixels>,
+    Vec<gpui_kit::Pixels>,
+    Vec<gpui_kit::Pixels>,
+) {
+    ed.read_with(cx, |e, _| {
+        let (_, origin, l) = e
+            .geometry
+            .lines
+            .iter()
+            .find(|(_, _, l)| l.grid.is_some())
+            .unwrap();
+        let g = l.grid.as_ref().unwrap();
+        (*origin, g.col_x.clone(), g.row_y.clone())
+    })
+}
+
+fn drag(
+    cx: &mut TestAppContext,
+    h: AnyWindowHandle,
+    from: Point<gpui_kit::Pixels>,
+    to: Point<gpui_kit::Pixels>,
+) {
+    use gpui_kit::MouseButton::Left;
+    cx.update_window(h, |_, window, cx| {
+        window.pointer_move(from, None, cx);
+        window.pointer_down(from, Left, cx);
+        window.pointer_move(to, Some(Left), cx);
+        window.pointer_up(to, Left, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+fn dragging_a_header_border_resizes_and_saves_widths(cx: &mut TestAppContext) {
+    let (h, ed) = open(cx, "| a | b |\n|---|---|\n| 1 | 2 |", Mode::Rendered);
+    let (o, cols, rows) = grid_geometry(cx, &ed);
+    let border = o + gpui_kit::point(cols[1], (rows[0] + rows[1]) / 2.);
+    let before = f32::from(cols[1] - cols[0]).ceil() as u32;
+    drag(cx, h, border, border + gpui_kit::point(px(40.), px(0.)));
+    let t = text(cx, &ed);
+    let saved = t.lines().last().unwrap().to_string();
+    assert!(saved.starts_with("<!-- zen:cols="), "{t}");
+    let first: u32 = saved["<!-- zen:cols=".len()..]
+        .split(',')
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(first, before + 40, "{t}");
+}
+
+#[gpui_kit::test]
+fn grips_reorder_rows_and_the_rail_adds_one(cx: &mut TestAppContext) {
+    let (h, ed) = open(cx, "| h |\n|---|\n| 1 |\n| 2 |", Mode::Rendered);
+    let (o, cols, rows) = grid_geometry(cx, &ed);
+    let grip = super::table::GRIP;
+    let first = o + gpui_kit::point(cols[0] - px(grip / 2.), (rows[1] + rows[2]) / 2.);
+    let second = o + gpui_kit::point(cols[0] - px(grip / 2.), (rows[2] + rows[3]) / 2.);
+    drag(cx, h, first, second);
+    assert_eq!(text(cx, &ed), "| h   |\n| --- |\n| 2   |\n| 1   |");
+    let (o, cols, rows) = grid_geometry(cx, &ed);
+    let rail = o + gpui_kit::point(
+        (cols[0] + cols[1]) / 2.,
+        *rows.last().unwrap() + px(super::table::RAIL / 2.),
+    );
+    drag(cx, h, rail, rail);
+    assert_eq!(text(cx, &ed).lines().count(), 5, "a row was added");
+}
+
+#[gpui_kit::test]
+fn a_right_click_on_a_cell_opens_the_table_menu(cx: &mut TestAppContext) {
+    let (h, ed) = open(
+        cx,
+        "| a | b |\n|---|---|\n| 1 | 2 |\n\nafter",
+        Mode::Rendered,
+    );
+    let (o, cols, rows) = grid_geometry(cx, &ed);
+    let cell = o + gpui_kit::point((cols[1] + cols[2]) / 2., (rows[1] + rows[2]) / 2.);
+    cx.update_window(h, |_, window, cx| {
+        window.pointer_down(cell, gpui_kit::MouseButton::Right, cx);
+        window.pointer_up(cell, gpui_kit::MouseButton::Right, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(ed.read_with(cx, |e, _| e.table_menu.is_some()));
+    let two = text(cx, &ed).find('2').unwrap();
+    assert_eq!(head(cx, &ed), two + 1, "the caret went into the cell");
+    // Elsewhere, no menu of ours.
+    ed.update(cx, |e, _| e.table_menu = None);
+    let after = o + gpui_kit::point(px(4.), *rows.last().unwrap() + px(40.));
+    cx.update_window(h, |_, window, cx| {
+        window.pointer_down(after, gpui_kit::MouseButton::Right, cx);
+    })
+    .unwrap();
+    assert!(ed.read_with(cx, |e, _| e.table_menu.is_none()));
+}
+
+#[gpui_kit::test]
+fn live_mode_shows_the_caret_cells_markdown(cx: &mut TestAppContext) {
+    let src = "| **a** | *b* |\n|---|---|\n| 1 | 2 |";
+    let (h, ed) = open(cx, src, Mode::Live);
+    caret(cx, &ed, src.find('a').unwrap());
+    keys(cx, h, &[]);
+    let shown = ed.read_with(cx, |e, _| {
+        let (_, _, l) = e
+            .geometry
+            .lines
+            .iter()
+            .find(|(_, _, l)| l.grid.is_some())
+            .unwrap();
+        let g = l.grid.as_ref().unwrap();
+        (
+            g.cells[0].display.text.clone(),
+            g.cells[1].display.text.clone(),
+        )
+    });
+    assert_eq!(shown, ("**a**".to_string(), "b".to_string()));
 }

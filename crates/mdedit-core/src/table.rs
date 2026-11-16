@@ -746,12 +746,18 @@ impl TableModel {
     /// Where cell (r, c)'s text starts in `render()`'s output, relative to
     /// its start.
     pub fn rendered_cell(&self, r: usize, c: usize) -> Option<usize> {
+        self.rendered_cell_range(r, c).map(|r| r.start)
+    }
+
+    /// Where cell (r, c)'s text is in `render()`'s output.
+    pub fn rendered_cell_range(&self, r: usize, c: usize) -> Option<std::ops::Range<usize>> {
         let out = self.render();
         let line_ix = if r == 0 { 0 } else { r + 1 };
         let line_start: usize = out.split('\n').take(line_ix).map(|l| l.len() + 1).sum();
         let line = out.split('\n').nth(line_ix)?;
         let r = split_row(line).get(c).cloned()?;
-        Some(line_start + content(line, r).start)
+        let c = content(line, r);
+        Some(line_start + c.start..line_start + c.end)
     }
 
     pub fn insert_row(&mut self, at: usize) {
@@ -850,11 +856,76 @@ impl TableModel {
             self.rows.insert((r + 1).max(1), copy);
         }
     }
+
+    /// Copy column `c` in beside itself, alignment and width included.
+    pub fn duplicate_col(&mut self, c: usize) {
+        let cols = self.cols();
+        if c >= cols {
+            return;
+        }
+        for row in &mut self.rows {
+            row.resize(cols, String::new());
+            let copy = row[c].clone();
+            row.insert(c + 1, copy);
+        }
+        self.aligns.resize(cols, Align::None);
+        self.aligns.insert(c + 1, self.aligns[c]);
+        if !self.widths.is_empty() {
+            self.widths.resize(cols, None);
+            self.widths.insert(c + 1, self.widths[c]);
+        }
+    }
+
+    /// Pin column widths, in pixels.
+    pub fn set_widths(&mut self, widths: Vec<Option<u32>>) {
+        self.widths = widths;
+        self.widths.resize(self.cols(), None);
+    }
+
+    /// Where a cell's text starts: (row, column) to a document offset.
+    pub fn cell_start(&self, r: usize, c: usize) -> Option<usize> {
+        self.cells.get(r)?.get(c).map(|c| c.start)
+    }
+}
+
+/// Text typed into a cell, made safe to sit between pipes: a `|` is
+/// escaped (unless it already is) and a line break becomes a space.
+pub fn escape_cell(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut escaped = false;
+    for ch in text.chars() {
+        match ch {
+            '|' if !escaped => out.push_str("\\|"),
+            '\r' => {}
+            '\n' => out.push(' '),
+            _ => out.push(ch),
+        }
+        escaped = ch == '\\' && !escaped;
+    }
+    out
 }
 
 #[cfg(test)]
 mod model_tests {
     use super::*;
+
+    #[test]
+    fn typed_text_is_escaped_for_a_cell() {
+        assert_eq!(escape_cell("a|b"), "a\\|b");
+        assert_eq!(escape_cell("a\\|b"), "a\\|b");
+        assert_eq!(escape_cell("one\ntwo\r\n"), "one two ");
+    }
+
+    #[test]
+    fn a_column_duplicates_with_its_alignment() {
+        let text = "| a | b |\n|:--|--:|\n| 1 | 2 |";
+        let mut t = TableModel::parse(text, &lines(text)).unwrap();
+        t.duplicate_col(1);
+        assert_eq!(t.rows[1], ["1", "2", "2"]);
+        assert_eq!(t.aligns, [Align::Left, Align::Right, Align::Right]);
+        t.set_widths(vec![Some(80)]);
+        assert!(t.render().ends_with("<!-- zen:cols=80,auto,auto -->"));
+    }
 
     fn lines(text: &str) -> Vec<std::ops::Range<usize>> {
         let mut out = Vec::new();

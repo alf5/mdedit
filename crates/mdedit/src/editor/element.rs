@@ -8,7 +8,8 @@ use mdedit_core::syntax::LineKind;
 
 use mdedit_core::display::{Gutter, RowWidget};
 
-use super::{Geometry, LIST_INDENT, LineLayout, MarkdownEditor, Placed, max, min};
+use super::table::{Control, Drag, controls};
+use super::{Geometry, LIST_INDENT, MarkdownEditor, Placed, max, min};
 
 const PAD_X: f32 = 32.;
 const PAD_TOP: f32 = 28.;
@@ -42,6 +43,13 @@ pub(crate) struct Frame {
     box_border: Hsla,
     box_fill: Hsla,
     check: Hsla,
+    /// Tables: what goes under the text (header, caret cell) and over it
+    /// (rules, borders, the hover controls).
+    under: Vec<PaintQuad>,
+    over: Vec<PaintQuad>,
+    /// Pointer shapes over the table controls, and for a drag in progress.
+    cursors: Vec<(Hitbox, CursorStyle)>,
+    drag_cursor: Option<CursorStyle>,
 }
 
 impl IntoElement for EditorElement {
@@ -49,47 +57,6 @@ impl IntoElement for EditorElement {
     fn into_element(self) -> Self {
         self
     }
-}
-
-/// Rectangles covering display range `a..b` of a (possibly wrapped) line.
-fn range_rects(
-    origin: Point<Pixels>,
-    l: &LineLayout,
-    a: usize,
-    b: usize,
-    to_eol: bool,
-    width: Pixels,
-) -> Vec<Bounds<Pixels>> {
-    let pa = l.point(a);
-    let pb = l.point(b);
-    let lh = l.line_height;
-    let eol = if to_eol { px(6.) } else { px(0.) };
-    let mut out = Vec::new();
-    if pa.y == pb.y {
-        out.push(Bounds::from_corners(
-            origin + point(pa.x, pa.y),
-            origin + point(pb.x + eol, pb.y + lh),
-        ));
-        return out;
-    }
-    let right = l.indent + width;
-    out.push(Bounds::from_corners(
-        origin + pa,
-        origin + point(right, pa.y + lh),
-    ));
-    let mut y = pa.y + lh;
-    while y < pb.y {
-        out.push(Bounds::from_corners(
-            origin + point(l.indent, y),
-            origin + point(right, y + lh),
-        ));
-        y += lh;
-    }
-    out.push(Bounds::from_corners(
-        origin + point(l.indent, pb.y),
-        origin + point(pb.x + eol, pb.y + lh),
-    ));
-    out
 }
 
 /// What `prepare` hands back: the visible rows, the widgets drawn among
@@ -126,7 +93,7 @@ impl MarkdownEditor {
                     .iter()
                     .map(|s| s.height)
                     .fold(px(0.), |a, b| a + b);
-            let p = layout.point(layout.display.to_display(self.sel.head));
+            let p = layout.point(layout.to_display(self.sel.head));
             let caret_top = line_top + p.y;
             let caret_bottom = caret_top + layout.line_height;
             let margin = min(px(48.), view_h / 4.);
@@ -176,6 +143,220 @@ impl MarkdownEditor {
             self.scroll_y = max_scroll;
         }
         (lines, widgets, content_x, content_w, total)
+    }
+
+    /// The quads that draw the visible tables, and their controls when one
+    /// is hovered: v1's look. Also the pointer shapes over those controls.
+    #[allow(clippy::type_complexity)]
+    fn paint_tables(
+        &self,
+        lines: &[Placed],
+        focused: bool,
+        window: &mut Window,
+    ) -> (
+        Vec<PaintQuad>,
+        Vec<PaintQuad>,
+        Vec<(Hitbox, CursorStyle)>,
+        Option<CursorStyle>,
+    ) {
+        let c = &self.style.colors;
+        let p = &self.style.palette;
+        let accent_text = super::style::hsla(p.accent_text);
+        let soft = super::style::hsla(p.bg_soft);
+        let bg = super::style::hsla(p.bg);
+        let (mut under, mut over, mut cursors) = (Vec::new(), Vec::new(), Vec::new());
+        let drag = self.table_dragging();
+        let drag_cursor = match drag {
+            Some(Drag::Row { .. } | Drag::Col { .. }) => Some(CursorStyle::ClosedHand),
+            Some(Drag::Resize { .. }) => Some(CursorStyle::ResizeColumn),
+            _ => None,
+        };
+        for (ix, origin, l) in lines {
+            let Some(g) = &l.grid else { continue };
+            let at = |b: Bounds<Pixels>| Bounds::new(*origin + b.origin, b.size);
+            let table = at(g.bounds());
+            let radius = px(6.);
+            // The header's shading, then the caret's cell.
+            let head = at(Bounds::from_corners(
+                point(px(0.), g.row_y[0]),
+                point(g.width(), g.row_y[1]),
+            ));
+            under.push(fill(head, c.code_bg).corner_radii(Corners {
+                top_left: radius,
+                top_right: radius,
+                bottom_left: px(0.),
+                bottom_right: px(0.),
+            }));
+            if focused
+                && self.sel.is_empty()
+                && let Some(k) = g.cell_at_source(self.sel.head)
+            {
+                let cell = at(g.cell_bounds(g.cells[k].r, g.cells[k].c));
+                under.push(fill(cell, c.accent.opacity(0.10)));
+                over.push(quad(
+                    cell,
+                    px(0.),
+                    transparent_black(),
+                    px(2.),
+                    c.accent.opacity(0.45),
+                    BorderStyle::Solid,
+                ));
+            }
+            // Rules between rows and columns, and the border round it all.
+            for y in &g.row_y[1..g.row_y.len() - 1] {
+                over.push(fill(
+                    Bounds::new(*origin + point(px(0.), *y), size(g.width(), px(1.))),
+                    c.border,
+                ));
+            }
+            for x in &g.col_x[1..g.col_x.len() - 1] {
+                over.push(fill(
+                    Bounds::new(
+                        point(origin.x + *x, table.top()),
+                        size(px(1.), table.size.height),
+                    ),
+                    c.border,
+                ));
+            }
+            over.push(outline(table, c.border, BorderStyle::Solid).corner_radii(radius));
+
+            // The controls, while the pointer is near (or a press is on).
+            let hover = self.table_hover.filter(|h| h.row == *ix);
+            let active = drag.filter(|d| d.row() == *ix);
+            if hover.is_none() && active.is_none() {
+                continue;
+            }
+            let moving = matches!(active, Some(Drag::Row { .. } | Drag::Col { .. }));
+            let resizing = match active {
+                Some(Drag::Resize { col, .. }) => Some(col),
+                _ => None,
+            };
+            let under_pointer = hover.and_then(|h| h.control);
+            for (control, b) in controls(g) {
+                let b = at(b);
+                match control {
+                    Control::AddCol | Control::AddRow => {
+                        let lit = under_pointer == Some(control)
+                            || matches!(active, Some(Drag::Rail { control: k, .. }) if k == control);
+                        over.push(if lit {
+                            fill(b, c.accent.opacity(0.85)).corner_radii(px(5.))
+                        } else {
+                            fill(b, bg.opacity(0.9))
+                                .corner_radii(px(5.))
+                                .border_widths(px(1.))
+                                .border_color(c.border)
+                        });
+                        let ink = if lit { accent_text } else { c.muted };
+                        let mid = b.center();
+                        over.push(fill(
+                            Bounds::new(mid - point(px(3.5), px(0.75)), size(px(7.), px(1.5))),
+                            ink,
+                        ));
+                        over.push(fill(
+                            Bounds::new(mid - point(px(0.75), px(3.5)), size(px(1.5), px(7.))),
+                            ink,
+                        ));
+                        cursors.push((
+                            window.insert_hitbox(b, HitboxBehavior::Normal),
+                            CursorStyle::PointingHand,
+                        ));
+                    }
+                    Control::ColGrip(i) | Control::RowGrip(i) => {
+                        let col = matches!(control, Control::ColGrip(_));
+                        let on = if col {
+                            hover.and_then(|h| h.head) == Some(i)
+                        } else {
+                            hover.and_then(|h| h.body) == Some(i)
+                        };
+                        cursors.push((
+                            window.insert_hitbox(b, HitboxBehavior::Normal),
+                            CursorStyle::OpenHand,
+                        ));
+                        if !on || moving || resizing.is_some() {
+                            continue;
+                        }
+                        let inner = Bounds::from_corners(
+                            b.origin + point(px(1.), px(1.)),
+                            b.bottom_right() - point(px(1.), px(1.)),
+                        );
+                        over.push(
+                            fill(inner, soft)
+                                .corner_radii(px(4.))
+                                .border_widths(px(1.))
+                                .border_color(c.border),
+                        );
+                        // ⠿, on its side for a column.
+                        let (across, down) = if col { (3, 2) } else { (2, 3) };
+                        let mid = inner.center();
+                        for a in 0..across {
+                            for d in 0..down {
+                                let x =
+                                    mid.x + px((a as f32 - (across - 1) as f32 / 2.) * 3.5 - 1.);
+                                let y = mid.y + px((d as f32 - (down - 1) as f32 / 2.) * 3.5 - 1.);
+                                over.push(
+                                    fill(Bounds::new(point(x, y), size(px(2.), px(2.))), c.muted)
+                                        .corner_radii(px(1.)),
+                                );
+                            }
+                        }
+                    }
+                    Control::Resize(i) => {
+                        cursors.push((
+                            window.insert_hitbox(b, HitboxBehavior::Normal),
+                            CursorStyle::ResizeColumn,
+                        ));
+                        let x = origin.x + g.col_x[i + 1] - px(1.);
+                        if resizing == Some(i) {
+                            over.push(fill(
+                                Bounds::new(point(x, table.top()), size(px(2.), table.size.height)),
+                                c.accent.opacity(0.55),
+                            ));
+                        } else if !moving
+                            && resizing.is_none()
+                            && hover.and_then(|h| h.head) == Some(i)
+                        {
+                            over.push(fill(
+                                Bounds::new(point(x, b.top()), size(px(2.), b.size.height)),
+                                c.accent.opacity(0.55),
+                            ));
+                        }
+                    }
+                }
+            }
+            // Where a dragged row or column would land.
+            match active {
+                Some(Drag::Row { from, to, .. }) if from != to => {
+                    let y = if to > from {
+                        g.row_y[to + 2]
+                    } else {
+                        g.row_y[to + 1]
+                    };
+                    over.push(fill(
+                        Bounds::new(
+                            point(table.left(), origin.y + y - px(1.)),
+                            size(table.size.width, px(2.)),
+                        ),
+                        c.accent,
+                    ));
+                }
+                Some(Drag::Col { from, to, .. }) if from != to => {
+                    let x = if to > from {
+                        g.col_x[to + 1]
+                    } else {
+                        g.col_x[to]
+                    };
+                    over.push(fill(
+                        Bounds::new(
+                            point(origin.x + x - px(1.), table.top()),
+                            size(px(2.), table.size.height),
+                        ),
+                        c.accent,
+                    ));
+                }
+                _ => {}
+            }
+        }
+        (under, over, cursors, drag_cursor)
     }
 }
 
@@ -229,23 +410,23 @@ impl Element for EditorElement {
                         if m.start > src.end {
                             break;
                         }
-                        let a = l.display.to_display(m.start.max(src.start));
-                        let b = l.display.to_display(m.end.min(src.end));
+                        let a = l.to_display(m.start.max(src.start));
+                        let b = l.to_display(m.end.min(src.end));
                         let color = if f.current == Some(first + i) {
                             colors.find_current
                         } else {
                             colors.find
                         };
-                        for r in range_rects(*origin, l, a, b, false, content_w - l.indent) {
+                        for r in l.rects(*origin, a, b, false, content_w - l.indent) {
                             rects.push((r, color));
                         }
                     }
                 }
                 if !sel.is_empty() && sel.start <= src.end && sel.end >= src.start {
-                    let a = l.display.to_display(sel.start.max(src.start));
-                    let b = l.display.to_display(sel.end.min(src.end));
-                    let to_eol = sel.end > src.end;
-                    for r in range_rects(*origin, l, a, b, to_eol, content_w - l.indent) {
+                    let a = l.to_display(sel.start.max(src.start));
+                    let b = l.to_display(sel.end.min(src.end));
+                    let to_eol = sel.end > src.end && l.grid.is_none();
+                    for r in l.rects(*origin, a, b, to_eol, content_w - l.indent) {
                         rects.push((r, colors.selection));
                     }
                 }
@@ -256,7 +437,7 @@ impl Element for EditorElement {
                 .iter()
                 .find(|(ix, ..)| *ix == caret_ix)
                 .map(|(_, origin, l)| {
-                    let p = l.point(l.display.to_display(ed.sel.head));
+                    let p = l.point(l.to_display(ed.sel.head));
                     Bounds::new(*origin + p, size(px(2.), l.line_height))
                 });
 
@@ -270,6 +451,8 @@ impl Element for EditorElement {
                 )
             });
 
+            let focused = ed.focus.is_focused(window);
+            let (under, over, cursors, drag_cursor) = ed.paint_tables(&lines, focused, window);
             ed.geometry = Geometry {
                 bounds,
                 lines: lines.clone(),
@@ -293,6 +476,10 @@ impl Element for EditorElement {
                 box_border: colors.muted.opacity(0.7),
                 box_fill: colors.accent,
                 check: colors.text,
+                under,
+                over,
+                cursors,
+                drag_cursor,
             }
         })
     }
@@ -313,7 +500,15 @@ impl Element for EditorElement {
             ElementInputHandler::new(bounds, self.editor.clone()),
             cx,
         );
-        window.set_cursor_style(CursorStyle::IBeam, &frame.hitbox);
+        window.set_cursor_style(
+            frame.drag_cursor.unwrap_or(CursorStyle::IBeam),
+            &frame.hitbox,
+        );
+        if frame.drag_cursor.is_none() {
+            for (hitbox, style) in &frame.cursors {
+                window.set_cursor_style(*style, hitbox);
+            }
+        }
 
         // Mouse: press, drag-select (even outside), release, wheel.
         {
@@ -325,20 +520,42 @@ impl Element for EditorElement {
                     cx.stop_propagation();
                 }
             });
+            // A right press on a table cell: its menu.
+            let editor = self.editor.clone();
+            let hitbox = frame.hitbox.clone();
+            window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
+                if phase.bubble()
+                    && e.button == MouseButton::Right
+                    && hitbox.is_hovered(window)
+                    && editor.update(cx, |ed, cx| ed.table_menu_at(e.position, window, cx))
+                {
+                    cx.stop_propagation();
+                }
+            });
             let editor = self.editor.clone();
             window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
-                if phase.bubble() && editor.read(cx).is_selecting() {
+                if !phase.bubble() {
+                    return;
+                }
+                if editor.read(cx).is_selecting() {
                     if e.pressed_button == Some(MouseButton::Left) {
                         editor.update(cx, |ed, cx| ed.mouse_drag(e.position, cx));
                     } else {
                         editor.update(cx, |ed, _| ed.mouse_up());
                     }
+                } else {
+                    // Hovering a table shows its controls; a press on one
+                    // drags.
+                    editor.update(cx, |ed, cx| ed.table_pointer(e.position, cx));
                 }
             });
             let editor = self.editor.clone();
             window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
                 if phase.bubble() {
-                    editor.update(cx, |ed, _| ed.mouse_up());
+                    editor.update(cx, |ed, cx| {
+                        ed.mouse_up();
+                        ed.table_release(cx);
+                    });
                 }
             });
             let editor = self.editor.clone();
@@ -384,6 +601,9 @@ impl Element for EditorElement {
                     }
                 }
             }
+            for q in &frame.under {
+                window.paint_quad(q.clone());
+            }
             for (r, color) in &frame.rects {
                 window.paint_quad(fill(*r, *color));
             }
@@ -423,6 +643,21 @@ impl Element for EditorElement {
                 }
             }
             for (_, origin, l) in &frame.lines {
+                if let Some(g) = &l.grid {
+                    for cell in &g.cells {
+                        cell.shaped
+                            .paint(
+                                *origin + cell.origin,
+                                g.line_height,
+                                TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            )
+                            .ok();
+                    }
+                    continue;
+                }
                 let text_origin = *origin + point(l.indent, l.pad_top);
                 l.shaped
                     .paint(
@@ -437,6 +672,9 @@ impl Element for EditorElement {
             }
             for el in &mut frame.widgets {
                 el.paint(window, cx);
+            }
+            for q in &frame.over {
+                window.paint_quad(q.clone());
             }
             if focus.is_focused(window)
                 && let Some(c) = frame.caret

@@ -322,7 +322,8 @@ pub struct Row {
 /// break, `\\` or two spaces at the end, still ends a row), and widgets
 /// (tables, diagrams, formulas, images) are drawn in place of their
 /// source, except the one holding the caret line `open`, whose source is
-/// shown. In Source mode every line is its own row.
+/// shown. Tables are the exception: they're edited in place, as a grid, so
+/// they stay drawn. In Source mode every line is its own row.
 pub fn rows(text: &str, syntax: &Syntax, rich: bool, open: Option<usize>) -> Vec<Row> {
     let lines = &syntax.lines;
     let mut out: Vec<Row> = Vec::with_capacity(lines.len());
@@ -346,7 +347,9 @@ pub fn rows(text: &str, syntax: &Syntax, rich: bool, open: Option<usize>) -> Vec
             let w = &syntax.widgets[w_ix];
             next.next();
             let end = w.lines.end.min(lines.len());
-            let is_open = open.is_some_and(|o| w.lines.contains(&o));
+            // A table is edited in its grid, so it never opens.
+            let is_open = open.is_some_and(|o| w.lines.contains(&o))
+                && !matches!(w.kind, crate::syntax::WidgetKind::Table);
             if !is_open {
                 out.push(Row {
                     lines: i..end,
@@ -432,6 +435,37 @@ pub fn display_row(
         }
     }
     out.source = syntax.lines[first].range.start..syntax.lines[lines.end - 1].range.end;
+    out
+}
+
+/// The display form of a table cell's text, `text`, which starts at `at`
+/// in the document. A cell holds only inline markdown, so anything that
+/// would read as a block on its own (`# x`, `- x`) is shown as it is.
+pub fn fragment(text: &str, at: usize, reveal: Reveal) -> DisplayLine {
+    let plain = |text: &str| {
+        let mut out = DisplayLine {
+            source: at..at + text.len(),
+            ..Default::default()
+        };
+        out.push(text, at..at + text.len(), true, 0, Role::Text);
+        if out.segs.is_empty() {
+            out.segs.push(Seg {
+                display: 0..0,
+                source: at..at,
+                copy: true,
+            });
+        }
+        out
+    };
+    let s = crate::syntax::parse(text);
+    if s.lines.len() != 1 || s.lines[0].kind != LineKind::Paragraph {
+        return plain(text);
+    }
+    let mut out = display_row(text, &s, 0..1, reveal);
+    for seg in &mut out.segs {
+        seg.source = seg.source.start + at..seg.source.end + at;
+    }
+    out.source = at..at + text.len();
     out
 }
 
@@ -589,6 +623,21 @@ mod tests {
     }
 
     #[test]
+    fn a_cell_is_drawn_inline_and_mapped_into_the_document() {
+        let d = fragment("**b** \\| c", 10, Reveal::Hide);
+        assert_eq!(d.text, "b | c");
+        assert_eq!(d.source, 10..20);
+        assert_eq!(d.to_source(0), 12, "inside the bold markup");
+        assert_eq!(d.to_display(17), 2, "the escaped pipe");
+        assert_eq!(
+            fragment("# not a heading", 0, Reveal::Hide).text,
+            "# not a heading"
+        );
+        let empty = fragment("", 5, Reveal::Hide);
+        assert_eq!((empty.text.as_str(), empty.to_source(0)), ("", 5));
+    }
+
+    #[test]
     fn widgets_close_into_one_row_and_open_around_the_caret() {
         let text = "intro\n\n```mermaid\ngraph TD\n```\n\n| a |\n|---|\n| 1 |";
         let s = parse(text);
@@ -609,14 +658,9 @@ mod tests {
         assert_eq!(open[2].widget, None);
         assert_eq!(open[4].lines, 4..5);
         assert_eq!(open[4].widget, Some(RowWidget::Preview(0)));
-        // In a table: plain source rows, no preview.
+        // In a table: still the grid, which is where it's edited.
         let table = rows(text, &s, true, Some(7));
-        assert!(table.iter().all(|r| r.widget != Some(RowWidget::Closed(1))));
-        assert!(
-            table
-                .iter()
-                .all(|r| r.widget.is_none() || r.widget == Some(RowWidget::Closed(0)))
-        );
+        assert_eq!(table.last().unwrap().widget, Some(RowWidget::Closed(1)));
         // Source mode never draws widgets.
         assert!(
             rows(text, &s, false, None)

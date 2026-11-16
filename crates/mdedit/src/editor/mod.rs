@@ -12,9 +12,11 @@
 
 mod element;
 pub mod find_bar;
+mod grid;
 mod highlight;
 mod overlays;
 pub mod style;
+pub(crate) mod table;
 pub(crate) mod widgets;
 
 use std::cell::Cell;
@@ -24,12 +26,13 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Instant;
 
+use gpui_kit::component::menu::PopupMenu;
 use gpui_kit::*;
 use mdedit_core::buffer::{self, Change, Edit, Selection};
 use mdedit_core::display::{self, DisplayLine, Gutter, Reveal, Role, Row, RowWidget};
 use mdedit_core::history::{History, Kind};
 use mdedit_core::prefs::Mode;
-use mdedit_core::syntax::{self, LineKind, Syntax};
+use mdedit_core::syntax::{self, LineKind, Syntax, WidgetKind};
 use mdedit_core::{edit, find, os};
 
 use self::element::EditorElement;
@@ -62,11 +65,115 @@ pub(crate) struct LineLayout {
     pub alert: Option<mdedit_core::syntax::Alert>,
     /// A list marker drawn in the margin before the text.
     pub gutter: Option<ShapedLine>,
+    /// A table, drawn and edited as a grid; the text fields are unused.
+    pub grid: Option<grid::Grid>,
 }
 
 impl LineLayout {
+    /// How many display offsets the row has.
+    pub(crate) fn len(&self) -> usize {
+        match &self.grid {
+            Some(g) => g.len(),
+            None => self.display.text.len(),
+        }
+    }
+
+    pub(crate) fn to_display(&self, src: usize) -> usize {
+        match &self.grid {
+            Some(g) => g.to_display(src),
+            None => self.display.to_display(src),
+        }
+    }
+
+    pub(crate) fn to_source(&self, d: usize) -> usize {
+        match &self.grid {
+            Some(g) => g.to_source(d),
+            None => self.display.to_source(d),
+        }
+    }
+
+    pub(crate) fn prev(&self, d: usize) -> usize {
+        match &self.grid {
+            Some(g) => g.prev(d),
+            None => self.display.prev(d),
+        }
+    }
+
+    pub(crate) fn next(&self, d: usize) -> usize {
+        match &self.grid {
+            Some(g) => g.next(d),
+            None => self.display.next(d),
+        }
+    }
+
+    pub(crate) fn role_at(&self, d: usize) -> Role {
+        match &self.grid {
+            Some(g) => g.role_at(d),
+            None => self.display.role_at(d),
+        }
+    }
+
+    pub(crate) fn source_at(&self, d: usize) -> Option<Range<usize>> {
+        match &self.grid {
+            Some(g) => g.source_at(d),
+            None => self.display.source_at(d),
+        }
+    }
+
+    /// Rectangles covering display range `a..b`, for a row drawn at
+    /// `origin`; `width` is the reading column's, from the text's start.
+    pub(crate) fn rects(
+        &self,
+        origin: Point<Pixels>,
+        a: usize,
+        b: usize,
+        to_eol: bool,
+        width: Pixels,
+    ) -> Vec<Bounds<Pixels>> {
+        match &self.grid {
+            Some(g) => g.rects(origin, a, b),
+            None => grid::wrapped_rects(
+                origin + point(self.indent, self.pad_top),
+                &self.shaped,
+                self.line_height,
+                a,
+                b,
+                to_eol,
+                width,
+            ),
+        }
+    }
+
+    /// Where the caret goes a line up or down from `p` without leaving
+    /// the row, if it can.
+    fn step(&self, p: Point<Pixels>, step: i32) -> Option<Pixels> {
+        if let Some(g) = &self.grid {
+            return g.step_y(p, step);
+        }
+        let y = p.y + self.line_height * step as f32;
+        (y >= self.pad_top && y < self.pad_top + self.text_height()).then_some(y)
+    }
+
+    /// The first and last lines' tops, for coming in from above or below.
+    fn first_y(&self) -> Pixels {
+        match &self.grid {
+            Some(g) => g.cells.first().map_or(self.pad_top, |c| c.origin.y),
+            None => self.pad_top,
+        }
+    }
+
+    fn last_y(&self) -> Pixels {
+        match &self.grid {
+            Some(g) => g.last_line_y(),
+            None => self.pad_top + self.text_height() - self.line_height,
+        }
+    }
+
     /// The point of display offset `d`, relative to the line box.
     fn point(&self, d: usize) -> Point<Pixels> {
+        if let Some(g) = &self.grid {
+            return g.point(d);
+        }
         let p = self
             .shaped
             .position_for_index(d, self.line_height)
@@ -76,6 +183,9 @@ impl LineLayout {
 
     /// The display offset nearest `p`, relative to the line box.
     fn index(&self, p: Point<Pixels>) -> usize {
+        if let Some(g) = &self.grid {
+            return g.index(p);
+        }
         let local = point(p.x - self.indent, (p.y - self.pad_top).max(px(0.)));
         match self
             .shaped
@@ -157,6 +267,14 @@ pub struct MarkdownEditor {
     /// The `/` menu: where its slash is, and the highlighted entry.
     slash: Option<usize>,
     slash_ix: usize,
+    /// A table under the pointer, its controls showing.
+    table_hover: Option<table::Hover>,
+    /// A press on one of those controls, until the button comes up.
+    table_drag: Option<table::Drag>,
+    /// Column widths while a border is dragged.
+    table_resize: Option<table::ResizeDrag>,
+    /// A table's right-click menu: the menu, where, and its dismissal.
+    table_menu: Option<(Entity<PopupMenu>, Point<Pixels>, Subscription)>,
 }
 
 impl EventEmitter<EditorEvent> for MarkdownEditor {}
@@ -215,6 +333,10 @@ impl MarkdownEditor {
             find: None,
             slash: None,
             slash_ix: 0,
+            table_hover: None,
+            table_drag: None,
+            table_resize: None,
+            table_menu: None,
         };
         this.rebuild_slots();
         this.recount();
@@ -399,8 +521,21 @@ impl MarkdownEditor {
 
     fn set_selection(&mut self, sel: Selection, cx: &mut Context<Self>) {
         let sel = sel.clamp(self.text.len());
+        // In a grid the caret is always in a cell, never on a pipe.
+        let sel = Selection::new(self.snap_to_cell(sel.anchor), self.snap_to_cell(sel.head));
         if sel != self.sel {
             self.history.seal();
+            if self.mode == Mode::Live {
+                // Live shows the caret cell's markup: those grids re-lay.
+                for pos in [self.sel.head, sel.head] {
+                    let ix = self.row_at(pos);
+                    if let Some(slot) = self.slots.get_mut(ix)
+                        && slot.layout.as_ref().is_some_and(|l| l.grid.is_some())
+                    {
+                        slot.layout = None;
+                    }
+                }
+            }
             let was_in = self.widget_at(self.sel.head);
             self.sel = sel;
             let now_in = self.widget_at(self.sel.head);
@@ -467,6 +602,41 @@ impl MarkdownEditor {
         let content_w = self.content_w.unwrap_or(px(700.));
         let row = self.rows[ix].clone();
         let line = self.syntax.lines[row.lines.start].clone();
+        if let Some(RowWidget::Closed(w)) = row.widget
+            && self.syntax.widgets[w].kind == WidgetKind::Table
+            && let Some(g) = self.layout_grid(w, content_w, Some(self.sel.head), window)
+        {
+            let range = self.row_range(ix);
+            let height = g.row_y.last().copied().unwrap_or_default() + px(grid::BOTTOM);
+            let layout = Rc::new(LineLayout {
+                display: DisplayLine {
+                    segs: vec![display::Seg {
+                        display: 0..0,
+                        source: range.end..range.end,
+                        copy: true,
+                    }],
+                    source: range,
+                    ..Default::default()
+                },
+                shaped: WrappedLine::default(),
+                kind: line.kind,
+                quote: 0,
+                line_height: g.line_height,
+                pad_top: px(0.),
+                indent: px(0.),
+                height: Cell::new(height),
+                text_h: height,
+                widget: None,
+                alert: None,
+                gutter: None,
+                grid: Some(g),
+            });
+            if let Some(slot) = self.slots.get_mut(ix) {
+                slot.height = height;
+                slot.layout = Some(layout.clone());
+            }
+            return layout;
+        }
         if let Some(RowWidget::Closed(_)) = row.widget {
             // Drawn by `widget_element`; no text of its own. The caret never
             // rests inside it: going in opens it.
@@ -494,6 +664,7 @@ impl MarkdownEditor {
                 text_h: px(0.),
                 widget: row.widget,
                 alert: None,
+                grid: None,
             });
             if let Some(slot) = self.slots.get_mut(ix) {
                 slot.layout = Some(layout.clone());
@@ -601,6 +772,7 @@ impl MarkdownEditor {
             text_h: height,
             widget: row.widget,
             alert: line.alert,
+            grid: None,
         });
         if let Some(slot) = self.slots.get_mut(ix) {
             if row.widget.is_none() {
@@ -732,7 +904,7 @@ impl MarkdownEditor {
     fn caret_display(&mut self, window: &mut Window) -> (usize, usize, Rc<LineLayout>) {
         let ix = self.row_at(self.sel.head);
         let layout = self.layout(ix, window);
-        let d = layout.display.to_display(self.sel.head);
+        let d = layout.to_display(self.sel.head);
         (ix, d, layout)
     }
 
@@ -764,24 +936,30 @@ impl MarkdownEditor {
             return self.move_to(pos, false, cx);
         }
         let (ix, d, layout) = self.caret_display(window);
+        // In a table, Left and Right stop at the edges of the cell; Tab is
+        // what moves between cells.
+        if let Some(g) = &layout.grid
+            && !extend
+        {
+            let cell = &g.cells[g.cell_of(d)];
+            if (forward && d >= cell.base + cell.display.text.len()) || (!forward && d <= cell.base)
+            {
+                return;
+            }
+        }
         let pos = if forward {
-            if d < layout.display.text.len() {
-                let next = layout.display.next(d);
+            if d < layout.len() {
                 // Past the last character: the end of the source line, after
                 // any markup closing it.
-                if next == layout.display.text.len() {
-                    self.row_range(ix).end
-                } else {
-                    layout.display.to_source(next)
-                }
+                layout.to_source(layout.next(d))
             } else if ix + 1 < self.rows.len() {
                 let next = self.layout(ix + 1, window);
-                next.display.to_source(0)
+                next.to_source(0)
             } else {
                 self.text.len()
             }
         } else if d > 0 {
-            layout.display.to_source(layout.display.prev(d))
+            layout.to_source(layout.prev(d))
         } else if ix > 0 {
             self.row_range(ix - 1).end
         } else {
@@ -808,8 +986,7 @@ impl MarkdownEditor {
         let mut y = here.y;
         let step = rows.signum();
         for _ in 0..rows.abs() {
-            let next_y = y + layout.line_height * step as f32;
-            if next_y >= layout.pad_top && next_y < layout.pad_top + layout.text_height() {
+            if let Some(next_y) = layout.step(point(x, y), step) {
                 y = next_y;
                 continue;
             }
@@ -822,13 +999,13 @@ impl MarkdownEditor {
             ix = next as usize;
             layout = self.layout(ix, window);
             y = if step > 0 {
-                layout.pad_top
+                layout.first_y()
             } else {
-                layout.pad_top + layout.text_height() - layout.line_height
+                layout.last_y()
             };
         }
         let idx = layout.index(point(x, y));
-        let pos = layout.display.to_source(idx);
+        let pos = layout.to_source(idx);
         let goal = self.goal_x;
         self.move_to(pos, extend, cx);
         self.goal_x = goal;
@@ -839,6 +1016,10 @@ impl MarkdownEditor {
     fn line_edge(&mut self, end: bool, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.goal_x = None;
         let (ix, d, layout) = self.caret_display(window);
+        if let Some(g) = &layout.grid {
+            let pos = layout.to_source(g.line_edge(d, end));
+            return self.move_to(pos, extend, cx);
+        }
         let y = layout.point(d).y;
         let range = self.row_range(ix);
         let pos = if end {
@@ -982,6 +1163,16 @@ impl MarkdownEditor {
 
     fn replace_selection(&mut self, s: &str, kind: Kind, cx: &mut Context<Self>) {
         let r = self.sel.range();
+        if let Some((edits, at)) = self.table_safe_edits(r.clone(), s) {
+            return self.apply(
+                Change {
+                    edits,
+                    selection: Selection::caret(at),
+                },
+                kind,
+                cx,
+            );
+        }
         let at = r.start + s.len();
         self.apply(
             Change {
@@ -996,6 +1187,16 @@ impl MarkdownEditor {
     fn delete_range(&mut self, r: Range<usize>, cx: &mut Context<Self>) {
         if r.is_empty() {
             return;
+        }
+        if let Some((edits, at)) = self.table_safe_edits(r.clone(), "") {
+            return self.apply(
+                Change {
+                    edits,
+                    selection: Selection::caret(at),
+                },
+                Kind::Typing,
+                cx,
+            );
         }
         let at = r.start;
         self.apply(
@@ -1013,25 +1214,32 @@ impl MarkdownEditor {
             return self.delete_range(self.sel.range(), cx);
         }
         if self.rich()
+            && self.grid_widget(self.sel.head).is_none()
             && let Some(c) = edit::backspace_prefix(&self.text, self.sel)
         {
             return self.apply(c, Kind::Other, cx);
         }
         let caret = self.sel.head;
         let (ix, d, layout) = self.caret_display(window);
+        // A cell keeps its place: Backspace at its start does nothing.
+        if let Some(g) = &layout.grid
+            && d <= g.cells[g.cell_of(d)].base
+        {
+            return;
+        }
         let range = if d == 0 {
             if ix == 0 {
                 return;
             }
             self.row_range(ix - 1).end..caret
         } else {
-            let prev = layout.display.prev(d);
-            match layout.display.role_at(prev) {
+            let prev = layout.prev(d);
+            match layout.role_at(prev) {
                 Role::Bullet | Role::TaskOpen | Role::TaskDone => {
-                    layout.display.source_at(prev).unwrap_or(caret..caret)
+                    layout.source_at(prev).unwrap_or(caret..caret)
                 }
                 _ => {
-                    let s = layout.display.to_source(prev);
+                    let s = layout.to_source(prev);
                     s..buffer::next_char(&self.text, s).min(caret.max(s + 1))
                 }
             }
@@ -1045,11 +1253,18 @@ impl MarkdownEditor {
         }
         let caret = self.sel.head;
         let (ix, d, layout) = self.caret_display(window);
-        let range = if d >= layout.display.text.len() {
+        // Nor Delete at its end.
+        if let Some(g) = &layout.grid {
+            let cell = &g.cells[g.cell_of(d)];
+            if d >= cell.base + cell.display.text.len() {
+                return;
+            }
+        }
+        let range = if d >= layout.len() {
             let end = self.row_range(ix).end;
             caret..(end + 1).min(self.text.len()).max(caret)
         } else {
-            let s = layout.display.to_source(d);
+            let s = layout.to_source(d);
             s..buffer::next_char(&self.text, s)
         };
         let range = range.start.min(caret)..range.end;
@@ -1058,7 +1273,11 @@ impl MarkdownEditor {
 
     fn delete_word_left(&mut self, _: &DeleteWordLeft, _: &mut Window, cx: &mut Context<Self>) {
         let r = if self.sel.is_empty() {
-            buffer::prev_word(&self.text, self.sel.head)..self.sel.head
+            let mut from = buffer::prev_word(&self.text, self.sel.head);
+            if let Some(cell) = self.cell_range(self.sel.head) {
+                from = from.max(cell.start);
+            }
+            from..self.sel.head
         } else {
             self.sel.range()
         };
@@ -1067,7 +1286,11 @@ impl MarkdownEditor {
 
     fn delete_word_right(&mut self, _: &DeleteWordRight, _: &mut Window, cx: &mut Context<Self>) {
         let r = if self.sel.is_empty() {
-            self.sel.head..buffer::next_word(&self.text, self.sel.head)
+            let mut to = buffer::next_word(&self.text, self.sel.head);
+            if let Some(cell) = self.cell_range(self.sel.head) {
+                to = to.min(cell.end);
+            }
+            self.sel.head..to
         } else {
             self.sel.range()
         };
@@ -1079,7 +1302,7 @@ impl MarkdownEditor {
     }
 
     fn newline(&mut self, _: &Newline, _: &mut Window, cx: &mut Context<Self>) {
-        if self.slash_pick(cx) || self.table_key(widgets::TableKey::Down, cx) {
+        if self.slash_pick(cx) || self.table_key(table::TableKey::Down, cx) {
             return;
         }
         let in_code = matches!(self.caret_kind(), LineKind::Code | LineKind::FenceOpen);
@@ -1088,12 +1311,15 @@ impl MarkdownEditor {
     }
 
     fn soft_break(&mut self, _: &SoftBreak, _: &mut Window, cx: &mut Context<Self>) {
+        if self.grid_widget(self.sel.head).is_some() {
+            return;
+        }
         let c = edit::soft_break(&self.text, self.sel);
         self.apply(c, Kind::Other, cx);
     }
 
     fn indent(&mut self, _: &Indent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.slash_pick(cx) || self.table_key(widgets::TableKey::Next, cx) {
+        if self.slash_pick(cx) || self.table_key(table::TableKey::Next, cx) {
             return;
         }
         match edit::indent(&self.text, self.sel) {
@@ -1106,7 +1332,7 @@ impl MarkdownEditor {
     }
 
     fn outdent(&mut self, _: &Outdent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.table_key(widgets::TableKey::Prev, cx) {
+        if self.table_key(table::TableKey::Prev, cx) {
             return;
         }
         if let Some(c) = edit::outdent(&self.text, self.sel) {
@@ -1165,7 +1391,19 @@ impl MarkdownEditor {
         }
     }
 
+    /// Block commands make no sense in a table cell, and inline ones only
+    /// within one cell.
+    fn blocked_in_table(&self, inline: bool) -> bool {
+        let Some(cell) = self.cell_range(self.sel.head) else {
+            return self.grid_widget(self.sel.head).is_some();
+        };
+        !inline || !(cell.start <= self.sel.start() && self.sel.end() <= cell.end)
+    }
+
     fn inline(&mut self, marker: &str, cx: &mut Context<Self>) {
+        if self.blocked_in_table(true) {
+            return;
+        }
         let c = edit::toggle_inline(&self.text, self.sel, marker);
         self.apply(c, Kind::Other, cx);
     }
@@ -1184,15 +1422,24 @@ impl MarkdownEditor {
     }
 
     fn heading(&mut self, a: &Heading, _: &mut Window, cx: &mut Context<Self>) {
+        if self.blocked_in_table(false) {
+            return;
+        }
         let c = edit::set_heading(&self.text, self.sel, a.level);
         self.apply(c, Kind::Other, cx);
     }
     fn paragraph(&mut self, _: &Paragraph, _: &mut Window, cx: &mut Context<Self>) {
+        if self.blocked_in_table(false) {
+            return;
+        }
         let c = edit::set_heading(&self.text, self.sel, 0);
         self.apply(c, Kind::Other, cx);
     }
 
     fn block(&mut self, b: edit::Block, cx: &mut Context<Self>) {
+        if self.blocked_in_table(false) {
+            return;
+        }
         let c = edit::toggle_block(&self.text, self.sel, b);
         self.apply(c, Kind::Other, cx);
     }
@@ -1210,6 +1457,9 @@ impl MarkdownEditor {
     }
 
     fn insert_block(&mut self, block: &str, caret: usize, cx: &mut Context<Self>) {
+        if self.blocked_in_table(false) {
+            return;
+        }
         let c = edit::insert_block(&self.text, self.sel, block, caret);
         self.apply(c, Kind::Other, cx);
     }
@@ -1275,7 +1525,7 @@ impl MarkdownEditor {
     fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
         if self.slash.take().is_some() {
             cx.notify();
-        } else if self.table_key(widgets::TableKey::Leave, cx) {
+        } else if self.table_key(table::TableKey::Leave, cx) {
         } else if self.find.is_some() {
             self.find = None;
             cx.emit(EditorEvent::Moved);
@@ -1380,7 +1630,7 @@ impl MarkdownEditor {
                 return Some((*ix, layout.index(local), layout.clone()));
             }
         }
-        Some((last.0, last.2.display.text.len(), last.2.clone()))
+        Some((last.0, last.2.len(), last.2.clone()))
     }
 
     /// The task box at `p`, in a list line's margin.
@@ -1410,6 +1660,10 @@ impl MarkdownEditor {
         cx: &mut Context<Self>,
     ) {
         self.focus.focus(window, cx);
+        // A table's controls take the press before the text does.
+        if self.table_press(e.position, cx) {
+            return;
+        }
         if self.rich()
             && e.click_count == 1
             && let Some(src) = self.task_at(e.position)
@@ -1428,11 +1682,7 @@ impl MarkdownEditor {
         let Some((ix, d, layout)) = self.hit(e.position) else {
             return;
         };
-        let pos = if d >= layout.display.text.len() {
-            self.row_range(ix).end
-        } else {
-            layout.display.to_source(d)
-        };
+        let pos = layout.to_source(d);
         // A link opens with Ctrl/Cmd held.
         if self.rich()
             && e.click_count == 1
@@ -1452,11 +1702,14 @@ impl MarkdownEditor {
                 let w = buffer::word_at(&self.text, pos);
                 (Grain::Word, Selection::new(w.start, w.end))
             }
-            _ => {
-                let l = &self.row_range(ix);
-                let end = (l.end + 1).min(self.text.len());
-                (Grain::Line, Selection::new(l.start, end))
-            }
+            _ => match self.cell_range(pos) {
+                Some(cell) => (Grain::Line, Selection::new(cell.start, cell.end)),
+                None => {
+                    let l = &self.row_range(ix);
+                    let end = (l.end + 1).min(self.text.len());
+                    (Grain::Line, Selection::new(l.start, end))
+                }
+            },
         };
         self.selecting = Some((grain, sel));
         self.set_selection(sel, cx);
@@ -1469,11 +1722,7 @@ impl MarkdownEditor {
         let Some((ix, d, layout)) = self.hit(p) else {
             return;
         };
-        let pos = if d >= layout.display.text.len() {
-            self.row_range(ix).end
-        } else {
-            layout.display.to_source(d)
-        };
+        let pos = layout.to_source(d);
         let sel = match grain {
             Grain::Char => Selection::new(origin.anchor, pos),
             Grain::Word => {
@@ -1561,10 +1810,12 @@ impl EntityInputHandler for MarkdownEditor {
             .or(self.marked.clone())
             .unwrap_or(self.sel.range());
         self.marked = None;
-        let at = r.start + text.len();
+        let (edits, at) = self
+            .table_safe_edits(r.clone(), text)
+            .unwrap_or_else(|| (vec![Edit::replace(r.clone(), text)], r.start + text.len()));
         self.apply(
             Change {
-                edits: vec![Edit::replace(r, text)],
+                edits,
                 selection: Selection::caret(at),
             },
             Kind::Typing,
@@ -1615,7 +1866,7 @@ impl EntityInputHandler for MarkdownEditor {
         let ix = self.row_at(pos);
         let (_, origin, layout) = self.geometry.lines.iter().find(|(i, ..)| *i == ix)?.clone();
         let _ = window;
-        let p = layout.point(layout.display.to_display(pos));
+        let p = layout.point(layout.to_display(pos));
         Some(Bounds::new(origin + p, size(px(2.), layout.line_height)))
     }
 
@@ -1626,10 +1877,7 @@ impl EntityInputHandler for MarkdownEditor {
         _: &mut Context<Self>,
     ) -> Option<usize> {
         let (_, d, layout) = self.hit(p)?;
-        Some(buffer::utf16_offset(
-            &self.text,
-            layout.display.to_source(d),
-        ))
+        Some(buffer::utf16_offset(&self.text, layout.to_source(d)))
     }
 }
 
@@ -1701,6 +1949,15 @@ impl Render for MarkdownEditor {
             .cursor(CursorStyle::IBeam)
             .child(EditorElement::new(cx.entity()))
             .children(overlay)
+            .children(self.table_menu.as_ref().map(|(menu, at, _)| {
+                deferred(
+                    anchored()
+                        .position(*at)
+                        .snap_to_window_with_margin(px(8.))
+                        .child(menu.clone()),
+                )
+                .with_priority(2)
+            }))
     }
 }
 

@@ -82,7 +82,8 @@ impl MarkdownEditor {
     /// After every edit or move: open the menu on a freshly typed `/` that
     /// starts a line, keep it while a word follows it, close it otherwise.
     pub(crate) fn update_slash(&mut self, typed: Option<&str>) {
-        if !self.rich() || !self.sel.is_empty() {
+        // Blocks can't go in a table cell.
+        if !self.rich() || !self.sel.is_empty() || self.grid_widget(self.sel.head).is_some() {
             self.slash = None;
             return;
         }
@@ -134,7 +135,7 @@ impl MarkdownEditor {
     pub(crate) fn screen_point(&self, pos: usize) -> Option<(Point<Pixels>, Pixels)> {
         let ix = self.row_at(pos);
         let (_, origin, l) = self.geometry.lines.iter().find(|(i, ..)| *i == ix)?;
-        Some((*origin + l.point(l.display.to_display(pos)), l.line_height))
+        Some((*origin + l.point(l.to_display(pos)), l.line_height))
     }
 
     pub(crate) fn render_overlays(

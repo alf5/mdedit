@@ -212,3 +212,30 @@ Arch, Wayland, RADV Vulkan). Kept here so later milestones don't relearn them.
     would list the app twice in menus.
   - **Binary size:** the stripped release binary is 73 MB, or 45 MB without
     the `pdf` feature, so Typst is 28 MB of it. The .deb is 31 MB.
+
+## Tables as grids (after M6)
+
+- **Back to v1's model.** Alfred asked for v1's table editing back, so a
+  table is never opened as source in the rendered modes. It is edited in its
+  grid (`editor/grid.rs`, `editor/table.rs`).
+- **One row, many cells.** The grid is one editor row whose `LineLayout`
+  carries a `Grid`. Each cell has its own `DisplayLine` (from
+  `display::fragment`, mapped into document offsets) and its own
+  `WrappedLine`.
+  - **Display offsets:** cell after cell, with one spare offset between
+    cells, so every offset is in exactly one cell.
+  - **Lookups:** `LineLayout::to_display`, `to_source`, `point` and `index`
+    hand off to the grid, which is why callers use those methods and not
+    `layout.display` directly.
+- **Cells keep their place.**
+  - The caret snaps out of pipes and the delimiter row (`snap_to_cell`).
+  - Backspace and Delete stop at a cell's edges.
+  - Typing escapes `|`, and an edit across cells only empties them
+    (`table_safe_edits`).
+  - Block commands do nothing in a cell.
+- **Controls:** custom-painted quads, with hitboxes for the pointer shapes.
+  The editor keeps the hover, drag and resize-preview state. A resize pins
+  every column at its drawn width, then writes all of them into
+  `zen:cols` on release, as one undo step.
+- **Column widths** come from each cell's text shaped unwrapped (so markup
+  doesn't count), then saved widths, then scaling down to fit.

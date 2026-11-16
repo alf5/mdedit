@@ -229,19 +229,25 @@ impl MarkdownEditor {
                 }
             }
             WidgetKind::Image { url, alt } => {
+                let remote_waiting;
                 let source: Option<ImageSource> =
-                    if url.starts_with("http://") || url.starts_with("https://") {
-                        Some(SharedUri::from(url.clone()).into())
-                    } else if url.contains("://") || url.starts_with("data:") {
-                        None
-                    } else {
-                        let decoded = url.replace("%20", " ");
-                        let path = PathBuf::from(&decoded);
-                        let path = match (&self.base_dir, path.is_absolute()) {
-                            (Some(dir), false) => dir.join(path),
-                            _ => path,
-                        };
-                        Some(path.into())
+                    match os::resolve_image(&url, self.base_dir.as_deref()) {
+                        os::ImageRef::Local(path) => {
+                            remote_waiting = false;
+                            Some(path.into())
+                        }
+                        os::ImageRef::Remote(u) if self.allow_remote => {
+                            remote_waiting = false;
+                            Some(SharedUri::from(u).into())
+                        }
+                        os::ImageRef::Remote(_) => {
+                            remote_waiting = true;
+                            None
+                        }
+                        os::ImageRef::Refused => {
+                            remote_waiting = false;
+                            None
+                        }
                     };
                 let line = self.syntax.widgets[w].lines.start;
                 let start = self.syntax.lines[line].range.start;
@@ -261,7 +267,11 @@ impl MarkdownEditor {
                             .bg(c.code_bg)
                             .text_color(c.muted)
                             .text_sm()
-                            .child(format!("🖼 {alt}"))
+                            .child(if remote_waiting {
+                                format!("🖼 {alt} — click to load images from the web")
+                            } else {
+                                format!("🖼 {alt}")
+                            })
                             .into_any_element()
                     }
                 };
@@ -271,7 +281,15 @@ impl MarkdownEditor {
                     .cursor_pointer()
                     .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                         editor
-                            .update(cx, |e, cx| e.reveal_offset(start, window, cx))
+                            .update(cx, |e, cx| {
+                                if remote_waiting {
+                                    // Asked for: this document's web images load.
+                                    e.allow_remote = true;
+                                    cx.notify();
+                                } else {
+                                    e.reveal_offset(start, window, cx);
+                                }
+                            })
                             .ok();
                     })
                     .child(match source {

@@ -134,6 +134,9 @@ pub struct MarkdownEditor {
     base_dir: Option<PathBuf>,
     /// Drawn diagrams and formulas, by source and look.
     pictures: HashMap<u64, widgets::Picture>,
+    /// Images from the web load only once asked for, per document: fetching
+    /// one tells its server the document was opened.
+    pub(crate) allow_remote: bool,
     slots: Vec<Slot>,
     content_w: Option<Pixels>,
     scroll_y: Pixels,
@@ -187,6 +190,7 @@ impl MarkdownEditor {
             rows: Vec::new(),
             base_dir: None,
             pictures: HashMap::new(),
+            allow_remote: false,
             slots: Vec::new(),
             content_w: None,
             scroll_y: px(0.),

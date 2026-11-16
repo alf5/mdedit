@@ -50,8 +50,117 @@ pub fn open_in_file_manager(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Where an image in a document comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImageRef {
+    /// A file on this machine.
+    Local(PathBuf),
+    /// An `http(s)` URL: fetching it tells its server the document was
+    /// opened, so it waits until asked.
+    Remote(String),
+    /// Not loaded at all: network shares (on Windows, touching one sends
+    /// the user's credentials to its host) and other schemes.
+    Refused,
+}
+
+/// Decide where image `url` in a document whose folder is `base` comes from.
+pub fn resolve_image(url: &str, base: Option<&Path>) -> ImageRef {
+    let url = url.trim();
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return ImageRef::Remote(url.to_string());
+    }
+    if url.contains("://") || lower.starts_with("data:") || lower.starts_with("file:") {
+        return ImageRef::Refused;
+    }
+    // `\\host\share`, `//host/share`, `\\?\UNC\…`: network paths.
+    if url.starts_with("\\\\")
+        || url.starts_with("//")
+        || url.starts_with("\\/")
+        || url.starts_with("/\\")
+    {
+        return ImageRef::Refused;
+    }
+    let decoded = percent_decode(url);
+    let path = PathBuf::from(&decoded);
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        if let Some(Component::Prefix(p)) = path.components().next()
+            && matches!(
+                p.kind(),
+                Prefix::UNC(..)
+                    | Prefix::VerbatimUNC(..)
+                    | Prefix::DeviceNS(..)
+                    | Prefix::Verbatim(..)
+            )
+        {
+            return ImageRef::Refused;
+        }
+    }
+    if path.is_absolute() {
+        return ImageRef::Local(path);
+    }
+    match base {
+        Some(dir) => ImageRef::Local(dir.join(path)),
+        None => ImageRef::Refused,
+    }
+}
+
+/// `%20` and friends.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && let Some(v) = s
+                .get(i + 1..i + 3)
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn images_resolve_locally_and_refuse_network_paths() {
+        let base = Path::new("/docs/notes");
+        assert_eq!(
+            resolve_image("img/a b.png", Some(base)),
+            ImageRef::Local(PathBuf::from("/docs/notes/img/a b.png"))
+        );
+        assert_eq!(
+            resolve_image("img/a%20b.png", Some(base)),
+            ImageRef::Local(PathBuf::from("/docs/notes/img/a b.png"))
+        );
+        assert_eq!(
+            resolve_image("../shared/x.png", Some(base)),
+            ImageRef::Local(PathBuf::from("/docs/notes/../shared/x.png"))
+        );
+        assert_eq!(
+            resolve_image("https://x.y/i.png", Some(base)),
+            ImageRef::Remote("https://x.y/i.png".into())
+        );
+        for bad in [
+            r"\\host\share\x.png",
+            "//host/share/x.png",
+            "file:///etc/x.png",
+            "data:image/png;base64,AAAA",
+            "smb://host/x.png",
+        ] {
+            assert_eq!(resolve_image(bad, Some(base)), ImageRef::Refused, "{bad}");
+        }
+        assert_eq!(resolve_image("x.png", None), ImageRef::Refused);
+    }
+
     use super::*;
 
     #[test]

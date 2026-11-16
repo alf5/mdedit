@@ -96,6 +96,12 @@ pub struct Palette {
     pub border: Rgba,
     pub text: Rgba,
     pub text_muted: Rgba,
+    /// ZenNotes' fg-2, grey-0 and accent-soft: quotes and comments, faint
+    /// edges, list numbers and markup shown at the caret.
+    pub text_soft: Rgba,
+    pub text_faint: Rgba,
+    pub accent_soft: Rgba,
+    pub aqua: Rgba,
     pub accent: Rgba,
     pub accent_text: Rgba,
     pub code_bg: Rgba,
@@ -167,6 +173,14 @@ fn palette_from(decls: &HashMap<&str, &str>, base: Option<&Palette>) -> Option<P
         border: get("--border", base.map(|b| b.border))?,
         text: get("--text", base.map(|b| b.text))?,
         text_muted: get("--text-muted", base.map(|b| b.text_muted))?,
+        // document.css's own palette has none of these: the nearest it has.
+        text_soft: get("--text-soft", base.map(|b| b.text_soft))
+            .or_else(|| get("--text-muted", None))?,
+        text_faint: get("--text-faint", base.map(|b| b.text_faint))
+            .or_else(|| get("--text-muted", None))?,
+        accent_soft: get("--accent-soft", base.map(|b| b.accent_soft))
+            .or_else(|| get("--accent", None))?,
+        aqua: get("--aqua", base.map(|b| b.aqua)).or(Some(alerts[1]))?,
         accent: get("--accent", base.map(|b| b.accent))?,
         accent_text: get("--accent-text", base.map(|b| b.accent_text))?,
         code_bg: get("--code-bg", base.map(|b| b.code_bg))?,

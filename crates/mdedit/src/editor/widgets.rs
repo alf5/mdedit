@@ -43,27 +43,28 @@ fn hash_of(parts: &[&dyn Fn(&mut std::collections::hash_map::DefaultHasher)]) ->
     h.finish()
 }
 
-/// A palette's colours as a diagram's.
+/// A palette's colours as a diagram's, as ZenNotes draws them: shapes on its
+/// bg-2 edged in bg-3, lines in grey-1, and its series of accents.
 pub(crate) fn diagram_colors(p: &mdedit_core::themes::Palette) -> Colors {
     Colors {
         bg: p.bg,
         fg: p.text,
         muted: p.text_muted,
-        line: p.text,
-        surface: p.bg_soft,
-        surface_alt: p.diagram_surface_alt,
-        border: p.diagram_border,
+        line: p.text_muted,
+        surface: p.diagram_surface_alt,
+        surface_alt: p.bg_soft,
+        border: p.border,
         accent: p.accent,
         critical: p.danger,
         series: [
             p.accent,
-            p.alert_tip,
-            p.alert_warning,
-            p.alert_important,
-            p.alert_caution,
             p.alert_note,
-            p.text_muted,
-            p.diagram_border,
+            p.alert_tip,
+            p.alert_important,
+            p.alert_warning,
+            p.alert_caution,
+            p.aqua,
+            p.text,
         ],
     }
 }
@@ -87,11 +88,10 @@ impl MarkdownEditor {
     }
 
     fn picture(&mut self, body: &str, diagram: bool) -> Picture {
-        let c = &self.style.colors;
         let key = hash_of(&[
             &|h| body.hash(h),
             &|h| diagram.hash(h),
-            &|h| format!("{:?}{:?}", c.text, c.code_bg).hash(h),
+            &|h| format!("{:?}", self.style.palette).hash(h),
             &|h| self.style.size.to_bits().hash(h),
         ]);
         if let Some(p) = self.pictures.get(&key) {
@@ -169,16 +169,41 @@ impl MarkdownEditor {
                         .ok();
                 };
                 match self.picture(&src, diagram) {
-                    Ok((image, w_px, h_px)) => {
+                    Ok((image, w_px, h_px)) if diagram => {
                         let scale = (f32::from(width) / w_px).min(1.0);
                         div()
                             .w(width)
                             .flex()
                             .justify_center()
-                            .py(px(10.))
+                            .py(px(self.style.size * 0.5))
                             .cursor_pointer()
                             .on_mouse_down(MouseButton::Left, open)
                             .child(img(image).w(px(w_px * scale)).h(px(h_px * scale)))
+                            .into_any_element()
+                    }
+                    // A formula on a card of its own, as ZenNotes sets it.
+                    Ok((image, w_px, h_px)) => {
+                        let em = self.style.size;
+                        let inner = f32::from(width) - em * 2.2 - 2.;
+                        let scale = (inner / w_px).min(1.0);
+                        div()
+                            .w(width)
+                            .py(px(em * 0.5))
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, open)
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .justify_center()
+                                    .px(px(em * 1.1))
+                                    .py(px(em * 0.9))
+                                    .rounded(px(12.))
+                                    .border_1()
+                                    .border_color(c.surface_alt.opacity(0.7))
+                                    .bg(c.bg.blend(c.surface.opacity(0.7)))
+                                    .child(img(image).w(px(w_px * scale)).h(px(h_px * scale))),
+                            )
                             .into_any_element()
                     }
                     Err(e) => div()
@@ -250,6 +275,8 @@ impl MarkdownEditor {
                 };
                 div()
                     .w(width)
+                    .flex()
+                    .items_start()
                     .py(px(8.))
                     .cursor_pointer()
                     .on_mouse_down(MouseButton::Left, move |_, window, cx| {
@@ -266,11 +293,21 @@ impl MarkdownEditor {
                             .ok();
                     })
                     .child(match source {
-                        Some(s) => img(s)
-                            .max_w(width)
-                            .max_h(px(560.))
-                            .object_fit(ObjectFit::ScaleDown)
-                            .with_fallback(placeholder)
+                        // In a rounded frame, as ZenNotes shows an image.
+                        Some(s) => div()
+                            .flex()
+                            .rounded(px(14.))
+                            .border_1()
+                            .border_color(c.surface_alt)
+                            .bg(c.bg.opacity(0.94))
+                            .child(
+                                img(s)
+                                    .max_w(width - px(2.))
+                                    .max_h(px(560.))
+                                    .rounded(px(13.))
+                                    .object_fit(ObjectFit::ScaleDown)
+                                    .with_fallback(placeholder),
+                            )
                             .into_any_element(),
                         None => placeholder(),
                     })

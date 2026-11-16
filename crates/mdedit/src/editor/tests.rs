@@ -520,3 +520,70 @@ fn shift_enter_breaks_a_line_in_a_cell(cx: &mut TestAppContext) {
     keys(cx, h, &["shift-enter"]);
     assert!(!text(cx, &ed).contains("<br>"));
 }
+
+#[gpui_kit::test]
+fn frontmatter_callouts_and_code_sit_on_cards(cx: &mut TestAppContext) {
+    use super::Card;
+    use mdedit_core::syntax::Alert;
+    let doc = "---\ntitle: A\n---\n\n> [!NOTE]\n> body\n\n```rust\nlet x = 1;\n```\n";
+    let (_, ed) = open(cx, doc, Mode::Rendered);
+    let cards: Vec<_> = ed.read_with(cx, |e, _| {
+        e.geometry
+            .lines
+            .iter()
+            .map(|(_, _, l)| {
+                (
+                    l.card.map(|k| (k.card, k.first, k.last)),
+                    l.display.text.clone(),
+                )
+            })
+            .collect()
+    });
+    // The frontmatter: its fences hidden, as the card's top and bottom.
+    assert_eq!(cards[0], (Some((Card::Meta, true, false)), String::new()));
+    assert_eq!(cards[1].0, Some((Card::Meta, false, false)));
+    assert_eq!(cards[2], (Some((Card::Meta, false, true)), String::new()));
+    assert_eq!(cards[3].0, None);
+    // The callout: its title, then its body.
+    assert_eq!(
+        cards[4],
+        (
+            Some((Card::Callout(Alert::Note), true, false)),
+            "Note".into()
+        )
+    );
+    assert_eq!(cards[5].0, Some((Card::Callout(Alert::Note), false, true)));
+    // The code block: its language as the header.
+    assert_eq!(cards[7], (Some((Card::Code, true, false)), "rust".into()));
+    assert_eq!(cards[9].0, Some((Card::Code, false, true)));
+}
+
+#[gpui_kit::test]
+fn the_copy_button_copies_its_code_block(cx: &mut TestAppContext) {
+    let doc = "Text\n\n```sh\necho one\necho two\n```\n";
+    let (h, ed) = open(cx, doc, Mode::Rendered);
+    let at = ed.read_with(cx, |e, _| {
+        let (_, origin, l) = e
+            .geometry
+            .lines
+            .iter()
+            .find(|(_, _, l)| l.kind == mdedit_core::syntax::LineKind::FenceOpen)
+            .cloned()
+            .unwrap();
+        let w = e.content_w.unwrap();
+        gpui_kit::point(origin.x + w - px(18.), origin.y + l.height.get() / 2.)
+    });
+    cx.update_window(h, |_, window, cx| {
+        window.render_frame(cx);
+        window.pointer_move(at, None, cx);
+        window.render_frame(cx);
+        window.pointer_down(at, gpui_kit::MouseButton::Left, cx);
+        window.pointer_up(at, gpui_kit::MouseButton::Left, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let copied = cx.read_from_clipboard().and_then(|c| c.text());
+    assert_eq!(copied.as_deref(), Some("echo one\necho two"));
+    // The document is as it was, and the caret didn't move into the block.
+    assert_eq!(text(cx, &ed), doc);
+}

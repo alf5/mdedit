@@ -26,7 +26,14 @@ pub enum Role {
     Alert,
     /// A `<br>` in a table cell, drawn as a line break.
     Break,
+    /// A hidden code span's backticks, drawn as a thin space ([`PAD`]) that
+    /// pads its chip.
+    Pad,
 }
+
+/// What a hidden inline code span's backticks are drawn as: a thin space,
+/// so the chip behind the code has room on either side of it.
+pub const PAD: &str = "\u{2009}";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Run {
@@ -147,9 +154,10 @@ impl DisplayLine {
         self.source.end
     }
 
-    /// A `<br>` drawn as a newline.
+    /// A `<br>` drawn as a newline, or a code span's padding: the caret
+    /// before it is before its source, and after it, after.
     fn is_break(&self, seg: &Seg) -> bool {
-        !seg.copy && self.text.get(seg.display.clone()) == Some("\n")
+        !seg.copy && matches!(self.text.get(seg.display.clone()), Some("\n" | PAD))
     }
 
     /// The previous and next display character boundaries.
@@ -281,6 +289,7 @@ pub fn display_line(text: &str, syntax: &Syntax, ix: usize, reveal: Reveal) -> D
             MarkupKind::Number => out.push(src, r.clone(), true, 0, Role::Number),
             MarkupKind::Bullet => out.push("", r.clone(), false, 0, Role::Text),
             MarkupKind::Alert(a) => out.push(a.title(), r.clone(), false, style::BOLD, Role::Alert),
+            MarkupKind::CodeTick => out.push(PAD, r.clone(), false, style::CODE, Role::Pad),
             MarkupKind::TaskBox(done) => {
                 out.push("", r.clone(), false, 0, Role::Text);
                 out.gutter = Some(Gutter::Task {
@@ -561,7 +570,7 @@ pub fn has(style: u16, flags: u16) -> bool {
     style & flags != 0
 }
 
-pub use style::{BOLD, CODE, IMAGE, ITALIC, LINK, MATH, STRIKE};
+pub use style::{BOLD, CODE, IMAGE, ITALIC, KEY, LINK, MATH, STRIKE};
 
 #[cfg(test)]
 mod tests {
@@ -573,6 +582,27 @@ mod tests {
         (0..s.lines.len())
             .map(|i| display_line(text, &s, i, reveal).text)
             .collect()
+    }
+
+    #[test]
+    fn a_code_span_is_padded_and_the_caret_keeps_to_its_side() {
+        let t = "a `b` c";
+        let s = parse(t);
+        let d = display_line(t, &s, 0, Reveal::Hide);
+        assert_eq!(d.text, format!("a {PAD}b{PAD} c"));
+        let pad = PAD.len();
+        // Before the opening tick: outside the chip; after it, in.
+        assert_eq!(d.to_display(2), 2);
+        assert_eq!(d.to_display(3), 2 + pad);
+        assert_eq!(d.to_display(4), 3 + pad);
+        assert_eq!(d.to_display(5), 3 + 2 * pad);
+        assert_eq!(d.to_source(2), 2);
+        assert_eq!(d.to_source(2 + pad), 3);
+        assert_eq!(d.to_source(3 + pad), 4);
+        assert_eq!(d.to_source(3 + 2 * pad), 5);
+        assert_eq!(d.next(2), 2 + pad);
+        // Shown, the backticks are themselves.
+        assert_eq!(show(t, Reveal::Show), ["a `b` c"]);
     }
 
     #[test]

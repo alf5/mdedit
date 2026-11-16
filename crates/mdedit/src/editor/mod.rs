@@ -46,6 +46,36 @@ pub enum EditorEvent {
     Moved,
 }
 
+/// A block drawn on a card, a rounded box behind its rows, in the rendered
+/// modes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Card {
+    /// A fenced code block.
+    Code,
+    /// The frontmatter's properties.
+    Meta,
+    /// A `> [!NOTE]` alert.
+    Callout(syntax::Alert),
+}
+
+/// A row's place on its card: which card, and whether the row is the
+/// card's first and last.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OnCard {
+    pub card: Card,
+    pub first: bool,
+    pub last: bool,
+}
+
+/// How far a card's text sits in from its edges.
+pub(crate) const CARD_PAD_X: f32 = 14.;
+pub(crate) const CARD_PAD_Y: f32 = 8.;
+/// A code block's text sits further in, as ZenNotes has it.
+pub(crate) const CODE_PAD_X: f32 = 16.;
+/// From a code block's right edge to its language label's: the copy button
+/// and the gaps round it.
+pub(crate) const CODE_HEADER_RIGHT: f32 = 38.;
+
 /// One line, shaped for the current width and mode.
 pub(crate) struct LineLayout {
     pub display: DisplayLine,
@@ -67,6 +97,11 @@ pub(crate) struct LineLayout {
     pub gutter: Option<ShapedLine>,
     /// A table, drawn and edited as a grid; the text fields are unused.
     pub grid: Option<grid::Grid>,
+    pub card: Option<OnCard>,
+    /// Where its card's left edge is, from the left of the reading column.
+    pub card_x: Pixels,
+    /// How deep in lists it's drawn, for the guides.
+    pub list: u8,
 }
 
 impl LineLayout {
@@ -247,6 +282,8 @@ pub struct MarkdownEditor {
     pictures: HashMap<u64, widgets::Picture>,
     /// Highlighted code blocks, by content and language.
     code_colors: HashMap<u64, Rc<Vec<highlight::Span>>>,
+    /// The palette's highlighting theme.
+    code_theme: Rc<syntect::highlighting::Theme>,
     /// Images from the web load only once asked for, per document: fetching
     /// one tells its server the document was opened.
     pub(crate) allow_remote: bool,
@@ -275,6 +312,8 @@ pub struct MarkdownEditor {
     table_resize: Option<table::ResizeDrag>,
     /// A table's right-click menu: the menu, where, and its dismissal.
     table_menu: Option<(Entity<PopupMenu>, Point<Pixels>, Subscription)>,
+    /// The code block (its header row) just copied, its button lit a moment.
+    copied: Option<usize>,
 }
 
 impl EventEmitter<EditorEvent> for MarkdownEditor {}
@@ -305,6 +344,7 @@ fn min(a: Pixels, b: Pixels) -> Pixels {
 impl MarkdownEditor {
     pub fn new(text: String, mode: Mode, style: DocStyle, cx: &mut Context<Self>) -> Self {
         let syntax = syntax::parse(&text);
+        let code_theme = Rc::new(highlight::theme(&style.palette));
         let mut this = MarkdownEditor {
             text,
             syntax,
@@ -318,6 +358,7 @@ impl MarkdownEditor {
             base_dir: None,
             pictures: HashMap::new(),
             code_colors: HashMap::new(),
+            code_theme,
             allow_remote: crate::state::AppState::try_prefs(cx).is_some_and(|p| p.remote_images),
             slots: Vec::new(),
             content_w: None,
@@ -337,6 +378,7 @@ impl MarkdownEditor {
             table_drag: None,
             table_resize: None,
             table_menu: None,
+            copied: None,
         };
         this.rebuild_slots();
         this.recount();
@@ -392,6 +434,10 @@ impl MarkdownEditor {
 
     pub fn set_style(&mut self, style: DocStyle, cx: &mut Context<Self>) {
         if self.style != style {
+            if self.style.palette != style.palette {
+                self.code_theme = Rc::new(highlight::theme(&style.palette));
+                self.code_colors.clear();
+            }
             self.style = style;
             self.invalidate();
             cx.notify();
@@ -416,13 +462,7 @@ impl MarkdownEditor {
     }
 
     fn estimate(&self, kind: LineKind) -> Pixels {
-        let (_, lh) = self.style.metrics(kind, self.mode);
-        let rich = self.mode != Mode::Source;
-        px(match kind {
-            LineKind::Blank if rich => lh * 0.6,
-            LineKind::Heading(_) if rich => lh * 1.4,
-            _ => lh,
-        })
+        px(self.style.metrics(kind, self.mode).1)
     }
 
     fn rebuild_slots(&mut self) {
@@ -593,6 +633,61 @@ impl MarkdownEditor {
         self.mode != Mode::Source
     }
 
+    /// Copy the code block whose header is row `ix`: its lines between the
+    /// fences, as they are.
+    pub(crate) fn copy_code(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(row) = self.rows.get(ix) else {
+            return;
+        };
+        let body: Vec<&str> = self.syntax.lines[row.lines.start + 1..]
+            .iter()
+            .take_while(|l| l.kind == LineKind::Code)
+            .map(|l| &self.text[l.range.clone()])
+            .collect();
+        cx.write_to_clipboard(ClipboardItem::new_string(body.join("\n")));
+        self.copied = Some(ix);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(1200))
+                .await;
+            this.update(cx, |ed, cx| {
+                if ed.copied == Some(ix) {
+                    ed.copied = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The card source line `ix` is drawn on, if any.
+    fn card_of(&self, ix: usize) -> Option<Card> {
+        let l = self.syntax.lines.get(ix)?;
+        match l.kind {
+            LineKind::Code | LineKind::FenceOpen | LineKind::FenceClose => Some(Card::Code),
+            LineKind::Meta => Some(Card::Meta),
+            _ => l.alert.map(Card::Callout),
+        }
+    }
+
+    /// Where a row sits on its card: a card starts where the line before
+    /// isn't on one like it (or a fence opens) and ends where the line after
+    /// isn't (or a fence closes).
+    fn on_card(&self, row: &Row) -> Option<OnCard> {
+        let (start, end) = (row.lines.start, row.lines.end);
+        let card = self.card_of(start)?;
+        let kind = |i: usize| self.syntax.lines.get(i).map(|l| l.kind);
+        let first = start == 0
+            || self.card_of(start - 1) != Some(card)
+            || kind(start) == Some(LineKind::FenceOpen);
+        let last = self.card_of(end) != Some(card)
+            || kind(end - 1) == Some(LineKind::FenceClose)
+            || kind(end) == Some(LineKind::FenceOpen);
+        Some(OnCard { card, first, last })
+    }
+
     // ---------- layout ----------
 
     fn layout(&mut self, ix: usize, window: &mut Window) -> Rc<LineLayout> {
@@ -630,6 +725,9 @@ impl MarkdownEditor {
                 alert: None,
                 gutter: None,
                 grid: Some(g),
+                card: None,
+                card_x: px(0.),
+                list: 0,
             });
             if let Some(slot) = self.slots.get_mut(ix) {
                 slot.height = height;
@@ -665,6 +763,9 @@ impl MarkdownEditor {
                 widget: row.widget,
                 alert: None,
                 grid: None,
+                card: None,
+                card_x: px(0.),
+                list: 0,
             });
             if let Some(slot) = self.slots.get_mut(ix) {
                 slot.layout = Some(layout.clone());
@@ -678,30 +779,42 @@ impl MarkdownEditor {
             self.reveal_of(ix),
         );
         let (size, lh) = self.style.metrics(line.kind, self.mode);
-        let (size, lh) = (px(size), px(lh));
+        let (mut size, lh) = (px(size), px(lh));
         let rich = self.rich();
-        let code_block = rich
-            && matches!(
-                line.kind,
-                LineKind::Code | LineKind::FenceOpen | LineKind::FenceClose
-            );
         let revealed = self.reveal_of(ix) == Reveal::Show;
+        // A code block's opening fence, hidden, is its card's header: the
+        // language as a small label at the right, by the copy button.
+        let header = rich && !revealed && line.kind == LineKind::FenceOpen;
+        if header {
+            size = px(11. * self.style.size / 16.);
+        }
         let list_depth = match (rich, revealed) {
             (false, _) => 0,
             (true, true) => line.list.saturating_sub(1),
             (true, false) => line.list,
         };
-        let indent = if rich {
-            px(line.quote as f32 * 20. + list_depth as f32 * LIST_INDENT)
-                + if code_block { px(16.) } else { px(0.) }
+        let card = if rich { self.on_card(&row) } else { None };
+        // A card's text sits in from its edges; a callout's card takes the
+        // place of its quote's bar.
+        let (card_in, quote_levels) = match card.map(|c| c.card) {
+            Some(Card::Code) => (px(CODE_PAD_X), line.quote as f32),
+            Some(Card::Meta) => (px(CARD_PAD_X), 0.),
+            Some(Card::Callout(_)) => (px(CARD_PAD_X), line.quote.saturating_sub(1) as f32),
+            None => (px(0.), line.quote as f32),
+        };
+        let card_x = if rich {
+            px(quote_levels * 20. + list_depth as f32 * LIST_INDENT)
         } else {
             px(0.)
         };
-        let wrap = max(
-            content_w - indent - if code_block { px(16.) } else { px(0.) },
-            px(40.),
-        );
-        let mut runs = self.text_runs(&display, line.kind, line.quote);
+        let mut indent = card_x + card_in;
+        let wrap = max(content_w - indent - card_in, px(40.));
+        let mut runs = self.text_runs(&display, line.kind, line.quote, line.alert, revealed);
+        if header {
+            for r in &mut runs {
+                r.font = font(crate::theme::UI_FONT);
+            }
+        }
         if line.kind == LineKind::Code
             && let Some(spans) = self.code_spans(row.lines.start)
         {
@@ -725,15 +838,33 @@ impl MarkdownEditor {
             .ok()
             .and_then(|mut v| (!v.is_empty()).then(|| v.remove(0)))
             .unwrap_or_default();
-        let pad_top = match line.kind {
-            LineKind::Heading(l) if rich => size * if l <= 2 { 0.55 } else { 0.35 },
-            _ => px(0.),
-        };
+        if header {
+            let label = shaped.width();
+            indent = max(content_w - px(CODE_HEADER_RIGHT) - label, card_x + card_in);
+        }
+        // ZenNotes' spacing: no more round a heading than its own leading,
+        // and blank lines as tall as any other.
+        let mut pad_top = px(0.);
+        let mut pad_bottom = px(0.);
+        if let Some(OnCard {
+            card: Card::Callout(_),
+            first,
+            last,
+        }) = card
+        {
+            if first {
+                pad_top += px(CARD_PAD_Y);
+            }
+            if last {
+                pad_bottom = px(CARD_PAD_Y);
+            }
+        }
         let text_h = shaped.size(lh).height;
         let height = match line.kind {
-            LineKind::Blank if rich => lh * 0.6,
-            LineKind::FenceClose if rich && display.text.is_empty() => lh * 0.6,
-            _ => text_h + pad_top,
+            LineKind::FenceOpen if header => lh,
+            // The frontmatter's hidden fences are its card's padding.
+            LineKind::Meta if rich && display.text.is_empty() => px(CARD_PAD_Y),
+            _ => text_h + pad_top + pad_bottom,
         };
         let c = &self.style.colors;
         let number = (rich && self.style.numbered && matches!(line.kind, LineKind::Heading(_)))
@@ -742,14 +873,18 @@ impl MarkdownEditor {
         let gutter_glyph = number.map(|n| (n, c.muted)).or_else(|| {
             display.gutter.as_ref().and_then(|g| match g {
                 Gutter::Bullet => Some(("•".to_string(), c.muted)),
-                Gutter::Number(n) => Some((n.clone(), c.muted)),
+                Gutter::Number(n) => Some((n.clone(), c.accent_soft)),
                 Gutter::Task { .. } => None,
             })
         });
         let gutter = gutter_glyph.map(|(glyph, color)| {
+            let mut f = font(self.style.font.clone());
+            if glyph == "•" {
+                f.weight = FontWeight::BOLD;
+            }
             let run = TextRun {
                 len: glyph.len(),
-                font: font(self.style.font.clone()),
+                font: f,
                 color,
                 background_color: None,
                 underline: None,
@@ -773,6 +908,9 @@ impl MarkdownEditor {
             widget: row.widget,
             alert: line.alert,
             grid: None,
+            card,
+            card_x,
+            list: list_depth,
         });
         if let Some(slot) = self.slots.get_mut(ix) {
             if row.widget.is_none() {
@@ -807,14 +945,13 @@ impl MarkdownEditor {
             self.text.len()
         };
         let body = &self.text[body_start..body_end.max(body_start)];
-        let dark = self.style.palette.dark;
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(&(body, &lang, dark), &mut h);
+        std::hash::Hash::hash(&(body, &lang), &mut h);
         let key = std::hash::Hasher::finish(&h);
         if let Some(s) = self.code_colors.get(&key) {
             return Some(s.clone());
         }
-        let spans: Vec<highlight::Span> = highlight::highlight(body, &lang, dark)
+        let spans: Vec<highlight::Span> = highlight::highlight(body, &lang, &self.code_theme)
             .into_iter()
             .map(|s| highlight::Span {
                 range: s.range.start + body_start..s.range.end + body_start,
@@ -829,27 +966,45 @@ impl MarkdownEditor {
         Some(spans)
     }
 
-    fn text_runs(&self, d: &DisplayLine, kind: LineKind, quote: u8) -> Vec<TextRun> {
+    /// How a row's text is set, span by span: ZenNotes' editor's look.
+    /// `alert` is the callout the row is in; `shown` whether its markup is
+    /// showing (Live mode's caret row).
+    fn text_runs(
+        &self,
+        d: &DisplayLine,
+        kind: LineKind,
+        quote: u8,
+        alert: Option<syntax::Alert>,
+        shown: bool,
+    ) -> Vec<TextRun> {
         let c = &self.style.colors;
         let mono = self.style.monospace(kind, self.mode);
         let source = self.mode == Mode::Source;
         let heading = matches!(kind, LineKind::Heading(_) | LineKind::SetextUnderline);
-        let base_color = if quote > 0 || self.style.muted_body {
+        let meta = kind == LineKind::Meta && !source;
+        let base_color = if source {
+            if self.style.muted_body {
+                c.muted
+            } else {
+                c.text
+            }
+        } else if alert.is_some() {
+            c.text
+        } else if quote > 0 || kind == LineKind::Heading(6) {
+            c.soft
+        } else if self.style.muted_body {
             c.muted
         } else {
             c.text
         };
-        let base_color = if quote > 0 && !source {
-            c.muted
-        } else {
-            base_color
-        };
-        let alert_color = c.accent;
         d.runs
             .iter()
             .map(|r| {
                 let code = display::has(r.style, display::CODE);
-                let mut f = font(if mono || code {
+                let mut f = font(if r.role == Role::Pad {
+                    // A thin space in a proportional face: a few pixels.
+                    crate::theme::UI_FONT.into()
+                } else if (mono || code) && !meta {
                     self.style.mono.clone()
                 } else {
                     self.style.font.clone()
@@ -858,35 +1013,50 @@ impl MarkdownEditor {
                     // `<!--` should read as itself, not as an arrow.
                     f.features = FontFeatures::disable_ligatures();
                 }
-                if heading || display::has(r.style, display::BOLD) {
-                    f.weight = if heading && !source {
-                        FontWeight::SEMIBOLD
-                    } else {
-                        FontWeight::BOLD
-                    };
+                if (heading && !source)
+                    || display::has(r.style, display::BOLD)
+                    || r.role == Role::Bullet
+                {
+                    f.weight = FontWeight::BOLD;
+                } else if r.role == Role::Alert {
+                    f.weight = FontWeight::SEMIBOLD;
+                } else if display::has(r.style, display::KEY) {
+                    f.weight = FontWeight::MEDIUM;
                 }
-                if display::has(r.style, display::ITALIC) {
+                // Markup shown at the caret leans, as ZenNotes sets it; a
+                // heading's `#` stays upright.
+                if display::has(r.style, display::ITALIC)
+                    || (r.role == Role::Markup && !source && !heading)
+                {
                     f.style = FontStyle::Italic;
                 }
                 let link = display::has(r.style, display::LINK | display::IMAGE);
                 let color = match r.role {
-                    Role::Markup | Role::Bullet | Role::Number | Role::Lang => c.muted,
-                    Role::Alert => alert_color,
-                    Role::TaskOpen | Role::TaskDone => c.accent,
+                    Role::Markup if source => c.muted,
+                    Role::Markup => c.accent_soft,
+                    Role::Bullet => c.muted,
+                    Role::Number if source => c.muted,
+                    Role::Number => c.accent_soft,
+                    // A fence's language: purple as written, grey as a label.
+                    Role::Lang if shown || source => c.alerts[2],
+                    Role::Lang => c.muted,
+                    Role::Alert => alert.map_or(c.accent, |a| c.callout(a)),
+                    Role::TaskOpen | Role::TaskDone => c.alerts[3],
+                    Role::Text if display::has(r.style, display::KEY) => c.muted,
                     Role::Text if link => c.accent,
                     Role::Text if display::has(r.style, display::MATH) => c.accent,
                     Role::Text if heading && source => c.accent,
-                    Role::Text | Role::Break => base_color,
+                    Role::Text | Role::Break | Role::Pad => base_color,
                 };
                 TextRun {
                     len: r.len,
                     font: f,
                     color,
-                    background_color: (code && !source && kind != LineKind::Code)
-                        .then_some(c.code_bg),
+                    // Inline code's chip is drawn behind the text, rounded.
+                    background_color: None,
                     underline: (link && r.role == Role::Text).then_some(UnderlineStyle {
                         thickness: px(1.),
-                        color: Some(c.accent.opacity(0.5)),
+                        color: Some(c.accent.opacity(0.4)),
                         wavy: false,
                     }),
                     strikethrough: display::has(r.style, display::STRIKE).then_some(

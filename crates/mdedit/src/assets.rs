@@ -7,7 +7,7 @@ use gpui_kit::*;
 gpui_kit::assets::icon_assets!(
     ExtraIcons,
     [
-        Columns2, Save, FilePlus, Image, Binary, FileCode, X, Settings
+        Columns2, Save, FilePlus, Image, Binary, FileCode, X, Settings, Copy
     ]
 );
 

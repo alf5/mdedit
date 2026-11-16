@@ -386,6 +386,8 @@ impl Writer<'_> {
 /// The document's body as Typst markup; pictures it needs go in `files`.
 pub fn to_typst(md: &str, opts: &Options, files: &mut HashMap<String, Vec<u8>>) -> String {
     let parser_opts = mdedit_core::syntax::options();
+    // Frontmatter is the document's data, not its text; HTML leaves it out too.
+    let md = &md[mdedit_core::syntax::frontmatter_end(md).unwrap_or(0)..];
     // Footnote definitions first, so a reference can carry its text.
     let mut footnotes = HashMap::new();
     {

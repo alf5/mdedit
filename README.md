@@ -70,8 +70,14 @@ nothing is converted back and forth behind your back.
     the document was opened. **Settings** can allow them always.
   - **Network shares and other schemes** are never loaded.
 - **GitHub-flavoured Markdown**: tables, task lists, strikethrough,
-  footnotes, alerts (`> [!NOTE]` and the rest, each with its own colour), and
-  fenced code with syntax highlighting.
+  footnotes, alerts (`> [!NOTE]` and the rest, as tinted cards), and fenced
+  code with syntax highlighting in the theme's colours and a copy button.
+- **Frontmatter**: a YAML block opening the document (between `---` lines)
+  is drawn as a card of its keys and values. HTML and PDF exports leave it
+  out.
+- **The look** follows ZenNotes' editor: code, formulas, callouts and the
+  frontmatter on rounded cards, inline code in chips, and markup shown at
+  the caret in a soft accent.
 - **Find and replace** (`Ctrl/Cmd+F`, `Ctrl+H` or `Cmd+Alt+F`), with a match
   count, case matching, and replace one or all.
 - **Smart paste.**
@@ -145,8 +151,9 @@ applies it at once, and remembers it:
     Nord, Tokyo Night, Kanagawa, Black Metal and Rosé Pine.
   - **Where they apply:** the theme colours the window, the document and HTML
     exports. PDFs stay on white.
-- **Typography**: Ogma, GitHub, Manuscript, Compact or Typewriter, with the
-  text size and a reading column or the full width.
+- **Typography**: Ogma, GitHub, Manuscript, Compact or Typewriter (ZenNotes'
+  own: monospaced, with tables in a sans face), with the text size and a
+  reading column or the full width.
 - **Numbered headings**: headings can be numbered like an outline (1., 1.1.,
   …).
 

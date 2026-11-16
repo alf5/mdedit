@@ -22,6 +22,8 @@ pub mod style {
     pub const LINK: u16 = 1 << 4;
     pub const IMAGE: u16 = 1 << 5;
     pub const MATH: u16 = 1 << 6;
+    /// A frontmatter key, `title:`.
+    pub const KEY: u16 = 1 << 7;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,12 +39,18 @@ pub enum LineKind {
     Hr,
     Table,
     Html,
+    /// The YAML frontmatter opening a document, its `---` fences included:
+    /// drawn as a card of properties.
+    Meta,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarkupKind {
-    /// Emphasis, code and link delimiters, escapes.
+    /// Emphasis and link delimiters, escapes.
     Inline,
+    /// An inline code span's backticks: drawn as a little padding inside
+    /// its chip when hidden.
+    CodeTick,
     HeadingPrefix,
     QuotePrefix,
     /// `- `, `* `, `+ `: drawn as a bullet when hidden.
@@ -164,6 +172,30 @@ pub fn options() -> Options {
     opts.insert(Options::ENABLE_GFM);
     opts.insert(Options::ENABLE_MATH);
     opts
+}
+
+/// Where a document's frontmatter ends: the YAML block that may open it,
+/// between `---` lines, as Jekyll and Obsidian read it. The offset is past
+/// the closing line and its newline. Only at the very start: pulldown-cmark's
+/// own option takes a `---` pair anywhere, which would swallow a rule and
+/// the setext heading after it.
+pub fn frontmatter_end(text: &str) -> Option<usize> {
+    let first = text.lines().next()?;
+    if first.trim_end() != "---" {
+        return None;
+    }
+    let mut at = first.len() + 1;
+    if text.as_bytes().get(first.len()) == Some(&b'\r') {
+        at += 1;
+    }
+    for line in text.get(at..)?.split_inclusive('\n') {
+        at += line.len();
+        let t = line.trim_end();
+        if t == "---" || t == "..." {
+            return Some(at.min(text.len()));
+        }
+    }
+    None
 }
 
 struct Open {
@@ -295,7 +327,34 @@ pub fn parse(text: &str) -> Syntax {
     };
     let style_now = |stack: &[Open]| stack.iter().fold(0, |acc, o| acc | o.style);
 
-    for (event, r) in Parser::new_ext(text, options()).into_offset_iter() {
+    // The frontmatter is a card of its own; the markdown starts after it.
+    let base = frontmatter_end(text).unwrap_or(0);
+    if base > 0 {
+        let first = 0;
+        let last = line_at(base - 1, &lines);
+        for l in &mut lines[first..=last] {
+            l.kind = LineKind::Meta;
+        }
+        // The fences are hidden; each `key:` is set apart from its value.
+        for f in [first, last] {
+            markup.push(Markup {
+                range: lines[f].range.clone(),
+                kind: MarkupKind::Fence,
+            });
+        }
+        for l in lines.iter().take(last).skip(first + 1) {
+            if let Some(key) = meta_key(&text[l.range.clone()]) {
+                spans.push(Span {
+                    range: l.range.start + key.start..l.range.start + key.end,
+                    style: style::KEY,
+                });
+            }
+        }
+    }
+    let events = Parser::new_ext(&text[base..], options())
+        .into_offset_iter()
+        .map(|(e, r)| (e, r.start + base..r.end + base));
+    for (event, r) in events {
         match event {
             Event::Start(tag) => {
                 touch(&mut stack, &r);
@@ -628,11 +687,11 @@ pub fn parse(text: &str) -> Syntax {
                 if r.len() >= 2 * n {
                     markup.push(Markup {
                         range: r.start..r.start + n,
-                        kind: MarkupKind::Inline,
+                        kind: MarkupKind::CodeTick,
                     });
                     markup.push(Markup {
                         range: r.end - n..r.end,
-                        kind: MarkupKind::Inline,
+                        kind: MarkupKind::CodeTick,
                     });
                     spans.push(Span {
                         range: r.start + n..r.end - n,
@@ -765,6 +824,26 @@ fn trim_newline(text: &str, floor: usize, end: usize) -> usize {
     e
 }
 
+/// Where a frontmatter line's key is, colon included: `title:` in
+/// `title: Notes`, `- name:` in a list of maps. A comment line is all key, so
+/// it's drawn as quietly. `None` for a value on its own (`  - item`).
+fn meta_key(line: &str) -> Option<Range<usize>> {
+    let lead = line.len() - line.trim_start().len();
+    let rest = &line[lead..];
+    if rest.starts_with('#') {
+        return Some(lead..line.len());
+    }
+    let item = if rest.starts_with("- ") { 2 } else { 0 };
+    let body = &rest[item..];
+    let colon = body
+        .find(": ")
+        .or_else(|| body.ends_with(':').then(|| body.len() - 1))?;
+    let key = &body[..colon];
+    let quoted = key.starts_with('"') || key.starts_with('\'');
+    (!key.is_empty() && (quoted || !key.contains(['"', '\'', '[', '{'])))
+        .then(|| lead..lead + item + colon + 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -775,6 +854,42 @@ mod tests {
             .iter()
             .map(|m| &text[m.range.clone()])
             .collect()
+    }
+
+    #[test]
+    fn frontmatter_is_a_card_of_keys_and_values() {
+        let t = "---\ntitle: Notes\ntags:\n  - a\n# a comment\n---\n\n# Head\n";
+        let s = parse(t);
+        let kinds: Vec<_> = s.lines.iter().map(|l| l.kind).collect();
+        assert!(kinds[..6].iter().all(|k| *k == LineKind::Meta), "{kinds:?}");
+        assert_eq!(kinds[7], LineKind::Heading(1));
+        assert_eq!(hidden(t)[..2], ["---", "---"]);
+        let keys: Vec<_> = s
+            .spans
+            .iter()
+            .filter(|sp| sp.style == style::KEY)
+            .map(|sp| &t[sp.range.clone()])
+            .collect();
+        assert_eq!(keys, ["title:", "tags:", "# a comment"]);
+        // Only at the very start: a later `---` pair is a rule and a heading.
+        let later = parse("Text\n\n---\ntitle: x\n---\n");
+        assert!(later.lines.iter().all(|l| l.kind != LineKind::Meta));
+        assert_eq!(later.lines[2].kind, LineKind::Hr);
+        assert_eq!(later.lines[3].kind, LineKind::Heading(2));
+        // And it must close.
+        assert_eq!(frontmatter_end("---\ntitle: x\n"), None);
+        assert_eq!(frontmatter_end("---\r\na: 1\r\n...\r\nText"), Some(16));
+    }
+
+    #[test]
+    fn frontmatter_keys() {
+        assert_eq!(meta_key("title: A"), Some(0..6));
+        assert_eq!(meta_key("tags:"), Some(0..5));
+        assert_eq!(meta_key("  sub: x"), Some(2..6));
+        assert_eq!(meta_key("- name: x"), Some(0..7));
+        assert_eq!(meta_key("  - item"), None);
+        assert_eq!(meta_key("url: https://a.b"), Some(0..4));
+        assert_eq!(meta_key("plain"), None);
     }
 
     #[test]

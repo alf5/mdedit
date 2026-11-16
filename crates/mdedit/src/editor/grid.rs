@@ -19,7 +19,7 @@ use super::MarkdownEditor;
 pub(crate) const TOP: f32 = 14.;
 pub(crate) const BOTTOM: f32 = 12.;
 const PAD_X: f32 = 10.;
-const PAD_Y: f32 = 6.;
+const PAD_Y: f32 = 5.;
 /// The narrowest a column can be dragged.
 pub(crate) const MIN_COL: f32 = 48.;
 
@@ -436,8 +436,11 @@ impl MarkdownEditor {
     ) -> Option<Grid> {
         let model = self.table_model(w)?;
         let cols = model.cols().max(1);
-        let (size, lh) = self.style.metrics(LineKind::Paragraph, self.mode);
-        let (size, lh) = (px(size * 0.95), px(lh * 0.95));
+        // ZenNotes' table: a little smaller than the text, at 1.5, and in a
+        // sans face when the text is monospaced.
+        let (size, _) = self.style.metrics(LineKind::Paragraph, self.mode);
+        let (size, lh) = (px(size * 0.94), px(size * 0.94 * 1.5));
+        let sans = self.style.font.as_ref() == crate::theme::MONO_FONT;
         let live = self.mode == Mode::Live;
 
         // Each cell's text, and how wide it is unwrapped: a column is as
@@ -455,7 +458,17 @@ impl MarkdownEditor {
                     Reveal::Hide
                 };
                 let d = display::fragment(text, range.start, reveal);
-                let mut runs = self.text_runs(&d, LineKind::Paragraph, 0);
+                let mut runs = self.text_runs(&d, LineKind::Paragraph, 0, None, false);
+                if sans {
+                    for (run, src) in runs.iter_mut().zip(&d.runs) {
+                        if !mdedit_core::display::has(src.style, mdedit_core::display::CODE)
+                            && src.role != mdedit_core::display::Role::Pad
+                        {
+                            run.font.family = crate::theme::UI_FONT.into();
+                            run.font.features = FontFeatures::default();
+                        }
+                    }
+                }
                 if r == 0 {
                     for run in &mut runs {
                         run.font.weight = FontWeight::SEMIBOLD;

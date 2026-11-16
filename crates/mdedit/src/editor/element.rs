@@ -6,10 +6,11 @@ use gpui_kit::*;
 use mdedit_core::prefs::Mode;
 use mdedit_core::syntax::LineKind;
 
-use mdedit_core::display::{Gutter, RowWidget};
+use mdedit_core::display::RowWidget;
 
 use super::table::{Control, Drag, RAIL, controls};
-use super::{Geometry, LIST_INDENT, MarkdownEditor, Placed, max, min};
+use super::{Card, Geometry, LIST_INDENT, MarkdownEditor, Placed, max, min};
+use mdedit_core::display::{self, Role};
 
 const PAD_X: f32 = 32.;
 const PAD_TOP: f32 = 28.;
@@ -27,22 +28,23 @@ impl EditorElement {
 pub(crate) struct Frame {
     lines: Vec<Placed>,
     widgets: Vec<AnyElement>,
-    content_x: Pixels,
-    content_w: Pixels,
     rects: Vec<(Bounds<Pixels>, Hsla)>,
     caret: Option<Bounds<Pixels>>,
     thumb: Option<Bounds<Pixels>>,
     hitbox: Hitbox,
-    rich: bool,
-    code_bg: Hsla,
-    quote: Hsla,
-    rule: Hsla,
     caret_color: Hsla,
     thumb_color: Hsla,
-    alerts: [Hsla; 5],
-    box_border: Hsla,
-    box_fill: Hsla,
-    check: Hsla,
+    /// Cards, quote bars, rules, list guides and inline code's chips: what
+    /// goes behind the text.
+    deco: Vec<PaintQuad>,
+    tasks: Vec<Task>,
+    /// Code blocks' copy buttons, and the fence line each copies.
+    copy: Vec<(Bounds<Pixels>, Hitbox, usize)>,
+    copy_ink: Hsla,
+    copy_hover: Hsla,
+    /// The block just copied, and its button's colour for that moment.
+    copied: Option<usize>,
+    copied_ink: Hsla,
     /// Tables: what goes under the text (header, caret cell) and over it
     /// (rules, borders, the hover controls).
     under: Vec<PaintQuad>,
@@ -56,6 +58,41 @@ impl IntoElement for EditorElement {
     type Element = Self;
     fn into_element(self) -> Self {
         self
+    }
+}
+
+/// A task's box: ZenNotes' rounded square, filled with the accent and
+/// ticked when done.
+pub(crate) struct Task {
+    bounds: Bounds<Pixels>,
+    done: bool,
+    accent: Hsla,
+    edge: Hsla,
+    page: Hsla,
+}
+
+impl Task {
+    fn paint(&self, window: &mut Window) {
+        let b = self.bounds;
+        let side = b.size.width;
+        if !self.done {
+            window.paint_quad(
+                fill(b, self.page)
+                    .corner_radii(px(4.))
+                    .border_widths(px(1.5))
+                    .border_color(self.edge),
+            );
+            return;
+        }
+        window.paint_quad(fill(b, self.accent).corner_radii(px(4.)));
+        let at = |x: f32, y: f32| b.origin + point(side * x, side * y);
+        let mut tick = PathBuilder::stroke(max(side * 0.13, px(1.5)));
+        tick.move_to(at(0.26, 0.52));
+        tick.line_to(at(0.43, 0.69));
+        tick.line_to(at(0.75, 0.33));
+        if let Ok(path) = tick.build() {
+            window.paint_path(path, self.page);
+        }
     }
 }
 
@@ -143,6 +180,187 @@ impl MarkdownEditor {
             self.scroll_y = max_scroll;
         }
         (lines, widgets, content_x, content_w, total)
+    }
+
+    /// What's drawn behind the visible rows in the rendered modes, after
+    /// ZenNotes: cards behind code blocks, the frontmatter and callouts;
+    /// quote bars, rules and list guides; inline code's chips; task boxes;
+    /// and code blocks' copy buttons.
+    #[allow(clippy::type_complexity)]
+    fn decorations(
+        &self,
+        lines: &[Placed],
+        content_w: Pixels,
+        window: &mut Window,
+    ) -> (
+        Vec<PaintQuad>,
+        Vec<Task>,
+        Vec<(Bounds<Pixels>, Hitbox, usize)>,
+    ) {
+        let c = &self.style.colors;
+        let (mut deco, mut tasks, mut copy) = (Vec::new(), Vec::new(), Vec::new());
+
+        // Cards: a run of rows on one, rounded where it starts and ends (a
+        // card cut by the window's edge runs on past it).
+        let mut i = 0;
+        while i < lines.len() {
+            let Some(on) = lines[i].2.card else {
+                i += 1;
+                continue;
+            };
+            let mut j = i;
+            while !lines[j].2.card.is_some_and(|k| k.last)
+                && j + 1 < lines.len()
+                && lines[j + 1].0 == lines[j].0 + 1
+                && lines[j + 1]
+                    .2
+                    .card
+                    .is_some_and(|k| k.card == on.card && !k.first)
+            {
+                j += 1;
+            }
+            let (_, top_origin, top) = &lines[i];
+            let (_, end_origin, end) = &lines[j];
+            let last = end.card.is_some_and(|k| k.last);
+            // A diagram's preview sits under its source's last row, off the
+            // card.
+            let end_h = if end.widget.is_some() {
+                end.text_h
+            } else {
+                end.height.get()
+            };
+            let y0 = top_origin.y - if on.first { px(0.) } else { px(40.) };
+            let y1 = end_origin.y + end_h + if last { px(0.) } else { px(40.) };
+            let x0 = top_origin.x + top.card_x;
+            let b = Bounds::from_corners(point(x0, y0), point(top_origin.x + content_w, y1));
+            let (bg, edge) = match on.card {
+                Card::Code => (
+                    c.bg.blend(c.surface_alt.opacity(0.55)),
+                    c.border.opacity(0.7),
+                ),
+                Card::Meta => (c.bg.blend(c.surface.opacity(0.5)), c.faint.opacity(0.13)),
+                Card::Callout(a) => {
+                    let k = c.callout(a);
+                    (c.bg.blend(k.opacity(0.08)), k.opacity(0.35))
+                }
+            };
+            deco.push(
+                fill(b, bg)
+                    .corner_radii(px(8.))
+                    .border_widths(px(1.))
+                    .border_color(edge),
+            );
+            i = j + 1;
+        }
+
+        for (ix, origin, l) in lines {
+            let h = l.height.get();
+            if matches!(l.widget, Some(display::RowWidget::Closed(_))) {
+                continue;
+            }
+            // Quote bars, a callout's own quote excepted.
+            let bars = if l.alert.is_some() {
+                l.quote.saturating_sub(1)
+            } else {
+                l.quote
+            };
+            for q in 0..bars {
+                deco.push(fill(
+                    Bounds::new(
+                        point(origin.x + px(q as f32 * 20.), origin.y),
+                        size(px(3.), h),
+                    ),
+                    c.quote,
+                ));
+            }
+            // A rule.
+            if l.kind == LineKind::Hr && l.display.text.is_empty() {
+                deco.push(fill(
+                    Bounds::new(
+                        point(origin.x + l.indent, origin.y + h / 2. - px(1.)),
+                        size(content_w - l.indent, px(2.)),
+                    ),
+                    c.border,
+                ));
+            }
+            // Guides down a nested list, under each enclosing item's marker.
+            if l.list > 1 && l.grid.is_none() && l.kind != LineKind::Blank {
+                let base = l.card_x - px(l.list as f32 * LIST_INDENT);
+                for level in 1..l.list {
+                    let x = origin.x + base + px(level as f32 * LIST_INDENT - 11.);
+                    deco.push(fill(
+                        Bounds::new(point(x, origin.y), size(px(1.), h)),
+                        c.faint.opacity(0.16),
+                    ));
+                }
+            }
+            // A task's box, in the margin.
+            if let Some(display::Gutter::Task { done, .. }) = &l.display.gutter {
+                let side = px(self.style.size.round());
+                let x = origin.x + l.indent - px(LIST_INDENT) + px(3.);
+                let y = origin.y + l.pad_top + (l.line_height - side) / 2.;
+                tasks.push(Task {
+                    bounds: Bounds::new(point(x, y), size(side, side)),
+                    done: *done,
+                    accent: c.accent,
+                    edge: c.border,
+                    page: c.bg,
+                });
+            }
+            // A code block's copy button, on its header.
+            if l.kind == LineKind::FenceOpen && l.card.is_some_and(|k| k.first) {
+                let revealed = l.display.text.starts_with('`') || l.display.text.starts_with('~');
+                if !revealed {
+                    let b = Bounds::new(
+                        point(
+                            origin.x + content_w - px(8. + 20.),
+                            origin.y + (h - px(18.)) / 2.,
+                        ),
+                        size(px(20.), px(18.)),
+                    );
+                    copy.push((b, window.insert_hitbox(b, HitboxBehavior::Normal), *ix));
+                }
+            }
+            // Inline code's chips: a rounded fill a little taller than the
+            // text, behind each stretch of a code span (its padding too).
+            if !matches!(
+                l.kind,
+                LineKind::Code | LineKind::FenceOpen | LineKind::FenceClose | LineKind::Meta
+            ) {
+                let chip_h = px(self.style.size * 1.1 + 2.);
+                let mut spans: Vec<(usize, usize)> = Vec::new();
+                let mut push_runs = |runs: &[display::Run], base: usize| {
+                    let mut at = base;
+                    for r in runs {
+                        if display::has(r.style, display::CODE) || r.role == Role::Pad {
+                            match spans.last_mut() {
+                                Some((_, e)) if *e == at => *e = at + r.len,
+                                _ => spans.push((at, at + r.len)),
+                            }
+                        }
+                        at += r.len;
+                    }
+                };
+                match &l.grid {
+                    Some(g) => {
+                        for cell in &g.cells {
+                            push_runs(&cell.display.runs, cell.base);
+                        }
+                    }
+                    None => push_runs(&l.display.runs, 0),
+                }
+                for (a, b) in spans {
+                    for r in l.rects(*origin, a, b, false, content_w - l.indent) {
+                        let chip = Bounds::new(
+                            point(r.left(), r.center().y - chip_h / 2.),
+                            size(r.size.width, chip_h),
+                        );
+                        deco.push(fill(chip, c.code_bg).corner_radii(px(4.)));
+                    }
+                }
+            }
+        }
+        (deco, tasks, copy)
     }
 
     /// The quads that draw the visible tables, and their controls when one
@@ -422,7 +640,7 @@ impl Element for EditorElement {
     ) -> Frame {
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         self.editor.update(cx, |ed, cx| {
-            let (lines, widgets, content_x, content_w, total) = ed.prepare(bounds, window, cx);
+            let (lines, widgets, _, content_w, total) = ed.prepare(bounds, window, cx);
             let colors = ed.style.colors.clone();
             let mut rects = Vec::new();
 
@@ -483,25 +701,27 @@ impl Element for EditorElement {
                 bounds,
                 lines: lines.clone(),
             };
+            let (deco, tasks, copy) = if ed.mode == Mode::Source {
+                (Vec::new(), Vec::new(), Vec::new())
+            } else {
+                ed.decorations(&lines, content_w, window)
+            };
             Frame {
                 lines,
                 widgets,
-                content_x,
-                content_w,
                 rects,
                 caret,
                 thumb,
                 hitbox,
-                rich: ed.mode != Mode::Source,
-                code_bg: colors.code_bg,
-                quote: colors.quote,
-                rule: colors.border,
                 caret_color: colors.accent,
                 thumb_color: colors.muted.opacity(0.35),
-                alerts: colors.alerts,
-                box_border: colors.muted.opacity(0.7),
-                box_fill: colors.accent,
-                check: colors.text,
+                deco,
+                tasks,
+                copy,
+                copy_ink: colors.muted,
+                copy_hover: colors.border.opacity(0.85),
+                copied: ed.copied,
+                copied_ink: colors.accent,
                 under,
                 over,
                 cursors,
@@ -595,37 +815,32 @@ impl Element for EditorElement {
             });
         }
 
-        window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            // Block backgrounds and rules, behind everything.
-            if frame.rich {
-                for (_, origin, l) in &frame.lines {
-                    let full = Bounds::new(*origin, size(frame.content_w, l.height.get()));
-                    match l.kind {
-                        _ if matches!(l.widget, Some(RowWidget::Closed(_))) => {}
-                        LineKind::Code | LineKind::FenceOpen | LineKind::FenceClose => {
-                            window.paint_quad(fill(full, frame.code_bg));
-                        }
-                        LineKind::Hr => {
-                            let y = origin.y + l.height.get() / 2.;
-                            window.paint_quad(fill(
-                                Bounds::new(
-                                    point(frame.content_x, y),
-                                    size(frame.content_w, px(1.)),
-                                ),
-                                frame.rule,
-                            ));
-                        }
-                        _ => {}
-                    }
-                    let bar = l.alert.map_or(frame.quote, |a| frame.alerts[a as usize]);
-                    for q in 0..l.quote {
-                        let x = origin.x + px(q as f32 * 20. + 2.);
-                        window.paint_quad(fill(
-                            Bounds::new(point(x, origin.y), size(px(3.), l.height.get())),
-                            bar,
-                        ));
-                    }
+        // A press on a code block's copy button copies the block.
+        for (_, hitbox, _) in &frame.copy {
+            window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+        }
+        if !frame.copy.is_empty() {
+            let editor = self.editor.clone();
+            let buttons: Vec<(Hitbox, usize)> = frame
+                .copy
+                .iter()
+                .map(|(_, h, ix)| (h.clone(), *ix))
+                .collect();
+            window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
+                if !phase.bubble() || e.button != MouseButton::Left {
+                    return;
                 }
+                if let Some((_, ix)) = buttons.iter().find(|(h, _)| h.is_hovered(window)) {
+                    editor.update(cx, |ed, cx| ed.copy_code(*ix, cx));
+                    cx.stop_propagation();
+                }
+            });
+        }
+
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+            // Cards, bars, rules, guides and chips, behind everything.
+            for q in &frame.deco {
+                window.paint_quad(q.clone());
             }
             for q in &frame.under {
                 window.paint_quad(q.clone());
@@ -633,7 +848,7 @@ impl Element for EditorElement {
             for (r, color) in &frame.rects {
                 window.paint_quad(fill(*r, *color));
             }
-            // List markers and task boxes, in the margin.
+            // List markers in the margin, and task boxes.
             for (_, origin, l) in &frame.lines {
                 let row = origin.y + l.pad_top;
                 if let Some(g) = &l.gutter {
@@ -648,25 +863,32 @@ impl Element for EditorElement {
                     )
                     .ok();
                 }
-                if let Some(Gutter::Task { .. }) = &l.display.gutter {
-                    let done = matches!(l.display.gutter, Some(Gutter::Task { done: true, .. }));
-                    let side = px(14.);
-                    let x = origin.x + l.indent - px(LIST_INDENT) + px(4.);
-                    let y = row + (l.line_height - side) / 2.;
-                    let b = Bounds::new(point(x, y), size(side, side));
-                    if done {
-                        window.paint_quad(fill(b, frame.box_fill).corner_radii(px(3.)));
-                        // A tick: two strokes as thin rotated quads aren't
-                        // available, so a small inner square reads as done.
-                        let inner =
-                            Bounds::new(point(x + px(4.), y + px(4.)), size(px(6.), px(6.)));
-                        window.paint_quad(fill(inner, frame.check).corner_radii(px(1.5)));
-                    } else {
-                        window.paint_quad(
-                            outline(b, frame.box_border, BorderStyle::Solid).corner_radii(px(3.)),
-                        );
-                    }
+            }
+            for t in &frame.tasks {
+                t.paint(window);
+            }
+            // Code blocks' copy buttons.
+            for (b, hitbox, ix) in &frame.copy {
+                let ink = if frame.copied == Some(*ix) {
+                    frame.copied_ink
+                } else {
+                    frame.copy_ink
+                };
+                if hitbox.is_hovered(window) {
+                    window.paint_quad(fill(*b, frame.copy_hover).corner_radii(px(6.)));
                 }
+                let icon =
+                    Bounds::new(b.center() - point(px(6.5), px(6.5)), size(px(13.), px(13.)));
+                window
+                    .paint_svg(
+                        icon,
+                        gpui_kit::assets::IconName::Copy.path(),
+                        None,
+                        TransformationMatrix::unit(),
+                        ink,
+                        cx,
+                    )
+                    .ok();
             }
             for (_, origin, l) in &frame.lines {
                 if let Some(g) = &l.grid {

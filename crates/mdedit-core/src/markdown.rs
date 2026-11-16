@@ -17,6 +17,8 @@ pub fn to_html(md: &str) -> String {
     opts.insert(Options::ENABLE_TASKLISTS);
     opts.insert(Options::ENABLE_GFM);
     opts.insert(Options::ENABLE_MATH);
+    // Frontmatter is the document's data, not its text.
+    let md = &md[crate::syntax::frontmatter_end(md).unwrap_or(0)..];
     let parser = Parser::new_ext(md, opts);
     let mut out = String::new();
     let events = TableWidths::new(MermaidFences::new(parser)).map(render_math);
@@ -169,6 +171,14 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for TableWidths<'a, I> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frontmatter_is_left_out() {
+        let html = to_html("---\ntitle: x\n---\n\n# Head\n");
+        assert!(!html.contains("title"), "{html}");
+        assert!(!html.contains("<hr"), "{html}");
+        assert!(html.contains("<h1>Head</h1>"), "{html}");
+    }
 
     #[test]
     fn renders_gfm_extensions() {

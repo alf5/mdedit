@@ -210,6 +210,24 @@ impl Syntax {
             .take_while(move |s| s.range.start < range.end)
     }
 
+    /// Outline numbers for the headings, `1.`, `1.1.`, … counted from the
+    /// shallowest level used, keyed by heading line.
+    pub fn heading_numbers(&self) -> std::collections::HashMap<usize, String> {
+        let top = self.headings.iter().map(|h| h.level).min().unwrap_or(1);
+        let mut counters = [0usize; 6];
+        let mut out = std::collections::HashMap::new();
+        for h in &self.headings {
+            let depth = (h.level - top) as usize;
+            counters[depth] += 1;
+            for c in counters.iter_mut().skip(depth + 1) {
+                *c = 0;
+            }
+            let n: Vec<String> = counters[..=depth].iter().map(|c| c.to_string()).collect();
+            out.insert(h.line, format!("{}.", n.join(".")));
+        }
+        out
+    }
+
     /// The widget whose source lines hold line `line`.
     pub fn widget_at(&self, line: usize) -> Option<&Widget> {
         self.widgets.iter().find(|w| w.lines.contains(&line))
@@ -809,6 +827,16 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn headings_are_numbered_like_an_outline() {
+        let s = parse("## A\n\n### B\n\n### C\n\n## D\n\n#### E\n");
+        let n = s.heading_numbers();
+        let mut v: Vec<_> = n.into_iter().collect();
+        v.sort();
+        let v: Vec<&str> = v.iter().map(|(_, s)| s.as_str()).collect();
+        assert_eq!(v, ["1.", "1.1.", "1.2.", "2.", "2.0.1."]);
     }
 
     #[test]

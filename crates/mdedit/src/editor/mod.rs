@@ -200,7 +200,7 @@ impl MarkdownEditor {
             base_dir: None,
             pictures: HashMap::new(),
             code_colors: HashMap::new(),
-            allow_remote: false,
+            allow_remote: crate::state::AppState::try_prefs(cx).is_some_and(|p| p.remote_images),
             slots: Vec::new(),
             content_w: None,
             scroll_y: px(0.),
@@ -261,6 +261,11 @@ impl MarkdownEditor {
             cx.emit(EditorEvent::Moved);
             cx.notify();
         }
+    }
+
+    #[cfg(test)]
+    pub fn style(&self) -> &DocStyle {
+        &self.style
     }
 
     pub fn set_style(&mut self, style: DocStyle, cx: &mut Context<Self>) {
@@ -408,9 +413,8 @@ impl MarkdownEditor {
                         .get(*w)
                         .is_some_and(|w| w.kind == mdedit_core::syntax::WidgetKind::Table)
                 });
-                match left_table {
-                    Some(w) => self.tidy_table(w, cx),
-                    None => {}
+                if let Some(w) = left_table {
+                    self.tidy_table(w, cx);
                 }
                 self.rebuild_slots();
             }
@@ -561,13 +565,17 @@ impl MarkdownEditor {
             _ => text_h + pad_top,
         };
         let c = &self.style.colors;
-        let gutter = display.gutter.as_ref().and_then(|g| {
-            let (glyph, color) = match g {
-                Gutter::Bullet => ("•".to_string(), c.muted),
-                Gutter::Number(n) => (n.clone(), c.muted),
-                // Drawn as a box in `element.rs`.
-                Gutter::Task { .. } => return None,
-            };
+        let number = (rich && self.style.numbered && matches!(line.kind, LineKind::Heading(_)))
+            .then(|| self.syntax.heading_numbers().remove(&row.lines.start))
+            .flatten();
+        let gutter_glyph = number.map(|n| (n, c.muted)).or_else(|| {
+            display.gutter.as_ref().and_then(|g| match g {
+                Gutter::Bullet => Some(("•".to_string(), c.muted)),
+                Gutter::Number(n) => Some((n.clone(), c.muted)),
+                Gutter::Task { .. } => None,
+            })
+        });
+        let gutter = gutter_glyph.map(|(glyph, color)| {
             let run = TextRun {
                 len: glyph.len(),
                 font: font(self.style.font.clone()),
@@ -576,11 +584,9 @@ impl MarkdownEditor {
                 underline: None,
                 strikethrough: None,
             };
-            Some(
-                window
-                    .text_system()
-                    .shape_line(glyph.into(), size, &[run], None),
-            )
+            window
+                .text_system()
+                .shape_line(glyph.into(), size, &[run], None)
         });
         let layout = Rc::new(LineLayout {
             gutter,

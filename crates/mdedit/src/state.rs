@@ -32,6 +32,11 @@ impl AppState {
         &cx.global::<AppState>().prefs
     }
 
+    /// The settings, where there may be none yet (some tests).
+    pub fn try_prefs(cx: &App) -> Option<&Prefs> {
+        cx.try_global::<AppState>().map(|s| &s.prefs)
+    }
+
     /// Change the settings and write them out. Saving is cheap and rare
     /// (a theme pick, an open), so it happens on every change rather than
     /// on exit, which a crash would skip.

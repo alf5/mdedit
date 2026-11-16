@@ -20,6 +20,7 @@ use crate::editor::find_bar::{FindBar, FindBarEvent};
 use crate::editor::style::DocStyle;
 use crate::editor::{EditorEvent, MarkdownEditor};
 use crate::hex_view::{HexEvent, HexView};
+use crate::settings::SettingsPage;
 use crate::state::AppState;
 use crate::theme::{MONO_FONT, UI_FONT};
 
@@ -42,6 +43,7 @@ pub enum Body {
     Oversized {
         size: u64,
     },
+    Settings(Entity<SettingsPage>),
 }
 
 /// Something about the tab changed: modified state, name, or content.
@@ -85,6 +87,7 @@ impl Focusable for DocView {
             Body::Markdown { editor, .. } => editor.focus_handle(cx),
             Body::Text { editor, .. } => editor.focus_handle(cx),
             Body::Hex(hex) => hex.focus_handle(cx),
+            Body::Settings(page) => page.focus_handle(cx),
             _ => self.focus.clone(),
         }
     }
@@ -133,6 +136,17 @@ impl DocView {
         }
         doc.dirty = true;
         doc
+    }
+
+    /// The Settings tab.
+    pub fn settings(cx: &mut Context<Self>) -> Self {
+        let mut doc = Self::blank(None, cx);
+        doc.body = Body::Settings(cx.new(SettingsPage::new));
+        doc
+    }
+
+    pub fn is_settings(&self) -> bool {
+        matches!(self.body, Body::Settings(_))
     }
 
     pub fn from_file(file: AnyFile, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -450,6 +464,9 @@ impl DocView {
     }
 
     pub fn name(&self) -> String {
+        if self.is_settings() {
+            return "Settings".into();
+        }
         match &self.path {
             Some(p) => project::file_name_of(p),
             None if self.untitled > 1 => format!("Untitled {}", self.untitled),
@@ -529,6 +546,7 @@ impl DocView {
                 ]
             }
             Body::Oversized { size } => vec![project::human_size(*size).into()],
+            Body::Settings(_) => Vec::new(),
         }
     }
 
@@ -597,6 +615,7 @@ impl Render for DocView {
                 .text_color(muted)
                 .child("mdedit can't display this kind of image."),
             Body::Hex(hex) => page.child(hex.clone()),
+            Body::Settings(settings) => page.child(settings.clone()),
             Body::Oversized { size } => {
                 page.flex()
                     .flex_col()

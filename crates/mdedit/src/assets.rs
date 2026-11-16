@@ -6,7 +6,9 @@ use gpui_kit::*;
 
 gpui_kit::assets::icon_assets!(
     ExtraIcons,
-    [Columns2, Save, FilePlus, Image, Binary, FileCode, X]
+    [
+        Columns2, Save, FilePlus, Image, Binary, FileCode, X, Settings
+    ]
 );
 
 pub struct Assets;

@@ -1162,6 +1162,22 @@ impl Workspace {
         }
     }
 
+    /// Settings is a tab like any other, and there's only ever one.
+    fn open_settings(&mut self, _: &OpenSettings, window: &mut Window, cx: &mut Context<Self>) {
+        let open = self.docs().find(|d| d.read(cx).is_settings()).cloned();
+        if let Some(doc) = open {
+            self.activate_doc(&doc, window, cx);
+            return;
+        }
+        let doc = cx.new(DocView::settings);
+        self.add_doc(doc, window, cx);
+    }
+
+    fn prefs_changed(&mut self, _: &PrefsChanged, _: &mut Window, cx: &mut Context<Self>) {
+        self.restyle(cx);
+        cx.notify();
+    }
+
     fn about(&mut self, _: &About, window: &mut Window, cx: &mut Context<Self>) {
         window.open_dialog(cx, |dialog, _, _| {
             dialog.title("mdedit").width(px(360.)).child(format!(
@@ -1387,15 +1403,18 @@ impl Workspace {
             .icon(IconName::Menu)
             .tooltip("Menu")
             .dropdown_menu(move |menu, window, cx| {
-                let (has_doc, can_save_as, split, sidebar, has_markdown) = ws
+                let (has_doc, can_save_as, split, sidebar, has_markdown, undo, redo) = ws
                     .read_with(cx, |ws, cx| {
                         let doc = ws.active_doc().map(|d| d.read(cx));
+                        let editor = doc.and_then(|d| d.markdown()).map(|e| e.read(cx));
                         (
                             doc.is_some(),
                             doc.is_some_and(|d| d.can_save_as()),
                             ws.panes.len() > 1,
                             ws.sidebar_open,
-                            doc.is_some_and(|d| d.markdown().is_some()),
+                            editor.is_some(),
+                            editor.is_some_and(|e| e.can_undo()),
+                            editor.is_some_and(|e| e.can_redo()),
                         )
                     })
                     .unwrap_or_default();
@@ -1445,6 +1464,22 @@ impl Workspace {
                     .separator()
                     .menu_with_disabled("Close Tab", Box::new(CloseTab), !has_doc)
                     .separator()
+                    .submenu("Edit", window, cx, move |m, _, _| {
+                        m.menu_with_disabled("Undo", Box::new(Undo), !undo)
+                            .menu_with_disabled("Redo", Box::new(Redo), !redo)
+                            .separator()
+                            .menu_with_disabled("Cut", Box::new(Cut), !has_markdown)
+                            .menu_with_disabled("Copy", Box::new(Copy), !has_markdown)
+                            .menu_with_disabled("Paste", Box::new(Paste), !has_markdown)
+                            .menu_with_disabled("Select All", Box::new(SelectAll), !has_markdown)
+                            .separator()
+                            .menu_with_disabled("Find…", Box::new(Find), !has_markdown)
+                            .menu_with_disabled(
+                                "Find and Replace…",
+                                Box::new(FindReplace),
+                                !has_markdown,
+                            )
+                    })
                     .submenu("View", window, cx, move |m, _, _| {
                         m.menu_with_check("Sidebar", sidebar, Box::new(ToggleSidebar))
                             .separator()
@@ -1465,6 +1500,7 @@ impl Workspace {
                     .submenu("Theme", window, cx, move |m, window, cx| {
                         theme_menu(m, &current_theme, window, cx)
                     })
+                    .menu("Settings…", Box::new(OpenSettings))
                     .separator()
                     .menu("About mdedit", Box::new(About))
                     .menu("Quit", Box::new(Quit))
@@ -1525,6 +1561,16 @@ impl Workspace {
                             .tooltip("Command Palette")
                             .on_click(|_, window, cx| {
                                 window.dispatch_action(Box::new(CommandPalette), cx)
+                            }),
+                    )
+                    .child(
+                        Button::new("settings")
+                            .ghost()
+                            .small()
+                            .icon(gpui_kit::assets::IconName::Settings)
+                            .tooltip("Settings")
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(OpenSettings), cx)
                             }),
                     )
                     .child(
@@ -1767,7 +1813,13 @@ impl Workspace {
                             format!("{dir}/{name}")
                         }
                     })
-                    .unwrap_or_else(|| "Not saved yet".into());
+                    .unwrap_or_else(|| {
+                        if d.is_settings() {
+                            "Changes apply at once and are saved.".into()
+                        } else {
+                            "Not saved yet".into()
+                        }
+                    });
                 let hex_mode = d.hex().map(|h| h.read(cx).overwrite);
                 (path, d.status(cx), hex_mode)
             }
@@ -2075,6 +2127,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::reveal))
             .on_action(cx.listener(Self::set_theme))
             .on_action(cx.listener(Self::about))
+            .on_action(cx.listener(Self::open_settings))
+            .on_action(cx.listener(Self::prefs_changed))
             .on_action(cx.listener(Self::toggle_hex_overwrite))
             .drag_over::<ExternalPaths>(move |s, _, _, _| s.bg(drop_bg))
             .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
@@ -2255,6 +2309,56 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         assert_eq!(ws.read_with(cx, |ws, _| ws.sidebar_open), !open);
+    }
+
+    #[gpui_kit::test]
+    fn settings_open_once_and_apply_at_once(cx: &mut TestAppContext) {
+        let (h, ws) = setup(cx);
+        act(cx, h, NewFile);
+        for _ in 0..2 {
+            cx.update_window(h, |_, window, cx| window.press("ctrl-,", cx))
+                .unwrap();
+            cx.run_until_parked();
+        }
+        assert_eq!(tabs(cx, &ws), vec![vec!["Untitled", "Settings"]]);
+
+        cx.update_window(h, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("theme-apple-dark", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|cx| AppState::prefs(cx).theme.clone()),
+            "apple-dark"
+        );
+
+        // The style cards are further down the page.
+        cx.update_window(h, |_, window, cx| {
+            window.scroll(
+                "theme-apple-dark",
+                gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-900.))),
+                cx,
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(h, |_, window, cx| {
+            window.render_frame(cx);
+            window.click("style-Manuscript", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|cx| AppState::prefs(cx).style),
+            mdedit_core::prefs::Style::Manuscript
+        );
+        // The open document took the new typography without being touched.
+        let font = ws.read_with(cx, |ws, cx| {
+            let doc = ws.panes[0].tabs[0].read(cx);
+            doc.markdown().unwrap().read(cx).style().font.clone()
+        });
+        assert_eq!(font.as_ref(), crate::theme::SERIF_FONT);
     }
 
     #[gpui_kit::test]

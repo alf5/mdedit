@@ -103,6 +103,7 @@ fn commands(markdown: bool) -> Groups {
             entry("Join Sides", JoinPanes),
             entry("Next Document", NextTab),
             entry("Previous Document", PrevTab),
+            entry("Settings", OpenSettings),
             entry("About mdedit", About),
         ],
     ));
@@ -168,6 +169,9 @@ pub fn open_commands(markdown: bool, window: &mut Window, cx: &mut App) {
     });
 }
 
+/// A heading in Quick Open and the files under it, as (label, path).
+type Section = (&'static str, Vec<(SharedString, PathBuf)>);
+
 /// Open Quick Open: `recent` first, then `files` (relative to `root`).
 pub fn open_files(
     recent: Vec<PathBuf>,
@@ -190,7 +194,7 @@ pub fn open_files(
             }
         }
     };
-    let sections: Rc<Vec<(&'static str, Vec<(SharedString, PathBuf)>)>> = Rc::new(
+    let sections: Rc<Vec<Section>> = Rc::new(
         [("Recent", recent), ("Folder", files)]
             .into_iter()
             .filter(|(_, v)| !v.is_empty())

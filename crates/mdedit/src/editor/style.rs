@@ -34,6 +34,8 @@ pub struct DocStyle {
     /// The reading column; `None` fills the pane.
     pub width: Option<f32>,
     pub muted_body: bool,
+    /// Outline numbers on headings.
+    pub numbered: bool,
     pub colors: Colors,
     /// The theme's palette as is, for what's drawn outside GPUI (diagrams,
     /// formulas).
@@ -72,6 +74,7 @@ impl DocStyle {
             leading,
             width,
             muted_body,
+            numbered: prefs.numbered,
             colors: Colors {
                 text: hsla(p.text),
                 muted: hsla(p.text_muted),

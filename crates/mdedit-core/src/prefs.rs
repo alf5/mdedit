@@ -89,6 +89,8 @@ pub struct Prefs {
     pub font_size: f32,
     pub sidebar_open: bool,
     pub sidebar_width: f32,
+    /// Load documents' images from the web without asking.
+    pub remote_images: bool,
 }
 
 impl Default for Prefs {
@@ -103,6 +105,7 @@ impl Default for Prefs {
             font_size: 16.0,
             sidebar_open: true,
             sidebar_width: 240.0,
+            remote_images: false,
         }
     }
 }

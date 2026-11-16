@@ -35,6 +35,8 @@ gpui_kit::actions!(
         ClearRecent,
         RevealInFileManager,
         About,
+        OpenSettings,
+        PrefsChanged,
         ToggleHexOverwrite,
         HexUndo,
         HexRedo,
@@ -156,6 +158,7 @@ pub fn bind_keys(cx: &mut App) {
     let ws = Some("Workspace");
     bind(cx, "secondary-n", NewFile, ws);
     bind(cx, "secondary-o", Open, ws);
+    bind(cx, "secondary-,", OpenSettings, ws);
     bind(cx, "secondary-shift-k", OpenFolder, ws);
     bind(cx, "secondary-s", Save, ws);
     bind(cx, "secondary-shift-s", SaveAs, ws);

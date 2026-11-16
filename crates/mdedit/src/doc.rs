@@ -150,7 +150,16 @@ impl DocView {
         let mode = prefs.mode;
         let style = DocStyle::new(prefs, crate::theme::palette(cx));
         let saved = text.clone();
-        let editor = cx.new(|cx| MarkdownEditor::new(text, mode, style, cx));
+        let base_dir = self
+            .path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf);
+        let editor = cx.new(|cx| {
+            let mut e = MarkdownEditor::new(text, mode, style, cx);
+            e.set_base_dir(base_dir, cx);
+            e
+        });
         self._subs
             .push(cx.subscribe(&editor, |this, editor, ev: &EditorEvent, cx| {
                 // Escape in the text closes the search too.
@@ -326,6 +335,10 @@ impl DocView {
             _ => return Err("This tab has nothing to save.".into()),
         }
         self.path = Some(project::canonical(path));
+        if let Body::Markdown { editor, .. } = &self.body {
+            let dir = path.parent().map(Path::to_path_buf);
+            editor.update(cx, |e, cx| e.set_base_dir(dir, cx));
+        }
         self.dirty = false;
         cx.emit(DocEvent::Changed);
         cx.notify();

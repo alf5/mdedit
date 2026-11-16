@@ -22,6 +22,8 @@ pub enum Role {
     TaskDone,
     /// A code fence's language.
     Lang,
+    /// An alert's title, drawn in place of its `[!NOTE]`.
+    Alert,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -264,6 +266,7 @@ pub fn display_line(text: &str, syntax: &Syntax, ix: usize, reveal: Reveal) -> D
             }
             MarkupKind::Number => out.push(src, r.clone(), true, 0, Role::Number),
             MarkupKind::Bullet => out.push("", r.clone(), false, 0, Role::Text),
+            MarkupKind::Alert(a) => out.push(a.title(), r.clone(), false, style::BOLD, Role::Alert),
             MarkupKind::TaskBox(done) => {
                 out.push("", r.clone(), false, 0, Role::Text);
                 out.gutter = Some(Gutter::Task {
@@ -296,29 +299,85 @@ fn plain(out: &mut DisplayLine, text: &str, r: Range<usize>, lang: &Option<Range
     out.push(&text[r.clone()], r, true, 0, role);
 }
 
-/// Source lines drawn together as one row, as ranges of line indices. In
-/// the rendered modes a paragraph's lines flow as one, so hard-wrapped text
-/// reads as prose; a hard line break (`\` or two spaces at the end) still
-/// ends a row. In Source mode every line is its own row.
-pub fn rows(text: &str, syntax: &Syntax, rich: bool) -> Vec<Range<usize>> {
+/// How a row is drawn when it isn't text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowWidget {
+    /// The widget (an index into `Syntax::widgets`) in place of its source.
+    Closed(usize),
+    /// The source is shown (the caret is in it) and the widget is drawn
+    /// under this row, its last line, as a live preview.
+    Preview(usize),
+}
+
+/// One drawn row: the source lines it covers (indices) and, if it's a
+/// widget, which.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Row {
+    pub lines: Range<usize>,
+    pub widget: Option<RowWidget>,
+}
+
+/// The rows a document is drawn as. In the rendered modes a paragraph's
+/// lines flow as one row, so hard-wrapped text reads as prose (a hard line
+/// break, `\\` or two spaces at the end, still ends a row), and widgets
+/// (tables, diagrams, formulas, images) are drawn in place of their
+/// source, except the one holding the caret line `open`, whose source is
+/// shown. In Source mode every line is its own row.
+pub fn rows(text: &str, syntax: &Syntax, rich: bool, open: Option<usize>) -> Vec<Row> {
     let lines = &syntax.lines;
-    let mut out: Vec<Range<usize>> = Vec::with_capacity(lines.len());
-    for (i, line) in lines.iter().enumerate() {
+    let mut out: Vec<Row> = Vec::with_capacity(lines.len());
+    let mut i = 0;
+    while i < lines.len() {
+        if rich
+            && let Some((w_ix, w)) = syntax
+                .widgets
+                .iter()
+                .enumerate()
+                .find(|(_, w)| w.lines.start == i)
+        {
+            let end = w.lines.end.min(lines.len());
+            let is_open = open.is_some_and(|o| w.lines.contains(&o));
+            if !is_open {
+                out.push(Row {
+                    lines: i..end,
+                    widget: Some(RowWidget::Closed(w_ix)),
+                });
+            } else {
+                for l in i..end {
+                    let last = l + 1 == end;
+                    let preview = last && !matches!(w.kind, crate::syntax::WidgetKind::Table);
+                    out.push(Row {
+                        lines: l..l + 1,
+                        widget: preview.then_some(RowWidget::Preview(w_ix)),
+                    });
+                }
+            }
+            i = end;
+            continue;
+        }
+        let line = &lines[i];
         let joins = rich
             && i > 0
             && line.kind == LineKind::Paragraph
             && line.para.is_some()
             && lines[i - 1].para == line.para
             && lines[i - 1].kind == LineKind::Paragraph
+            && out
+                .last()
+                .is_some_and(|r| r.widget.is_none() && r.lines.end == i)
             && {
                 let prev = &text[lines[i - 1].range.clone()];
                 !(prev.ends_with('\\') || prev.ends_with("  "))
             }
             && !starts_item(syntax, i);
         match out.last_mut() {
-            Some(row) if joins => row.end = i + 1,
-            _ => out.push(i..i + 1),
+            Some(row) if joins => row.lines.end = i + 1,
+            _ => out.push(Row {
+                lines: i..i + 1,
+                widget: None,
+            }),
         }
+        i += 1;
     }
     out
 }
@@ -491,10 +550,10 @@ mod tests {
     fn hard_wrapped_paragraphs_flow_as_one_row() {
         let text = "one\ntwo\n\n- item\n  more\n- next\n\nbreak\\\nhere\n> a\n> b";
         let s = parse(text);
-        let rows = rows(text, &s, true);
+        let rows = rows(text, &s, true, None);
         let shown: Vec<String> = rows
             .iter()
-            .map(|r| display_row(text, &s, r.clone(), Reveal::Hide).text)
+            .map(|r| display_row(text, &s, r.lines.clone(), Reveal::Hide).text)
             .collect();
         assert_eq!(
             shown,
@@ -509,14 +568,51 @@ mod tests {
                 "a b"
             ]
         );
-        assert_eq!(super::rows(text, &s, false).len(), s.lines.len());
+        assert_eq!(super::rows(text, &s, false, None).len(), s.lines.len());
         // The joining space maps to the newline, both ways.
-        let d = display_row(text, &s, rows[0].clone(), Reveal::Hide);
+        let d = display_row(text, &s, rows[0].lines.clone(), Reveal::Hide);
         assert_eq!(d.to_source(3), 3);
         assert_eq!(d.to_source(4), 4);
         assert_eq!(d.to_display(4), 4);
         assert_eq!(d.to_display(7), 7);
         assert_eq!(d.source, 0..7);
+    }
+
+    #[test]
+    fn widgets_close_into_one_row_and_open_around_the_caret() {
+        let text = "intro\n\n```mermaid\ngraph TD\n```\n\n| a |\n|---|\n| 1 |";
+        let s = parse(text);
+        let closed = rows(text, &s, true, Some(0));
+        let w: Vec<_> = closed.iter().map(|r| (r.lines.clone(), r.widget)).collect();
+        assert_eq!(
+            w,
+            [
+                (0..1, None),
+                (1..2, None),
+                (2..5, Some(RowWidget::Closed(0))),
+                (5..6, None),
+                (6..9, Some(RowWidget::Closed(1))),
+            ]
+        );
+        // The caret in the diagram: its lines show, the last with the preview.
+        let open = rows(text, &s, true, Some(3));
+        assert_eq!(open[2].widget, None);
+        assert_eq!(open[4].lines, 4..5);
+        assert_eq!(open[4].widget, Some(RowWidget::Preview(0)));
+        // In a table: plain source rows, no preview.
+        let table = rows(text, &s, true, Some(7));
+        assert!(table.iter().all(|r| r.widget != Some(RowWidget::Closed(1))));
+        assert!(
+            table
+                .iter()
+                .all(|r| r.widget.is_none() || r.widget == Some(RowWidget::Closed(0)))
+        );
+        // Source mode never draws widgets.
+        assert!(
+            rows(text, &s, false, None)
+                .iter()
+                .all(|r| r.widget.is_none())
+        );
     }
 
     #[test]

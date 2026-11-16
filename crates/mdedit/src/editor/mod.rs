@@ -14,14 +14,18 @@ mod element;
 pub mod find_bar;
 mod overlays;
 pub mod style;
+mod widgets;
 
+use std::cell::Cell;
+use std::collections::HashMap;
 use std::ops::Range;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Instant;
 
 use gpui_kit::*;
 use mdedit_core::buffer::{self, Change, Edit, Selection};
-use mdedit_core::display::{self, DisplayLine, Gutter, Reveal, Role};
+use mdedit_core::display::{self, DisplayLine, Gutter, Reveal, Role, Row, RowWidget};
 use mdedit_core::history::{History, Kind};
 use mdedit_core::prefs::Mode;
 use mdedit_core::syntax::{self, LineKind, Syntax};
@@ -48,7 +52,13 @@ pub(crate) struct LineLayout {
     pub pad_top: Pixels,
     /// Where the text starts, from the left of the reading column.
     pub indent: Pixels,
-    pub height: Pixels,
+    /// The row's whole height; a widget's is measured each frame, since an
+    /// image can arrive after the first one.
+    pub height: Cell<Pixels>,
+    /// The text's height (zero for a closed widget).
+    pub text_h: Pixels,
+    pub widget: Option<RowWidget>,
+    pub alert: Option<mdedit_core::syntax::Alert>,
     /// A list marker drawn in the margin before the text.
     pub gutter: Option<ShapedLine>,
 }
@@ -118,9 +128,12 @@ pub struct MarkdownEditor {
     mode: Mode,
     style: DocStyle,
     focus: FocusHandle,
-    /// Source lines drawn together, as ranges of line indices (see
-    /// `display::rows`); one slot per row.
-    rows: Vec<Range<usize>>,
+    /// Source lines drawn together (see `display::rows`); one slot per row.
+    rows: Vec<Row>,
+    /// Where relative image paths are looked up: the document's folder.
+    base_dir: Option<PathBuf>,
+    /// Drawn diagrams and formulas, by source and look.
+    pictures: HashMap<u64, widgets::Picture>,
     slots: Vec<Slot>,
     content_w: Option<Pixels>,
     scroll_y: Pixels,
@@ -172,6 +185,8 @@ impl MarkdownEditor {
             style,
             focus: cx.focus_handle(),
             rows: Vec::new(),
+            base_dir: None,
+            pictures: HashMap::new(),
             slots: Vec::new(),
             content_w: None,
             scroll_y: px(0.),
@@ -271,7 +286,8 @@ impl MarkdownEditor {
 
     fn rebuild_slots(&mut self) {
         let old = std::mem::take(&mut self.slots);
-        self.rows = display::rows(&self.text, &self.syntax, self.rich());
+        let caret_line = self.syntax.line_at(self.sel.head.min(self.text.len()));
+        self.rows = display::rows(&self.text, &self.syntax, self.rich(), Some(caret_line));
         self.slots = self
             .rows
             .iter()
@@ -284,7 +300,10 @@ impl MarkdownEditor {
                     .get(i)
                     .filter(|_| old.len() == self.rows.len())
                     .map_or_else(
-                        || self.estimate(self.syntax.lines[r.start].kind) * r.len() as f32,
+                        || {
+                            self.estimate(self.syntax.lines[r.lines.start].kind)
+                                * r.lines.len() as f32
+                        },
                         |s| s.height,
                     ),
                 layout: None,
@@ -296,13 +315,13 @@ impl MarkdownEditor {
     fn row_at(&self, pos: usize) -> usize {
         let line = self.syntax.line_at(pos);
         self.rows
-            .partition_point(|r| r.end <= line)
+            .partition_point(|r| r.lines.end <= line)
             .min(self.rows.len().saturating_sub(1))
     }
 
     /// The source a row covers, without its final newline.
     fn row_range(&self, ix: usize) -> Range<usize> {
-        let r = &self.rows[ix];
+        let r = &self.rows[ix].lines;
         self.syntax.lines[r.start].range.start..self.syntax.lines[r.end - 1].range.end
     }
 
@@ -363,7 +382,24 @@ impl MarkdownEditor {
         let sel = sel.clamp(self.text.len());
         if sel != self.sel {
             self.history.seal();
+            let was_in = self.widget_at(self.sel.head);
             self.sel = sel;
+            let now_in = self.widget_at(self.sel.head);
+            if was_in != now_in && self.rich() {
+                // Leaving a table pads its source again (which re-lays the
+                // rows); otherwise just open or close the widget.
+                let left_table = was_in.filter(|w| {
+                    self.syntax
+                        .widgets
+                        .get(*w)
+                        .is_some_and(|w| w.kind == mdedit_core::syntax::WidgetKind::Table)
+                });
+                match left_table {
+                    Some(w) => self.tidy_table(w, cx),
+                    None => {}
+                }
+                self.rebuild_slots();
+            }
             self.update_reveal();
             self.update_slash(None);
             self.autoscroll = true;
@@ -411,11 +447,45 @@ impl MarkdownEditor {
             return l;
         }
         let content_w = self.content_w.unwrap_or(px(700.));
-        let line = self.syntax.lines[self.rows[ix].start].clone();
+        let row = self.rows[ix].clone();
+        let line = self.syntax.lines[row.lines.start].clone();
+        if let Some(RowWidget::Closed(_)) = row.widget {
+            // Drawn by `widget_element`; no text of its own. The caret never
+            // rests inside it: going in opens it.
+            let range = self.row_range(ix);
+            let display = DisplayLine {
+                segs: vec![display::Seg {
+                    display: 0..0,
+                    source: range.end..range.end,
+                    copy: true,
+                }],
+                source: range,
+                ..Default::default()
+            };
+            let (_, lh) = self.style.metrics(LineKind::Paragraph, self.mode);
+            let layout = Rc::new(LineLayout {
+                gutter: None,
+                display,
+                shaped: WrappedLine::default(),
+                kind: line.kind,
+                quote: 0,
+                line_height: px(lh),
+                pad_top: px(0.),
+                indent: px(0.),
+                height: Cell::new(self.slots.get(ix).map_or(px(lh), |s| s.height)),
+                text_h: px(0.),
+                widget: row.widget,
+                alert: None,
+            });
+            if let Some(slot) = self.slots.get_mut(ix) {
+                slot.layout = Some(layout.clone());
+            }
+            return layout;
+        }
         let display = display::display_row(
             &self.text,
             &self.syntax,
-            self.rows[ix].clone(),
+            row.lines.clone(),
             self.reveal_of(ix),
         );
         let (size, lh) = self.style.metrics(line.kind, self.mode);
@@ -490,10 +560,15 @@ impl MarkdownEditor {
             line_height: lh,
             pad_top,
             indent,
-            height,
+            height: Cell::new(height),
+            text_h: height,
+            widget: row.widget,
+            alert: line.alert,
         });
         if let Some(slot) = self.slots.get_mut(ix) {
-            slot.height = layout.height;
+            if row.widget.is_none() {
+                slot.height = height;
+            }
             slot.layout = Some(layout.clone());
         }
         layout
@@ -514,6 +589,7 @@ impl MarkdownEditor {
         } else {
             base_color
         };
+        let alert_color = c.accent;
         d.runs
             .iter()
             .map(|r| {
@@ -540,6 +616,7 @@ impl MarkdownEditor {
                 let link = display::has(r.style, display::LINK | display::IMAGE);
                 let color = match r.role {
                     Role::Markup | Role::Bullet | Role::Number | Role::Lang => c.muted,
+                    Role::Alert => alert_color,
                     Role::TaskOpen | Role::TaskDone => c.accent,
                     Role::Text if link => c.accent,
                     Role::Text if display::has(r.style, display::MATH) => c.accent,
@@ -919,7 +996,7 @@ impl MarkdownEditor {
     }
 
     fn newline(&mut self, _: &Newline, _: &mut Window, cx: &mut Context<Self>) {
-        if self.slash_pick(cx) {
+        if self.slash_pick(cx) || self.table_key(widgets::TableKey::Down, cx) {
             return;
         }
         let in_code = matches!(self.caret_kind(), LineKind::Code | LineKind::FenceOpen);
@@ -933,7 +1010,7 @@ impl MarkdownEditor {
     }
 
     fn indent(&mut self, _: &Indent, _: &mut Window, cx: &mut Context<Self>) {
-        if self.slash_pick(cx) {
+        if self.slash_pick(cx) || self.table_key(widgets::TableKey::Next, cx) {
             return;
         }
         match edit::indent(&self.text, self.sel) {
@@ -946,6 +1023,9 @@ impl MarkdownEditor {
     }
 
     fn outdent(&mut self, _: &Outdent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.table_key(widgets::TableKey::Prev, cx) {
+            return;
+        }
         if let Some(c) = edit::outdent(&self.text, self.sel) {
             self.apply(c, Kind::Other, cx);
         }
@@ -1104,6 +1184,7 @@ impl MarkdownEditor {
     fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
         if self.slash.take().is_some() {
             cx.notify();
+        } else if self.table_key(widgets::TableKey::Leave, cx) {
         } else if self.find.is_some() {
             self.find = None;
             cx.emit(EditorEvent::Moved);
@@ -1203,7 +1284,7 @@ impl MarkdownEditor {
             return Some((first.0, 0, first.2.clone()));
         }
         for (ix, origin, layout) in lines {
-            if p.y < origin.y + layout.height {
+            if p.y < origin.y + layout.height.get() {
                 let local = point(p.x - origin.x, p.y - origin.y);
                 return Some((*ix, layout.index(local), layout.clone()));
             }
@@ -1217,7 +1298,7 @@ impl MarkdownEditor {
             .geometry
             .lines
             .iter()
-            .find(|(_, o, l)| p.y >= o.y && p.y < o.y + l.height)?;
+            .find(|(_, o, l)| p.y >= o.y && p.y < o.y + l.height.get())?;
         let local = p - *origin;
         match &l.display.gutter {
             Some(Gutter::Task { source, .. })

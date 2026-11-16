@@ -9,7 +9,9 @@
 
 use std::ops::Range;
 
-use pulldown_cmark::{CodeBlockKind, Event, LinkType, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    BlockQuoteKind, CodeBlockKind, Event, LinkType, Options, Parser, Tag, TagEnd,
+};
 
 /// Inline style flags.
 pub mod style {
@@ -53,6 +55,50 @@ pub enum MarkupKind {
     Fence,
     /// A thematic break's `---`: drawn as a rule.
     Rule,
+    /// An alert's `[!NOTE]`: drawn as its title.
+    Alert(Alert),
+}
+
+/// GitHub's alert kinds, `> [!NOTE]` and friends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Alert {
+    Note,
+    Tip,
+    Important,
+    Warning,
+    Caution,
+}
+
+impl Alert {
+    pub fn title(self) -> &'static str {
+        match self {
+            Alert::Note => "Note",
+            Alert::Tip => "Tip",
+            Alert::Important => "Important",
+            Alert::Warning => "Warning",
+            Alert::Caution => "Caution",
+        }
+    }
+}
+
+/// A block the rendered modes draw as something other than text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WidgetKind {
+    /// A pipe table (with its `zen:cols` comment, if one follows).
+    Table,
+    /// A ```` ```mermaid ```` fence; `body` is the diagram source.
+    Diagram { body: Range<usize> },
+    /// A paragraph that is only `$$…$$`; `body` is the formula.
+    Math { body: Range<usize> },
+    /// A paragraph that is only an image.
+    Image { url: String, alt: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Widget {
+    /// The source lines it covers.
+    pub lines: Range<usize>,
+    pub kind: WidgetKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,6 +134,7 @@ pub struct Line {
     /// The paragraph (or tight list item's text) this line is part of.
     /// Lines sharing one flow together in the rendered modes.
     pub para: Option<u32>,
+    pub alert: Option<Alert>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,6 +152,7 @@ pub struct Syntax {
     pub markup: Vec<Markup>,
     pub links: Vec<Link>,
     pub headings: Vec<Heading>,
+    pub widgets: Vec<Widget>,
 }
 
 pub fn options() -> Options {
@@ -127,6 +175,11 @@ struct Open {
     delimited: bool,
     autolink: bool,
     url: Option<String>,
+    paragraph: bool,
+    /// Direct children seen, and the image if the only one was an image.
+    kids: u32,
+    image: Option<(String, String)>,
+    alt: String,
 }
 
 impl Syntax {
@@ -155,6 +208,11 @@ impl Syntax {
         self.spans[first..]
             .iter()
             .take_while(move |s| s.range.start < range.end)
+    }
+
+    /// The widget whose source lines hold line `line`.
+    pub fn widget_at(&self, line: usize) -> Option<&Widget> {
+        self.widgets.iter().find(|w| w.lines.contains(&line))
     }
 
     /// The link whose text holds `pos`.
@@ -188,8 +246,10 @@ pub fn parse(text: &str) -> Syntax {
             list: 0,
             lang: None,
             para: None,
+            alert: None,
         })
         .collect();
+    let mut widgets: Vec<Widget> = Vec::new();
     let mut para_id = 0u32;
     let line_at =
         |pos: usize, lines: &[Line]| match lines.binary_search_by(|l| l.range.start.cmp(&pos)) {
@@ -204,6 +264,11 @@ pub fn parse(text: &str) -> Syntax {
     let mut stack: Vec<Open> = Vec::new();
     let mut heading_text: Option<(u8, usize, String)> = None;
 
+    let count = |stack: &mut Vec<Open>| {
+        if let Some(top) = stack.last_mut() {
+            top.kids += 1;
+        }
+    };
     let touch = |stack: &mut Vec<Open>, r: &Range<usize>| {
         if let Some(top) = stack.last_mut() {
             top.first_child.get_or_insert(r.start);
@@ -216,6 +281,7 @@ pub fn parse(text: &str) -> Syntax {
         match event {
             Event::Start(tag) => {
                 touch(&mut stack, &r);
+                count(&mut stack);
                 let mut open = Open {
                     style: 0,
                     range: r.clone(),
@@ -224,6 +290,10 @@ pub fn parse(text: &str) -> Syntax {
                     delimited: false,
                     autolink: false,
                     url: None,
+                    paragraph: false,
+                    kids: 0,
+                    image: None,
+                    alt: String::new(),
                 };
                 let (first, last) = (
                     line_at(r.start, &lines),
@@ -249,6 +319,29 @@ pub fn parse(text: &str) -> Syntax {
                     Tag::CodeBlock(kind) => {
                         for l in &mut lines[first..=last] {
                             l.kind = LineKind::Code;
+                        }
+                        if let CodeBlockKind::Fenced(info) = &kind
+                            && info
+                                .split_whitespace()
+                                .next()
+                                .is_some_and(|w| w.eq_ignore_ascii_case("mermaid"))
+                        {
+                            let body_start = (lines[first].range.end + 1).min(text.len());
+                            let closed = last > first && {
+                                let ct = text[lines[last].range.clone()].trim();
+                                !ct.is_empty() && ct.chars().all(|c| c == '`' || c == '~')
+                            };
+                            let body_end = if closed {
+                                lines[last].range.start
+                            } else {
+                                r.end
+                            };
+                            widgets.push(Widget {
+                                lines: first..last + 1,
+                                kind: WidgetKind::Diagram {
+                                    body: body_start..body_end.max(body_start),
+                                },
+                            });
                         }
                         if let CodeBlockKind::Fenced(_) = kind {
                             let open_line = &mut lines[first];
@@ -288,9 +381,30 @@ pub fn parse(text: &str) -> Syntax {
                             }
                         }
                     }
-                    Tag::BlockQuote(_) => {
+                    Tag::BlockQuote(kind) => {
+                        let alert = kind.map(|k| match k {
+                            BlockQuoteKind::Note => Alert::Note,
+                            BlockQuoteKind::Tip => Alert::Tip,
+                            BlockQuoteKind::Important => Alert::Important,
+                            BlockQuoteKind::Warning => Alert::Warning,
+                            BlockQuoteKind::Caution => Alert::Caution,
+                        });
                         for l in &mut lines[first..=last] {
                             l.quote += 1;
+                            if alert.is_some() {
+                                l.alert = alert;
+                            }
+                        }
+                        if let Some(alert) = alert {
+                            let lt = &text[lines[first].range.clone()];
+                            if let Some(i) = lt.find("[!") {
+                                let end = lt[i..].find(']').map_or(lt.len(), |j| i + j + 1);
+                                let s = lines[first].range.start;
+                                markup.push(Markup {
+                                    range: s + i..s + end,
+                                    kind: MarkupKind::Alert(alert),
+                                });
+                            }
                         }
                     }
                     Tag::Item => {
@@ -325,6 +439,7 @@ pub fn parse(text: &str) -> Syntax {
                         }
                     }
                     Tag::Paragraph => {
+                        open.paragraph = true;
                         para_id += 1;
                         for l in &mut lines[first..=last] {
                             l.para = Some(para_id);
@@ -334,6 +449,17 @@ pub fn parse(text: &str) -> Syntax {
                         for l in &mut lines[first..=last] {
                             l.kind = LineKind::Table;
                         }
+                        // The saved column widths ride along with the table.
+                        let mut end = last + 1;
+                        if let Some(next) = lines.get(last + 1)
+                            && crate::table::parse_cols_comment(&text[next.range.clone()]).is_some()
+                        {
+                            end += 1;
+                        }
+                        widgets.push(Widget {
+                            lines: first..end,
+                            kind: WidgetKind::Table,
+                        });
                     }
                     Tag::HtmlBlock => {
                         for l in &mut lines[first..=last] {
@@ -374,6 +500,25 @@ pub fn parse(text: &str) -> Syntax {
             Event::End(tag) => {
                 let Some(open) = stack.pop() else { continue };
                 touch(&mut stack, &open.range);
+                if matches!(tag, TagEnd::Image)
+                    && let Some(parent) = stack.last_mut()
+                {
+                    parent.image = Some((open.url.clone().unwrap_or_default(), open.alt.clone()));
+                }
+                if open.paragraph
+                    && open.kids == 1
+                    && let Some((url, alt)) = open.image.clone()
+                {
+                    let first = line_at(open.range.start, &lines);
+                    let last = line_at(
+                        open.range.end.saturating_sub(1).max(open.range.start),
+                        &lines,
+                    );
+                    widgets.push(Widget {
+                        lines: first..last + 1,
+                        kind: WidgetKind::Image { url, alt },
+                    });
+                }
                 if matches!(tag, TagEnd::Heading(_))
                     && let Some((level, line, text)) = heading_text.take()
                 {
@@ -429,6 +574,12 @@ pub fn parse(text: &str) -> Syntax {
             }
             Event::Text(t) => {
                 touch(&mut stack, &r);
+                count(&mut stack);
+                if let Some(top) = stack.last_mut()
+                    && top.style == style::IMAGE
+                {
+                    top.alt.push_str(&t);
+                }
                 if let Some((_, _, h)) = heading_text.as_mut() {
                     h.push_str(&t);
                 }
@@ -451,6 +602,7 @@ pub fn parse(text: &str) -> Syntax {
             }
             Event::Code(t) => {
                 touch(&mut stack, &r);
+                count(&mut stack);
                 if let Some((_, _, h)) = heading_text.as_mut() {
                     h.push_str(&t);
                 }
@@ -472,11 +624,27 @@ pub fn parse(text: &str) -> Syntax {
             }
             Event::InlineMath(_) | Event::DisplayMath(_) => {
                 touch(&mut stack, &r);
+                count(&mut stack);
                 let n = if matches!(event, Event::DisplayMath(_)) {
                     2
                 } else {
                     1
                 };
+                // A paragraph that is just `$$…$$` is a display formula.
+                if n == 2
+                    && let Some(top) = stack.last()
+                    && top.paragraph
+                    && text[top.range.clone()].trim() == text[r.clone()].trim()
+                {
+                    let first = line_at(r.start, &lines);
+                    let last = line_at(r.end.saturating_sub(1).max(r.start), &lines);
+                    widgets.push(Widget {
+                        lines: first..last + 1,
+                        kind: WidgetKind::Math {
+                            body: r.start + 2..r.end - 2,
+                        },
+                    });
+                }
                 if r.len() >= 2 * n {
                     markup.push(Markup {
                         range: r.start..r.start + n,
@@ -521,9 +689,13 @@ pub fn parse(text: &str) -> Syntax {
                     kind: MarkupKind::TaskBox(checked),
                 });
             }
-            _ => touch(&mut stack, &r),
+            _ => {
+                touch(&mut stack, &r);
+                count(&mut stack);
+            }
         }
     }
+    widgets.sort_by_key(|w| w.lines.start);
 
     // Quote prefixes, which pulldown doesn't report per line.
     for line in &lines {
@@ -562,6 +734,7 @@ pub fn parse(text: &str) -> Syntax {
         markup,
         links,
         headings,
+        widgets,
     }
 }
 
@@ -679,6 +852,44 @@ mod tests {
         assert_eq!(s.lines[2].kind, LineKind::FenceClose);
         assert_eq!(s.lines[4].kind, LineKind::Hr);
         assert_eq!(hidden(text), ["```", "```", "---"]);
+    }
+
+    #[test]
+    fn widgets_and_alerts() {
+        let text = "| a | b |\n|---|---|\n| 1 | 2 |\n<!-- zen:cols=80,auto -->\n\n```mermaid\ngraph TD\n  A-->B\n```\n\n$$\nx^2\n$$\n\n![a cat](cat.png)\n\nsee ![inline](x.png) here\n\n> [!WARNING]\n> careful\n";
+        let s = parse(text);
+        let kinds: Vec<_> = s
+            .widgets
+            .iter()
+            .map(|w| (w.lines.clone(), &w.kind))
+            .collect();
+        assert_eq!(kinds.len(), 4, "{kinds:?}");
+        assert_eq!(kinds[0], (0..4, &WidgetKind::Table));
+        match kinds[1].1 {
+            WidgetKind::Diagram { body } => assert_eq!(&text[body.clone()], "graph TD\n  A-->B\n"),
+            k => panic!("{k:?}"),
+        }
+        match kinds[2].1 {
+            WidgetKind::Math { body } => assert_eq!(text[body.clone()].trim(), "x^2"),
+            k => panic!("{k:?}"),
+        }
+        assert_eq!(
+            kinds[3].1,
+            &WidgetKind::Image {
+                url: "cat.png".into(),
+                alt: "a cat".into()
+            }
+        );
+        let alert_line = s.lines.iter().position(|l| l.alert.is_some()).unwrap();
+        assert_eq!(s.lines[alert_line].alert, Some(Alert::Warning));
+        assert!(
+            s.markup
+                .iter()
+                .any(|m| m.kind == MarkupKind::Alert(Alert::Warning)
+                    && &text[m.range.clone()] == "[!WARNING]")
+        );
+        assert!(s.widget_at(1).is_some());
+        assert!(s.widget_at(4).is_none());
     }
 
     #[test]

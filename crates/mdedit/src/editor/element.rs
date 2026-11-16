@@ -6,7 +6,7 @@ use gpui_kit::*;
 use mdedit_core::prefs::Mode;
 use mdedit_core::syntax::LineKind;
 
-use mdedit_core::display::Gutter;
+use mdedit_core::display::{Gutter, RowWidget};
 
 use super::{Geometry, LIST_INDENT, LineLayout, MarkdownEditor, Placed, max, min};
 
@@ -25,6 +25,7 @@ impl EditorElement {
 
 pub(crate) struct Frame {
     lines: Vec<Placed>,
+    widgets: Vec<AnyElement>,
     content_x: Pixels,
     content_w: Pixels,
     rects: Vec<(Bounds<Pixels>, Hsla)>,
@@ -37,6 +38,7 @@ pub(crate) struct Frame {
     rule: Hsla,
     caret_color: Hsla,
     thumb_color: Hsla,
+    alerts: [Hsla; 5],
     box_border: Hsla,
     box_fill: Hsla,
     check: Hsla,
@@ -90,12 +92,17 @@ fn range_rects(
     out
 }
 
+/// What `prepare` hands back: the visible rows, the widgets drawn among
+/// them (laid out and placed), the reading column, and the content height.
+type Prepared = (Vec<Placed>, Vec<AnyElement>, Pixels, Pixels, Pixels);
+
 impl MarkdownEditor {
     fn prepare(
         &mut self,
         bounds: Bounds<Pixels>,
         window: &mut Window,
-    ) -> (Vec<Placed>, Pixels, Pixels, Pixels) {
+        cx: &mut Context<Self>,
+    ) -> Prepared {
         let pad = px(PAD_X);
         let avail = max(bounds.size.width - pad * 2., px(160.));
         let content_w = match self.style.width {
@@ -134,17 +141,30 @@ impl MarkdownEditor {
 
         let mut y = top;
         let mut lines = Vec::new();
+        let mut widgets = Vec::new();
         let n = self.slots.len();
         for ix in 0..n {
             let h = self.slots[ix].height;
             if y + h >= self.scroll_y && y <= self.scroll_y + view_h {
                 let layout = self.layout(ix, window);
-                lines.push((
-                    ix,
-                    point(content_x, bounds.top() + y - self.scroll_y),
-                    layout.clone(),
-                ));
-                y += layout.height;
+                let origin = point(content_x, bounds.top() + y - self.scroll_y);
+                if let Some(RowWidget::Closed(w) | RowWidget::Preview(w)) = layout.widget {
+                    // Lay the widget out at the column's width, under the
+                    // row's text (a preview) or in place of it.
+                    let mut el = self.widget_element(w, content_w, cx);
+                    let space = size(
+                        AvailableSpace::Definite(content_w),
+                        AvailableSpace::MinContent,
+                    );
+                    let measured = el.layout_as_root(space, window, cx);
+                    el.prepaint_at(origin + point(px(0.), layout.text_h), window, cx);
+                    widgets.push(el);
+                    let height = layout.text_h + measured.height;
+                    layout.height.set(height);
+                    self.slots[ix].height = height;
+                }
+                lines.push((ix, origin, layout.clone()));
+                y += layout.height.get();
             } else {
                 y += h;
             }
@@ -155,7 +175,7 @@ impl MarkdownEditor {
         if self.scroll_y > max_scroll {
             self.scroll_y = max_scroll;
         }
-        (lines, content_x, content_w, total)
+        (lines, widgets, content_x, content_w, total)
     }
 }
 
@@ -194,8 +214,8 @@ impl Element for EditorElement {
         cx: &mut App,
     ) -> Frame {
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-        self.editor.update(cx, |ed, _| {
-            let (lines, content_x, content_w, total) = ed.prepare(bounds, window);
+        self.editor.update(cx, |ed, cx| {
+            let (lines, widgets, content_x, content_w, total) = ed.prepare(bounds, window, cx);
             let colors = ed.style.colors.clone();
             let mut rects = Vec::new();
 
@@ -256,6 +276,7 @@ impl Element for EditorElement {
             };
             Frame {
                 lines,
+                widgets,
                 content_x,
                 content_w,
                 rects,
@@ -268,6 +289,7 @@ impl Element for EditorElement {
                 rule: colors.border,
                 caret_color: colors.accent,
                 thumb_color: colors.muted.opacity(0.35),
+                alerts: colors.alerts,
                 box_border: colors.muted.opacity(0.7),
                 box_fill: colors.accent,
                 check: colors.text,
@@ -334,13 +356,14 @@ impl Element for EditorElement {
             // Block backgrounds and rules, behind everything.
             if frame.rich {
                 for (_, origin, l) in &frame.lines {
-                    let full = Bounds::new(*origin, size(frame.content_w, l.height));
+                    let full = Bounds::new(*origin, size(frame.content_w, l.height.get()));
                     match l.kind {
+                        _ if matches!(l.widget, Some(RowWidget::Closed(_))) => {}
                         LineKind::Code | LineKind::FenceOpen | LineKind::FenceClose => {
                             window.paint_quad(fill(full, frame.code_bg));
                         }
                         LineKind::Hr => {
-                            let y = origin.y + l.height / 2.;
+                            let y = origin.y + l.height.get() / 2.;
                             window.paint_quad(fill(
                                 Bounds::new(
                                     point(frame.content_x, y),
@@ -351,11 +374,12 @@ impl Element for EditorElement {
                         }
                         _ => {}
                     }
+                    let bar = l.alert.map_or(frame.quote, |a| frame.alerts[a as usize]);
                     for q in 0..l.quote {
                         let x = origin.x + px(q as f32 * 20. + 2.);
                         window.paint_quad(fill(
-                            Bounds::new(point(x, origin.y), size(px(3.), l.height)),
-                            frame.quote,
+                            Bounds::new(point(x, origin.y), size(px(3.), l.height.get())),
+                            bar,
                         ));
                     }
                 }
@@ -410,6 +434,9 @@ impl Element for EditorElement {
                         cx,
                     )
                     .ok();
+            }
+            for el in &mut frame.widgets {
+                el.paint(window, cx);
             }
             if focus.is_focused(window)
                 && let Some(c) = frame.caret

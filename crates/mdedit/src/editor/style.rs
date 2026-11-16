@@ -20,6 +20,8 @@ pub struct Colors {
     pub selection: Hsla,
     pub find: Hsla,
     pub find_current: Hsla,
+    pub danger: Hsla,
+    pub alerts: [Hsla; 5],
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -33,6 +35,9 @@ pub struct DocStyle {
     pub width: Option<f32>,
     pub muted_body: bool,
     pub colors: Colors,
+    /// The theme's palette as is, for what's drawn outside GPUI (diagrams,
+    /// formulas).
+    pub palette: Palette,
 }
 
 pub fn hsla(c: Rgba) -> Hsla {
@@ -77,7 +82,16 @@ impl DocStyle {
                 selection: accent.opacity(0.28),
                 find: hsla(p.alert_warning).opacity(0.30),
                 find_current: hsla(p.alert_warning).opacity(0.65),
+                danger: hsla(p.danger),
+                alerts: [
+                    hsla(p.alert_note),
+                    hsla(p.alert_tip),
+                    hsla(p.alert_important),
+                    hsla(p.alert_warning),
+                    hsla(p.alert_caution),
+                ],
             },
+            palette: p.clone(),
         }
     }
 

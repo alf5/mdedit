@@ -247,3 +247,43 @@ fn hard_wrapped_paragraphs_flow(cx: &mut TestAppContext) {
     let rows = ed.read_with(cx, |e, _| e.rows.len());
     assert_eq!(rows, 3, "source mode: a row per line");
 }
+
+#[gpui_kit::test]
+fn tables_open_as_source_and_tab_between_cells(cx: &mut TestAppContext) {
+    let src = "| a | b |\n|---|---|\n| 1 | 2 |\n\nafter";
+    let (h, ed) = open(cx, src, Mode::Rendered);
+    caret(cx, &ed, src.len());
+    let closed = ed.read_with(cx, |e, _| e.rows.iter().any(|r| r.widget.is_some()));
+    assert!(closed, "with the caret elsewhere the table is a grid");
+    // Leaving the table padded it, so find the cell in today's text.
+    let one = text(cx, &ed).find('1').unwrap();
+    caret(cx, &ed, one);
+    let open_now = ed.read_with(cx, |e, _| e.rows.iter().all(|r| r.widget.is_none()));
+    assert!(open_now, "the caret in it shows its source");
+    keys(cx, h, &["tab"]);
+    typed(cx, h, "x");
+    keys(cx, h, &["tab"]);
+    typed(cx, h, "new");
+    keys(cx, h, &["escape"]);
+    assert_eq!(
+        text(cx, &ed),
+        "| a   | b   |\n| --- | --- |\n| 1   | x2  |\n| new |     |\n\nafter"
+    );
+    // Out of the table, it's a grid again.
+    let closed = ed.read_with(cx, |e, _| e.rows.iter().any(|r| r.widget.is_some()));
+    assert!(closed);
+}
+
+#[gpui_kit::test]
+fn table_menu_commands_rewrite_the_table(cx: &mut TestAppContext) {
+    let src = "| n |\n|---|\n| 2 |\n| 1 |";
+    let (_, ed) = open(cx, src, Mode::Rendered);
+    ed.update(cx, |e, cx| {
+        e.table_op(0, super::widgets::TableOp::Sort(false), 1, 0, cx)
+    });
+    assert_eq!(text(cx, &ed), "| n   |\n| --- |\n| 1   |\n| 2   |");
+    ed.update(cx, |e, cx| {
+        e.table_op(0, super::widgets::TableOp::ColRight, 1, 0, cx)
+    });
+    assert!(text(cx, &ed).starts_with("| n   | Column 2 |"));
+}

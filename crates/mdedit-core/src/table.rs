@@ -553,3 +553,356 @@ mod tests {
         assert_eq!(v, vec!['d', 'b', 'c', 'a']);
     }
 }
+
+/// A table read from its source, with every cell's place in it, so the
+/// editor can put the caret in a cell and the commands can rewrite the
+/// table as a whole.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableModel {
+    /// Header first. Cell text is the markdown between the pipes, trimmed.
+    pub rows: Vec<Vec<String>>,
+    /// Where each cell's text is (an empty cell: where its text would go).
+    pub cells: Vec<Vec<std::ops::Range<usize>>>,
+    pub aligns: Vec<Align>,
+    pub widths: Vec<Option<u32>>,
+    /// The whole table, with its `zen:cols` comment if it has one, without
+    /// the final newline.
+    pub range: std::ops::Range<usize>,
+}
+
+/// Split one row line into cell ranges (relative to `line`), honouring `\|`
+/// escapes and code spans.
+fn split_row(line: &str) -> Vec<std::ops::Range<usize>> {
+    let mut bounds = Vec::new();
+    let bytes = line.as_bytes();
+    let mut in_code = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'`' => in_code = !in_code,
+            b'|' if !in_code => bounds.push(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    let trimmed_start = line.len() - line.trim_start().len();
+    let trimmed_end = line.trim_end().len();
+    // Leading and trailing pipes are optional: without one, the row's own
+    // edge stands in for it.
+    let lead = bounds.first() == Some(&trimmed_start);
+    let trail =
+        bounds.last().is_some_and(|b| *b + 1 == trimmed_end) && bounds.len() > usize::from(lead);
+    let mut cuts: Vec<isize> = bounds.iter().map(|b| *b as isize).collect();
+    if !lead {
+        cuts.insert(0, trimmed_start as isize - 1);
+    }
+    if !trail {
+        cuts.push(trimmed_end as isize);
+    }
+    cuts.windows(2)
+        .map(|w| (w[0] + 1) as usize..w[1] as usize)
+        .collect()
+}
+
+/// The trimmed content of a cell range; an empty cell maps to just after
+/// its opening space.
+fn content(line: &str, r: std::ops::Range<usize>) -> std::ops::Range<usize> {
+    let raw = &line[r.clone()];
+    let lead = raw.len() - raw.trim_start().len();
+    let body = raw.trim();
+    if body.is_empty() {
+        let at = (r.start + 1).min(r.end);
+        return at..at;
+    }
+    r.start + lead..r.start + lead + body.len()
+}
+
+fn parse_align(cell: &str) -> Option<Align> {
+    let c = cell.trim();
+    if c.is_empty() || !c.chars().all(|ch| matches!(ch, '-' | ':')) || !c.contains('-') {
+        return None;
+    }
+    Some(match (c.starts_with(':'), c.ends_with(':')) {
+        (true, true) => Align::Center,
+        (false, true) => Align::Right,
+        (true, false) => Align::Left,
+        (false, false) => Align::None,
+    })
+}
+
+impl TableModel {
+    /// Read the table whose lines are `lines` (ranges into `text`, in
+    /// order): header, delimiter, body, and optionally a `zen:cols` line.
+    pub fn parse(text: &str, lines: &[std::ops::Range<usize>]) -> Option<TableModel> {
+        if lines.len() < 2 {
+            return None;
+        }
+        let mut lines = lines.to_vec();
+        let mut widths = Vec::new();
+        if let Some(last) = lines.last()
+            && let Some(w) = parse_cols_comment(&text[last.clone()])
+        {
+            widths = w;
+            if lines.len() > 2 {
+                lines.pop();
+            }
+        }
+        let delim_line = &text[lines[1].clone()];
+        let aligns: Vec<Align> = split_row(delim_line)
+            .into_iter()
+            .map(|r| parse_align(&delim_line[r]))
+            .collect::<Option<Vec<_>>>()?;
+        let mut rows = Vec::new();
+        let mut cells = Vec::new();
+        for (i, l) in lines.iter().enumerate() {
+            if i == 1 {
+                continue;
+            }
+            let line = &text[l.clone()];
+            let ranges: Vec<_> = split_row(line)
+                .into_iter()
+                .map(|r| content(line, r))
+                .collect();
+            rows.push(ranges.iter().map(|r| line[r.clone()].to_string()).collect());
+            cells.push(
+                ranges
+                    .iter()
+                    .map(|r| l.start + r.start..l.start + r.end)
+                    .collect(),
+            );
+        }
+        let end = if widths.is_empty() {
+            lines.last()?.end
+        } else {
+            // The comment line, which was popped off above.
+            lines.last()?.end.max(
+                text[lines.last()?.end..]
+                    .find('\n')
+                    .map_or(text.len(), |i| {
+                        let next_start = lines.last().unwrap().end + i + 1;
+                        text[next_start..]
+                            .find('\n')
+                            .map_or(text.len(), |j| next_start + j)
+                    }),
+            )
+        };
+        Some(TableModel {
+            rows,
+            cells,
+            aligns,
+            widths,
+            range: lines[0].start..end,
+        })
+    }
+
+    pub fn cols(&self) -> usize {
+        self.rows
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0)
+            .max(self.aligns.len())
+    }
+
+    /// The cell holding source offset `pos`: (row, column), header row 0.
+    pub fn cell_at(&self, pos: usize) -> Option<(usize, usize)> {
+        for (r, row) in self.cells.iter().enumerate() {
+            let (Some(first), Some(last)) = (row.first(), row.last()) else {
+                continue;
+            };
+            // The whole line belongs to the row.
+            let line_start = first.start.saturating_sub(2);
+            let line_end = last.end + 2;
+            if pos < line_start || pos > line_end {
+                continue;
+            }
+            let c = row
+                .iter()
+                .rposition(|c| c.start.saturating_sub(2) <= pos)
+                .unwrap_or(0);
+            return Some((r, c));
+        }
+        None
+    }
+
+    /// The table as padded source.
+    pub fn render(&self) -> String {
+        let cols = self.cols();
+        let rows: Vec<Vec<String>> = self
+            .rows
+            .iter()
+            .map(|r| {
+                (0..cols)
+                    .map(|c| r.get(c).cloned().unwrap_or_default())
+                    .collect()
+            })
+            .collect();
+        let mut widths = self.widths.clone();
+        widths.resize(cols, None);
+        format_table(&rows, &self.aligns, &widths)
+    }
+
+    /// Where cell (r, c)'s text starts in `render()`'s output, relative to
+    /// its start.
+    pub fn rendered_cell(&self, r: usize, c: usize) -> Option<usize> {
+        let out = self.render();
+        let line_ix = if r == 0 { 0 } else { r + 1 };
+        let line_start: usize = out.split('\n').take(line_ix).map(|l| l.len() + 1).sum();
+        let line = out.split('\n').nth(line_ix)?;
+        let r = split_row(line).get(c).cloned()?;
+        Some(line_start + content(line, r).start)
+    }
+
+    pub fn insert_row(&mut self, at: usize) {
+        let at = at.clamp(1, self.rows.len());
+        self.rows.insert(at, vec![String::new(); self.cols()]);
+    }
+
+    pub fn delete_row(&mut self, r: usize) {
+        if r > 0 && r < self.rows.len() {
+            self.rows.remove(r);
+        }
+    }
+
+    pub fn insert_col(&mut self, at: usize) {
+        let cols = self.cols();
+        let at = at.min(cols);
+        for row in &mut self.rows {
+            row.resize(cols, String::new());
+            row.insert(at, String::new());
+        }
+        self.aligns.resize(cols, Align::None);
+        self.aligns.insert(at, Align::None);
+        if !self.widths.is_empty() {
+            self.widths.resize(cols, None);
+            self.widths.insert(at, None);
+        }
+        if let Some(h) = self.rows.first_mut() {
+            h[at] = format!("Column {}", at + 1);
+        }
+    }
+
+    pub fn delete_col(&mut self, c: usize) {
+        if self.cols() <= 1 {
+            return;
+        }
+        for row in &mut self.rows {
+            if c < row.len() {
+                row.remove(c);
+            }
+        }
+        if c < self.aligns.len() {
+            self.aligns.remove(c);
+        }
+        if c < self.widths.len() {
+            self.widths.remove(c);
+        }
+    }
+
+    pub fn move_row(&mut self, from: usize, to: usize) {
+        if from > 0 && to > 0 && from < self.rows.len() && to < self.rows.len() {
+            moved(&mut self.rows, from, to);
+        }
+    }
+
+    pub fn move_col(&mut self, from: usize, to: usize) {
+        let cols = self.cols();
+        if from >= cols || to >= cols {
+            return;
+        }
+        for row in &mut self.rows {
+            row.resize(cols, String::new());
+            moved(row, from, to);
+        }
+        self.aligns.resize(cols, Align::None);
+        moved(&mut self.aligns, from, to);
+        if !self.widths.is_empty() {
+            self.widths.resize(cols, None);
+            moved(&mut self.widths, from, to);
+        }
+    }
+
+    pub fn set_align(&mut self, c: usize, a: Align) {
+        self.aligns.resize(self.cols(), Align::None);
+        if c < self.aligns.len() {
+            self.aligns[c] = a;
+        }
+    }
+
+    pub fn sort_by(&mut self, c: usize, descending: bool) {
+        let values: Vec<String> = self.rows[1..]
+            .iter()
+            .map(|r| r.get(c).cloned().unwrap_or_default())
+            .collect();
+        let order = sort_order(&values, descending);
+        let body: Vec<Vec<String>> = order
+            .into_iter()
+            .map(|i| self.rows[i + 1].clone())
+            .collect();
+        self.rows.truncate(1);
+        self.rows.extend(body);
+    }
+
+    pub fn duplicate_row(&mut self, r: usize) {
+        if r < self.rows.len() {
+            let copy = self.rows[r].clone();
+            self.rows.insert((r + 1).max(1), copy);
+        }
+    }
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::*;
+
+    fn lines(text: &str) -> Vec<std::ops::Range<usize>> {
+        let mut out = Vec::new();
+        let mut start = 0;
+        for l in text.split('\n') {
+            out.push(start..start + l.len());
+            start += l.len() + 1;
+        }
+        out
+    }
+
+    #[test]
+    fn parses_cells_aligns_and_widths() {
+        let text = "| a | b |\n|:--|--:|\n| 1 |  |\n<!-- zen:cols=90,auto -->";
+        let t = TableModel::parse(text, &lines(text)).unwrap();
+        assert_eq!(t.rows, vec![vec!["a", "b"], vec!["1", ""]]);
+        assert_eq!(t.aligns, vec![Align::Left, Align::Right]);
+        assert_eq!(t.widths, vec![Some(90), None]);
+        assert_eq!(&text[t.cells[1][0].clone()], "1");
+        assert_eq!(t.range, 0..text.len());
+        assert_eq!(t.cell_at(text.find('1').unwrap()), Some((1, 0)));
+        assert_eq!(t.cell_at(text.find('b').unwrap()), Some((0, 1)));
+    }
+
+    #[test]
+    fn rows_without_outer_pipes_and_with_escapes() {
+        let text = "a | b\n--- | ---\nx \\| y | `c|d`";
+        let t = TableModel::parse(text, &lines(text)).unwrap();
+        assert_eq!(t.rows[1], vec!["x \\| y", "`c|d`"]);
+    }
+
+    #[test]
+    fn edits_rewrite_the_table() {
+        let text = "| a | b |\n|---|---|\n| 2 | x |\n| 1 | y |";
+        let mut t = TableModel::parse(text, &lines(text)).unwrap();
+        t.sort_by(0, false);
+        assert_eq!(t.rows[1][0], "1");
+        t.insert_col(1);
+        assert_eq!(t.rows[0], vec!["a", "Column 2", "b"]);
+        t.delete_col(1);
+        t.insert_row(3);
+        assert_eq!(t.rows.len(), 4);
+        t.move_row(3, 1);
+        assert_eq!(t.rows[1], vec!["", ""]);
+        t.set_align(1, Align::Center);
+        let out = t.render();
+        assert!(out.starts_with("| a   |  b  |\n| --- | :-: |"), "{out}");
+        let at = t.rendered_cell(2, 1).unwrap();
+        assert_eq!(&out[at..at + 1], "y");
+    }
+}

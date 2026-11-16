@@ -162,10 +162,10 @@ impl MarkdownEditor {
         let c = &self.style.colors;
         let p = &self.style.palette;
         let accent_text = super::style::hsla(p.accent_text);
-        // The controls take ZenNotes' colours, which every theme here was made
-        // from: its bg-1 at 90% for the rails, bg-2 for the grips, and bg-3 at
-        // 90% round both. Those are our soft background, the diagrams' second
-        // surface, and the border.
+        // Tables take ZenNotes' colours, which every theme here was made from:
+        // its bg-2 for the grips and, at 70%, the header; bg-1 at 90% for the
+        // rails; bg-3 at 90% for the rules and edges. Those are the diagrams'
+        // second surface, our soft background, and the border.
         let bg = super::style::hsla(p.bg);
         let rail = bg.blend(super::style::hsla(p.bg_soft).opacity(0.9));
         let grip = super::style::hsla(p.diagram_surface_alt);
@@ -187,12 +187,14 @@ impl MarkdownEditor {
                 point(px(0.), g.row_y[0]),
                 point(g.width(), g.row_y[1]),
             ));
-            under.push(fill(head, c.code_bg).corner_radii(Corners {
-                top_left: radius,
-                top_right: radius,
-                bottom_left: px(0.),
-                bottom_right: px(0.),
-            }));
+            under.push(
+                fill(head, bg.blend(grip.opacity(0.7))).corner_radii(Corners {
+                    top_left: radius,
+                    top_right: radius,
+                    bottom_left: px(0.),
+                    bottom_right: px(0.),
+                }),
+            );
             if focused
                 && self.sel.is_empty()
                 && let Some(k) = g.cell_at_source(self.sel.head)
@@ -212,7 +214,7 @@ impl MarkdownEditor {
             for y in &g.row_y[1..g.row_y.len() - 1] {
                 over.push(fill(
                     Bounds::new(*origin + point(px(0.), *y), size(g.width(), px(1.))),
-                    c.border,
+                    edge,
                 ));
             }
             for x in &g.col_x[1..g.col_x.len() - 1] {
@@ -221,10 +223,10 @@ impl MarkdownEditor {
                         point(origin.x + *x, table.top()),
                         size(px(1.), table.size.height),
                     ),
-                    c.border,
+                    edge,
                 ));
             }
-            over.push(outline(table, c.border, BorderStyle::Solid).corner_radii(radius));
+            over.push(outline(table, edge, BorderStyle::Solid).corner_radii(radius));
 
             // The controls, while the pointer is near (or a press is on).
             let hover = self.table_hover.filter(|h| h.row == *ix);

@@ -121,3 +121,35 @@ Arch, Wayland, RADV Vulkan). Kept here so later milestones don't relearn them.
     `click("dont-save")`, `render_frame`.
   - `AppState::init_ephemeral` keeps tests away from the real settings
     file.
+
+## M3 findings: the editor
+
+- **The model** lives in mdedit-core:
+  - `buffer`: edits and selections.
+  - `history`: transactions, with 800 ms typing bursts.
+  - `syntax`: line kinds, spans, markup and paragraph ids, from
+    pulldown-cmark offsets.
+  - `display`: each row's drawn text, plus the display↔source map.
+  - `edit` and `find`.
+- **The view** is one custom GPUI element (`editor/element.rs`) that
+  shapes only visible rows.
+- **Rows, not lines.** In the rendered modes a paragraph's source lines
+  flow as one row: the newline shows as a space and maps 1:1 to it. A
+  hard break (`\` or two trailing spaces) ends a row. In Source mode, each
+  line is its own row.
+- **The caret moves in display offsets.** A position between two drawn
+  stretches maps to the start of the later one, so typing after hidden
+  opening markup goes inside it.
+- **List markers are drawn in a margin gutter**, not as text. That gives
+  hanging indents, and task boxes are clicked there.
+- **Overlays** (selection toolbar, `/` menu) are
+  `deferred(anchored().position(window_point))` with `.occlude()`, so a
+  click on them doesn't also reach the editor's own mouse handler.
+- **Dialogs and the palette:** a dialog renders beside the window's
+  content, so focus its field on the dialog's *first build* (focusing an
+  unrendered handle doesn't stick), and dispatch a chosen command from the
+  focus handle saved before opening. gpui-kit's `Command` filters
+  asynchronously, so tests must `run_until_parked` between typing and
+  Enter.
+- **Ligatures:** JetBrains Mono turns `<!--` into an arrow.
+  `FontFeatures::disable_ligatures()` turns that off for document code.

@@ -296,6 +296,76 @@ fn plain(out: &mut DisplayLine, text: &str, r: Range<usize>, lang: &Option<Range
     out.push(&text[r.clone()], r, true, 0, role);
 }
 
+/// Source lines drawn together as one row, as ranges of line indices. In
+/// the rendered modes a paragraph's lines flow as one, so hard-wrapped text
+/// reads as prose; a hard line break (`\` or two spaces at the end) still
+/// ends a row. In Source mode every line is its own row.
+pub fn rows(text: &str, syntax: &Syntax, rich: bool) -> Vec<Range<usize>> {
+    let lines = &syntax.lines;
+    let mut out: Vec<Range<usize>> = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        let joins = rich
+            && i > 0
+            && line.kind == LineKind::Paragraph
+            && line.para.is_some()
+            && lines[i - 1].para == line.para
+            && lines[i - 1].kind == LineKind::Paragraph
+            && {
+                let prev = &text[lines[i - 1].range.clone()];
+                !(prev.ends_with('\\') || prev.ends_with("  "))
+            }
+            && !starts_item(syntax, i);
+        match out.last_mut() {
+            Some(row) if joins => row.end = i + 1,
+            _ => out.push(i..i + 1),
+        }
+    }
+    out
+}
+
+/// Whether line `i` starts a list item (its marker is the first markup).
+fn starts_item(syntax: &Syntax, i: usize) -> bool {
+    let l = &syntax.lines[i];
+    syntax.markup_in(l.range.clone()).any(|m| {
+        matches!(m.kind, MarkupKind::Bullet | MarkupKind::Number) && m.range.start >= l.range.start
+    })
+}
+
+/// The display form of several source lines drawn as one row: each line's
+/// own display, joined by a space standing in for the newline.
+pub fn display_row(
+    text: &str,
+    syntax: &Syntax,
+    lines: Range<usize>,
+    reveal: Reveal,
+) -> DisplayLine {
+    let first = lines.start;
+    let mut out = display_line(text, syntax, first, reveal);
+    for ix in lines.start + 1..lines.end {
+        let next = display_line(text, syntax, ix, reveal);
+        let nl = syntax.lines[ix - 1].range.end;
+        // The newline shows as a space: one byte for one byte.
+        out.push(" ", nl..nl + 1, true, 0, Role::Text);
+        let base = out.text.len();
+        out.text.push_str(&next.text);
+        for seg in next.segs {
+            out.segs.push(Seg {
+                display: seg.display.start + base..seg.display.end + base,
+                source: seg.source,
+                copy: seg.copy,
+            });
+        }
+        for run in next.runs {
+            match out.runs.last_mut() {
+                Some(r) if r.style == run.style && r.role == run.role => r.len += run.len,
+                _ => out.runs.push(run),
+            }
+        }
+    }
+    out.source = syntax.lines[first].range.start..syntax.lines[lines.end - 1].range.end;
+    out
+}
+
 /// Whether a style has any of `flags`.
 pub fn has(style: u16, flags: u16) -> bool {
     style & flags != 0
@@ -415,6 +485,38 @@ mod tests {
         assert_eq!(lines[4], "");
         let d = display_line(text, &s, 2, Reveal::Hide);
         assert_eq!(d.runs[0].role, Role::Lang);
+    }
+
+    #[test]
+    fn hard_wrapped_paragraphs_flow_as_one_row() {
+        let text = "one\ntwo\n\n- item\n  more\n- next\n\nbreak\\\nhere\n> a\n> b";
+        let s = parse(text);
+        let rows = rows(text, &s, true);
+        let shown: Vec<String> = rows
+            .iter()
+            .map(|r| display_row(text, &s, r.clone(), Reveal::Hide).text)
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "one two",
+                "",
+                "item more",
+                "next",
+                "",
+                "break",
+                "here",
+                "a b"
+            ]
+        );
+        assert_eq!(super::rows(text, &s, false).len(), s.lines.len());
+        // The joining space maps to the newline, both ways.
+        let d = display_row(text, &s, rows[0].clone(), Reveal::Hide);
+        assert_eq!(d.to_source(3), 3);
+        assert_eq!(d.to_source(4), 4);
+        assert_eq!(d.to_display(4), 4);
+        assert_eq!(d.to_display(7), 7);
+        assert_eq!(d.source, 0..7);
     }
 
     #[test]

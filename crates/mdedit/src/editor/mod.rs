@@ -12,6 +12,7 @@
 
 mod element;
 pub mod find_bar;
+mod overlays;
 pub mod style;
 
 use std::ops::Range;
@@ -117,10 +118,15 @@ pub struct MarkdownEditor {
     mode: Mode,
     style: DocStyle,
     focus: FocusHandle,
+    /// Source lines drawn together, as ranges of line indices (see
+    /// `display::rows`); one slot per row.
+    rows: Vec<Range<usize>>,
     slots: Vec<Slot>,
     content_w: Option<Pixels>,
     scroll_y: Pixels,
     autoscroll: bool,
+    /// The next autoscroll puts the caret near the top, not just in view.
+    scroll_to_top: bool,
     goal_x: Option<Pixels>,
     selecting: Option<(Grain, Selection)>,
     pub(crate) geometry: Geometry,
@@ -129,6 +135,9 @@ pub struct MarkdownEditor {
     words: usize,
     chars: usize,
     pub find: Option<FindState>,
+    /// The `/` menu: where its slash is, and the highlighted entry.
+    slash: Option<usize>,
+    slash_ix: usize,
 }
 
 impl EventEmitter<EditorEvent> for MarkdownEditor {}
@@ -162,10 +171,12 @@ impl MarkdownEditor {
             mode,
             style,
             focus: cx.focus_handle(),
+            rows: Vec::new(),
             slots: Vec::new(),
             content_w: None,
             scroll_y: px(0.),
             autoscroll: false,
+            scroll_to_top: false,
             goal_x: None,
             selecting: None,
             geometry: Geometry::default(),
@@ -173,6 +184,8 @@ impl MarkdownEditor {
             words: 0,
             chars: 0,
             find: None,
+            slash: None,
+            slash_ix: 0,
         };
         this.rebuild_slots();
         this.recount();
@@ -211,7 +224,9 @@ impl MarkdownEditor {
     pub fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
         if self.mode != mode {
             self.mode = mode;
-            self.invalidate();
+            // Source draws every line on its own; the rendered modes flow
+            // paragraphs.
+            self.rebuild_slots();
             self.update_reveal();
             self.autoscroll = true;
             cx.emit(EditorEvent::Moved);
@@ -232,6 +247,7 @@ impl MarkdownEditor {
         self.set_selection(Selection::caret(pos.min(self.text.len())), cx);
         self.focus.focus(window, cx);
         self.autoscroll = true;
+        self.scroll_to_top = true;
         cx.notify();
     }
 
@@ -255,22 +271,39 @@ impl MarkdownEditor {
 
     fn rebuild_slots(&mut self) {
         let old = std::mem::take(&mut self.slots);
+        self.rows = display::rows(&self.text, &self.syntax, self.rich());
         self.slots = self
-            .syntax
-            .lines
+            .rows
             .iter()
             .enumerate()
-            .map(|(i, l)| Slot {
-                // Keep what we measured where we can: the lines around an
+            .map(|(i, r)| Slot {
+                // Keep what we measured where we can: the rows around an
                 // edit rarely change height, and keeping them steadies the
                 // scroll position.
                 height: old
                     .get(i)
-                    .filter(|_| old.len() == self.syntax.lines.len())
-                    .map_or_else(|| self.estimate(l.kind), |s| s.height),
+                    .filter(|_| old.len() == self.rows.len())
+                    .map_or_else(
+                        || self.estimate(self.syntax.lines[r.start].kind) * r.len() as f32,
+                        |s| s.height,
+                    ),
                 layout: None,
             })
             .collect();
+    }
+
+    /// The row holding byte `pos`.
+    fn row_at(&self, pos: usize) -> usize {
+        let line = self.syntax.line_at(pos);
+        self.rows
+            .partition_point(|r| r.end <= line)
+            .min(self.rows.len().saturating_sub(1))
+    }
+
+    /// The source a row covers, without its final newline.
+    fn row_range(&self, ix: usize) -> Range<usize> {
+        let r = &self.rows[ix];
+        self.syntax.lines[r.start].range.start..self.syntax.lines[r.end - 1].range.end
     }
 
     fn recount(&mut self) {
@@ -304,6 +337,7 @@ impl MarkdownEditor {
         self.recount();
         self.update_reveal();
         self.refresh_find();
+        self.update_slash(None);
         self.autoscroll = true;
         self.goal_x = None;
         cx.emit(EditorEvent::Edited);
@@ -331,6 +365,7 @@ impl MarkdownEditor {
             self.history.seal();
             self.sel = sel;
             self.update_reveal();
+            self.update_slash(None);
             self.autoscroll = true;
             cx.emit(EditorEvent::Moved);
         }
@@ -340,8 +375,8 @@ impl MarkdownEditor {
     /// In Live mode, the lines the selection touches show their markup.
     fn update_reveal(&mut self) {
         let new = if self.mode == Mode::Live {
-            let a = self.syntax.line_at(self.sel.start());
-            let b = self.syntax.line_at(self.sel.end());
+            let a = self.row_at(self.sel.start());
+            let b = self.row_at(self.sel.end());
             a..b + 1
         } else {
             0..0
@@ -376,8 +411,13 @@ impl MarkdownEditor {
             return l;
         }
         let content_w = self.content_w.unwrap_or(px(700.));
-        let line = self.syntax.lines[ix].clone();
-        let display = display::display_line(&self.text, &self.syntax, ix, self.reveal_of(ix));
+        let line = self.syntax.lines[self.rows[ix].start].clone();
+        let display = display::display_row(
+            &self.text,
+            &self.syntax,
+            self.rows[ix].clone(),
+            self.reveal_of(ix),
+        );
         let (size, lh) = self.style.metrics(line.kind, self.mode);
         let (size, lh) = (px(size), px(lh));
         let rich = self.rich();
@@ -530,7 +570,7 @@ impl MarkdownEditor {
 
     /// The caret's line and display offset.
     fn caret_display(&mut self, window: &mut Window) -> (usize, usize, Rc<LineLayout>) {
-        let ix = self.syntax.line_at(self.sel.head);
+        let ix = self.row_at(self.sel.head);
         let layout = self.layout(ix, window);
         let d = layout.display.to_display(self.sel.head);
         (ix, d, layout)
@@ -570,11 +610,11 @@ impl MarkdownEditor {
                 // Past the last character: the end of the source line, after
                 // any markup closing it.
                 if next == layout.display.text.len() {
-                    self.syntax.lines[ix].range.end
+                    self.row_range(ix).end
                 } else {
                     layout.display.to_source(next)
                 }
-            } else if ix + 1 < self.syntax.lines.len() {
+            } else if ix + 1 < self.rows.len() {
                 let next = self.layout(ix + 1, window);
                 next.display.to_source(0)
             } else {
@@ -583,7 +623,7 @@ impl MarkdownEditor {
         } else if d > 0 {
             layout.display.to_source(layout.display.prev(d))
         } else if ix > 0 {
-            self.syntax.lines[ix - 1].range.end
+            self.row_range(ix - 1).end
         } else {
             0
         };
@@ -614,7 +654,7 @@ impl MarkdownEditor {
                 continue;
             }
             let next = ix as i64 + step as i64;
-            if next < 0 || next as usize >= self.syntax.lines.len() {
+            if next < 0 || next as usize >= self.rows.len() {
                 let pos = if step < 0 { 0 } else { self.text.len() };
                 self.move_to(pos, extend, cx);
                 return;
@@ -634,16 +674,25 @@ impl MarkdownEditor {
         self.goal_x = goal;
     }
 
+    /// Home and End: the start and end of the wrapped line the caret is on.
+    /// Home again goes to the very start, before any hidden markup.
     fn line_edge(&mut self, end: bool, extend: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.goal_x = None;
-        let (ix, _, layout) = self.caret_display(window);
+        let (ix, d, layout) = self.caret_display(window);
+        let y = layout.point(d).y;
+        let range = self.row_range(ix);
         let pos = if end {
-            self.syntax.lines[ix].range.end
+            let e = layout.index(point(layout.indent + px(1e6), y));
+            if e >= layout.display.text.len() {
+                range.end
+            } else {
+                layout.display.to_source(e)
+            }
         } else {
-            let start = layout.display.to_source(0);
-            // Home again goes to the very start, before hidden markup.
-            if self.sel.head == start {
-                self.syntax.lines[ix].range.start
+            let st = layout.index(point(layout.indent, y));
+            let start = layout.display.to_source(st);
+            if self.sel.head == start && st == 0 {
+                range.start
             } else {
                 start
             }
@@ -669,11 +718,37 @@ impl MarkdownEditor {
     fn select_right(&mut self, _: &SelectRight, w: &mut Window, cx: &mut Context<Self>) {
         self.horizontal(true, true, w, cx);
     }
+    /// Up and Down walk the `/` menu while it's open.
+    fn slash_step(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
+        if self.slash.is_none() {
+            return false;
+        }
+        let n = self.slash_matches().len().max(1) as isize;
+        self.slash_ix = (self.slash_ix as isize + delta).rem_euclid(n) as usize;
+        cx.notify();
+        true
+    }
+
+    /// Enter or Tab picks the highlighted `/` entry.
+    fn slash_pick(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.slash.is_none() {
+            return false;
+        }
+        if let Some(item) = self.slash_matches().get(self.slash_ix).copied() {
+            self.apply_slash(item, cx);
+        }
+        true
+    }
+
     fn move_up(&mut self, _: &MoveUp, w: &mut Window, cx: &mut Context<Self>) {
-        self.vertical(-1, false, w, cx);
+        if !self.slash_step(-1, cx) {
+            self.vertical(-1, false, w, cx);
+        }
     }
     fn move_down(&mut self, _: &MoveDown, w: &mut Window, cx: &mut Context<Self>) {
-        self.vertical(1, false, w, cx);
+        if !self.slash_step(1, cx) {
+            self.vertical(1, false, w, cx);
+        }
     }
     fn select_up(&mut self, _: &SelectUp, w: &mut Window, cx: &mut Context<Self>) {
         self.vertical(-1, true, w, cx);
@@ -788,7 +863,7 @@ impl MarkdownEditor {
             if ix == 0 {
                 return;
             }
-            self.syntax.lines[ix - 1].range.end..caret
+            self.row_range(ix - 1).end..caret
         } else {
             let prev = layout.display.prev(d);
             match layout.display.role_at(prev) {
@@ -811,7 +886,7 @@ impl MarkdownEditor {
         let caret = self.sel.head;
         let (ix, d, layout) = self.caret_display(window);
         let range = if d >= layout.display.text.len() {
-            let end = self.syntax.lines[ix].range.end;
+            let end = self.row_range(ix).end;
             caret..(end + 1).min(self.text.len()).max(caret)
         } else {
             let s = layout.display.to_source(d);
@@ -844,6 +919,9 @@ impl MarkdownEditor {
     }
 
     fn newline(&mut self, _: &Newline, _: &mut Window, cx: &mut Context<Self>) {
+        if self.slash_pick(cx) {
+            return;
+        }
         let in_code = matches!(self.caret_kind(), LineKind::Code | LineKind::FenceOpen);
         let c = edit::enter(&self.text, self.sel, self.rich(), in_code);
         self.apply(c, Kind::Other, cx);
@@ -855,6 +933,9 @@ impl MarkdownEditor {
     }
 
     fn indent(&mut self, _: &Indent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.slash_pick(cx) {
+            return;
+        }
         match edit::indent(&self.text, self.sel) {
             Some(c) => self.apply(c, Kind::Other, cx),
             None if !self.rich() || self.caret_kind() == LineKind::Code => {
@@ -1021,7 +1102,9 @@ impl MarkdownEditor {
     }
 
     fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
-        if self.find.is_some() {
+        if self.slash.take().is_some() {
+            cx.notify();
+        } else if self.find.is_some() {
             self.find = None;
             cx.emit(EditorEvent::Moved);
             cx.notify();
@@ -1174,7 +1257,7 @@ impl MarkdownEditor {
             return;
         };
         let pos = if d >= layout.display.text.len() {
-            self.syntax.lines[ix].range.end
+            self.row_range(ix).end
         } else {
             layout.display.to_source(d)
         };
@@ -1198,7 +1281,7 @@ impl MarkdownEditor {
                 (Grain::Word, Selection::new(w.start, w.end))
             }
             _ => {
-                let l = &self.syntax.lines[ix].range;
+                let l = &self.row_range(ix);
                 let end = (l.end + 1).min(self.text.len());
                 (Grain::Line, Selection::new(l.start, end))
             }
@@ -1215,7 +1298,7 @@ impl MarkdownEditor {
             return;
         };
         let pos = if d >= layout.display.text.len() {
-            self.syntax.lines[ix].range.end
+            self.row_range(ix).end
         } else {
             layout.display.to_source(d)
         };
@@ -1230,7 +1313,7 @@ impl MarkdownEditor {
                 }
             }
             Grain::Line => {
-                let l = &self.syntax.lines[ix].range;
+                let l = &self.row_range(ix);
                 if pos < origin.start() {
                     Selection::new(origin.end(), l.start)
                 } else {
@@ -1315,6 +1398,8 @@ impl EntityInputHandler for MarkdownEditor {
             Kind::Typing,
             cx,
         );
+        self.update_slash(Some(text));
+        cx.notify();
     }
 
     fn replace_and_mark_text_in_range(
@@ -1355,7 +1440,7 @@ impl EntityInputHandler for MarkdownEditor {
         _: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let pos = buffer::from_utf16(&self.text, range.start);
-        let ix = self.syntax.line_at(pos);
+        let ix = self.row_at(pos);
         let (_, origin, layout) = self.geometry.lines.iter().find(|(i, ..)| *i == ix)?.clone();
         let _ = window;
         let p = layout.point(layout.display.to_display(pos));
@@ -1377,7 +1462,8 @@ impl EntityInputHandler for MarkdownEditor {
 }
 
 impl Render for MarkdownEditor {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let overlay = self.render_overlays(window, cx);
         div()
             .key_context("MdEditor")
             .track_focus(&self.focus)
@@ -1442,6 +1528,7 @@ impl Render for MarkdownEditor {
             .size_full()
             .cursor(CursorStyle::IBeam)
             .child(EditorElement::new(cx.entity()))
+            .children(overlay)
     }
 }
 

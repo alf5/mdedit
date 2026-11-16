@@ -85,6 +85,9 @@ pub struct Line {
     pub list: u8,
     /// A fence's info string, on its opening line.
     pub lang: Option<Range<usize>>,
+    /// The paragraph (or tight list item's text) this line is part of.
+    /// Lines sharing one flow together in the rendered modes.
+    pub para: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,8 +187,10 @@ pub fn parse(text: &str) -> Syntax {
             quote: 0,
             list: 0,
             lang: None,
+            para: None,
         })
         .collect();
+    let mut para_id = 0u32;
     let line_at =
         |pos: usize, lines: &[Line]| match lines.binary_search_by(|l| l.range.start.cmp(&pos)) {
             Ok(i) => i,
@@ -289,8 +294,12 @@ pub fn parse(text: &str) -> Syntax {
                         }
                     }
                     Tag::Item => {
+                        para_id += 1;
                         for l in &mut lines[first..=last] {
                             l.list += 1;
+                            // A tight item's text has no paragraph of its
+                            // own; nested items and paragraphs re-mark theirs.
+                            l.para = Some(para_id);
                         }
                         let rest = &text[r.start..lines[first].range.end];
                         let marker_len = if rest.starts_with(['-', '*', '+']) {
@@ -313,6 +322,12 @@ pub fn parse(text: &str) -> Syntax {
                                 range: r.start..r.start + marker_len + spaces,
                                 kind,
                             });
+                        }
+                    }
+                    Tag::Paragraph => {
+                        para_id += 1;
+                        for l in &mut lines[first..=last] {
+                            l.para = Some(para_id);
                         }
                     }
                     Tag::Table(_) => {

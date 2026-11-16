@@ -112,7 +112,7 @@ impl MarkdownEditor {
 
         if self.autoscroll {
             self.autoscroll = false;
-            let ix = self.syntax.line_at(self.sel.head);
+            let ix = self.row_at(self.sel.head);
             let layout = self.layout(ix, window);
             let line_top: Pixels = top
                 + self.slots[..ix]
@@ -123,7 +123,9 @@ impl MarkdownEditor {
             let caret_top = line_top + p.y;
             let caret_bottom = caret_top + layout.line_height;
             let margin = min(px(48.), view_h / 4.);
-            if caret_top < self.scroll_y + margin {
+            if std::mem::take(&mut self.scroll_to_top) {
+                self.scroll_y = max(caret_top - margin, px(0.));
+            } else if caret_top < self.scroll_y + margin {
                 self.scroll_y = caret_top - margin;
             } else if caret_bottom > self.scroll_y + view_h - margin {
                 self.scroll_y = caret_bottom - view_h + margin;
@@ -200,7 +202,7 @@ impl Element for EditorElement {
             // Find matches, then the selection, over the visible lines.
             let sel = ed.sel.range();
             for (ix, origin, l) in &lines {
-                let src = ed.syntax.lines[*ix].range.clone();
+                let src = ed.row_range(*ix);
                 if let Some(f) = &ed.find {
                     let first = f.matches.partition_point(|m| m.end < src.start);
                     for (i, m) in f.matches[first..].iter().enumerate() {
@@ -229,7 +231,7 @@ impl Element for EditorElement {
                 }
             }
 
-            let caret_ix = ed.syntax.line_at(ed.sel.head);
+            let caret_ix = ed.row_at(ed.sel.head);
             let caret = lines
                 .iter()
                 .find(|(ix, ..)| *ix == caret_ix)

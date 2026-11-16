@@ -199,3 +199,51 @@ fn clicking_a_task_box_ticks_it(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(text(cx, &ed), "- [x] todo");
 }
+
+#[gpui_kit::test]
+fn slash_opens_a_block_menu(cx: &mut TestAppContext) {
+    let (h, ed) = open(cx, "intro\n\n", Mode::Rendered);
+    caret(cx, &ed, 7);
+    typed(cx, h, "/");
+    assert!(
+        ed.read_with(cx, |e, _| e.slash.is_some()),
+        "a slash starting a line opens it"
+    );
+    typed(cx, h, "h2");
+    keys(cx, h, &["enter"]);
+    assert_eq!(text(cx, &ed), "intro\n\n## ");
+    // Mid-sentence it's just a slash.
+    typed(cx, h, "a/b");
+    assert!(ed.read_with(cx, |e, _| e.slash.is_none()));
+    assert_eq!(text(cx, &ed), "intro\n\n## a/b");
+}
+
+#[gpui_kit::test]
+fn the_slash_menu_walks_and_escapes(cx: &mut TestAppContext) {
+    let (h, ed) = open(cx, "", Mode::Rendered);
+    typed(cx, h, "/");
+    keys(cx, h, &["down", "down", "down"]);
+    keys(cx, h, &["enter"]);
+    assert_eq!(text(cx, &ed), "- ", "the fourth entry is a bullet list");
+    typed(cx, h, "x");
+    keys(cx, h, &["enter"]);
+    typed(cx, h, "/");
+    keys(cx, h, &["escape"]);
+    assert!(ed.read_with(cx, |e, _| e.slash.is_none()));
+    assert_eq!(text(cx, &ed), "- x\n- /");
+}
+
+#[gpui_kit::test]
+fn hard_wrapped_paragraphs_flow(cx: &mut TestAppContext) {
+    let (h, ed) = open(cx, "one\ntwo\n\nnext", Mode::Rendered);
+    let rows = ed.read_with(cx, |e, _| e.rows.len());
+    assert_eq!(rows, 3, "the paragraph's two lines are one row");
+    caret(cx, &ed, 3);
+    keys(cx, h, &["right"]);
+    assert_eq!(head(cx, &ed), 4, "across the newline, shown as a space");
+    keys(cx, h, &["backspace"]);
+    assert_eq!(text(cx, &ed), "onetwo\n\nnext");
+    ed.update(cx, |e, cx| e.set_mode(Mode::Source, cx));
+    let rows = ed.read_with(cx, |e, _| e.rows.len());
+    assert_eq!(rows, 3, "source mode: a row per line");
+}

@@ -44,6 +44,12 @@ impl Pane {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum SidebarTab {
+    Files,
+    Outline,
+}
+
 /// A question about unsaved changes that is waiting for its answer.
 enum Pending {
     Close(Entity<DocView>),
@@ -94,6 +100,7 @@ pub struct Workspace {
     active: usize,
     files: Entity<FilesPanel>,
     sidebar_open: bool,
+    sidebar_tab: SidebarTab,
     pending: Option<Pending>,
     /// Modified tabs the user chose not to save during this quit.
     quit_discarded: HashSet<EntityId>,
@@ -150,6 +157,9 @@ impl Workspace {
             active: 0,
             files,
             sidebar_open,
+            // With no folder open, Files has nothing to show; the outline
+            // does.
+            sidebar_tab: SidebarTab::Outline,
             pending: None,
             quit_discarded: HashSet::new(),
             _subs: subs,
@@ -273,6 +283,11 @@ impl Workspace {
     }
 
     fn set_folder(&mut self, root: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.sidebar_tab = if root.is_some() {
+            SidebarTab::Files
+        } else {
+            SidebarTab::Outline
+        };
         self.files.update(cx, |f, cx| f.set_root(root, cx));
         self.sync_files(cx);
         if !self.sidebar_open {
@@ -1409,6 +1424,143 @@ impl Workspace {
     }
 }
 
+impl Workspace {
+    fn render_sidebar_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (fg, muted, active_bg) = (theme.foreground, theme.muted_foreground, theme.background);
+        let tab = |id: &'static str,
+                   label: &'static str,
+                   which: SidebarTab,
+                   current: SidebarTab,
+                   cx: &mut Context<Self>| {
+            let on = which == current;
+            div()
+                .id(id)
+                .flex_1()
+                .flex()
+                .justify_center()
+                .py(px(3.))
+                .rounded(px(5.))
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .cursor_pointer()
+                .text_color(if on { fg } else { muted })
+                .when(on, |d| d.bg(active_bg).shadow_xs())
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.sidebar_tab = which;
+                    cx.notify();
+                }))
+        };
+        let current = self.sidebar_tab;
+        div()
+            .flex()
+            .gap(px(2.))
+            .mx(px(10.))
+            .mt(px(10.))
+            .mb(px(2.))
+            .p(px(2.))
+            .rounded(px(7.))
+            .bg(theme.secondary)
+            .child(tab("tab-files", "Files", SidebarTab::Files, current, cx))
+            .child(tab(
+                "tab-outline",
+                "Outline",
+                SidebarTab::Outline,
+                current,
+                cx,
+            ))
+    }
+
+    /// The active document's headings; the one the caret is under is
+    /// marked, and a click goes there.
+    fn render_outline(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (muted, fg, hover, active_bg) = (
+            theme.muted_foreground,
+            theme.foreground,
+            theme.sidebar_accent,
+            theme.list_active,
+        );
+        let editor = self
+            .active_doc()
+            .and_then(|d| d.read(cx).markdown().cloned());
+        let Some(editor) = editor else {
+            return div()
+                .p(px(14.))
+                .text_xs()
+                .text_color(muted)
+                .child("Open a Markdown document to see its outline.")
+                .into_any_element();
+        };
+        let e = editor.read(cx);
+        let syntax = e.syntax();
+        let caret_line = syntax.line_at(e.selection().head);
+        let headings: Vec<_> = syntax
+            .headings
+            .iter()
+            .map(|h| {
+                (
+                    h.level,
+                    h.text.clone(),
+                    syntax.lines[h.line].range.start,
+                    h.line,
+                )
+            })
+            .collect();
+        if headings.is_empty() {
+            return div()
+                .p(px(14.))
+                .text_xs()
+                .text_color(muted)
+                .child("No headings yet. Start a line with # to add one.")
+                .into_any_element();
+        }
+        let current = headings
+            .iter()
+            .rposition(|(_, _, _, line)| *line <= caret_line);
+        let top = headings.iter().map(|h| h.0).min().unwrap_or(1);
+        div()
+            .id("outline")
+            .size_full()
+            .overflow_y_scroll()
+            .py(px(6.))
+            .text_sm()
+            .children(
+                headings
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (level, text, start, _))| {
+                        let editor = editor.clone();
+                        div()
+                            .id(("heading", i))
+                            .mx(px(6.))
+                            .pl(px(10. + (level - top) as f32 * 14.))
+                            .pr(px(8.))
+                            .py(px(4.))
+                            .rounded(px(5.))
+                            .cursor_pointer()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .text_color(if level <= top { fg } else { muted })
+                            .when(level <= top, |d| d.font_weight(FontWeight::MEDIUM))
+                            .hover(|s| s.bg(hover))
+                            .when(current == Some(i), |d| d.bg(active_bg).text_color(fg))
+                            .child(if text.is_empty() {
+                                "Untitled heading".to_string()
+                            } else {
+                                text
+                            })
+                            .on_click(move |_, window, cx| {
+                                editor.update(cx, |e, cx| e.reveal_offset(start, window, cx));
+                            })
+                    }),
+            )
+            .into_any_element()
+    }
+}
+
 /// The Theme submenu: Match System, then a submenu per family.
 fn theme_menu(
     menu: PopupMenu,
@@ -1521,7 +1673,15 @@ impl Render for Workspace {
                                 .bg(sidebar_bg)
                                 .border_r_1()
                                 .border_color(border)
-                                .child(self.files.clone()),
+                                .flex()
+                                .flex_col()
+                                .child(self.render_sidebar_tabs(cx))
+                                .child(div().flex_1().min_h_0().child(match self.sidebar_tab {
+                                    SidebarTab::Files => self.files.clone().into_any_element(),
+                                    SidebarTab::Outline => {
+                                        self.render_outline(cx).into_any_element()
+                                    }
+                                })),
                         )
                     })
                     .child(

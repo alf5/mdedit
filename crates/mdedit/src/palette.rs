@@ -34,6 +34,8 @@ fn commands(markdown: bool) -> Groups {
             entry("Open…", Open),
             entry("Open Folder…", OpenFolder),
             entry("Quick Open…", QuickOpen),
+            entry("Import HTML…", ImportHtml),
+            entry("Import Word Document…", ImportWord),
             entry("Save", Save),
             entry("Save As…", SaveAs),
             entry("Close Tab", CloseTab),

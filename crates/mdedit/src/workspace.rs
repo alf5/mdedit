@@ -367,6 +367,61 @@ impl Workspace {
         );
     }
 
+    /// Pick a file, convert it, and open the result as a new document.
+    fn import(
+        &mut self,
+        convert: fn(&[u8]) -> Result<String, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Import".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = rx.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let result = std::fs::read(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|b| convert(&b));
+            this.update_in(cx, |this, window, cx| match result {
+                Ok(md) => {
+                    let n = this.next_untitled(cx);
+                    let doc = cx.new(|cx| DocView::untitled_with(n, md, cx));
+                    this.add_doc(doc, window, cx);
+                }
+                Err(e) => window.push_notification(
+                    Notification::error(format!("Couldn't import {}: {e}", path.display())),
+                    cx,
+                ),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn import_html(&mut self, _: &ImportHtml, window: &mut Window, cx: &mut Context<Self>) {
+        self.import(
+            |b| {
+                Ok(mdedit_core::html_import::html_to_markdown(
+                    &String::from_utf8_lossy(b),
+                ))
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn import_word(&mut self, _: &ImportWord, window: &mut Window, cx: &mut Context<Self>) {
+        self.import(mdedit_core::docx::docx_to_markdown, window, cx);
+    }
+
     fn close_folder(&mut self, _: &CloseFolder, _: &mut Window, cx: &mut Context<Self>) {
         self.set_folder(None, cx);
     }
@@ -1018,6 +1073,9 @@ impl Workspace {
                         m.separator().menu("Clear Recent", Box::new(ClearRecent))
                     })
                     .separator()
+                    .menu("Import HTML…", Box::new(ImportHtml))
+                    .menu("Import Word Document…", Box::new(ImportWord))
+                    .separator()
                     .menu_with_disabled("Save", Box::new(Save), !has_doc)
                     .menu_with_disabled("Save As…", Box::new(SaveAs), !can_save_as)
                     .separator()
@@ -1632,6 +1690,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(Self::close_folder))
             .on_action(cx.listener(Self::command_palette))
+            .on_action(cx.listener(Self::import_html))
+            .on_action(cx.listener(Self::import_word))
             .on_action(cx.listener(Self::quick_open))
             .on_action(cx.listener(Self::open_recent))
             .on_action(cx.listener(Self::clear_recent))

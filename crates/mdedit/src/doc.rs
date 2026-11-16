@@ -107,6 +107,18 @@ impl DocView {
         doc
     }
 
+    /// A new markdown document holding `text` (an import), not yet saved.
+    pub fn untitled_with(number: usize, text: String, cx: &mut Context<Self>) -> Self {
+        let mut doc = Self::blank(None, cx);
+        doc.untitled = number;
+        doc.body = doc.markdown_body(text, cx);
+        if let Body::Markdown { saved, .. } = &mut doc.body {
+            saved.clear();
+        }
+        doc.dirty = true;
+        doc
+    }
+
     pub fn from_file(file: AnyFile, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut doc = Self::blank(Some(file.path.clone()), cx);
         doc.body = match file.content {

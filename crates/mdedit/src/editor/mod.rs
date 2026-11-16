@@ -12,6 +12,7 @@
 
 mod element;
 pub mod find_bar;
+mod highlight;
 mod overlays;
 pub mod style;
 mod widgets;
@@ -134,6 +135,8 @@ pub struct MarkdownEditor {
     base_dir: Option<PathBuf>,
     /// Drawn diagrams and formulas, by source and look.
     pictures: HashMap<u64, widgets::Picture>,
+    /// Highlighted code blocks, by content and language.
+    code_colors: HashMap<u64, Rc<Vec<highlight::Span>>>,
     /// Images from the web load only once asked for, per document: fetching
     /// one tells its server the document was opened.
     pub(crate) allow_remote: bool,
@@ -164,6 +167,12 @@ impl Focusable for MarkdownEditor {
     }
 }
 
+/// The clipboard's HTML flavour, if it has one. GPUI's clipboard only
+/// knows plain text, so this asks the platform directly.
+fn clipboard_html() -> Option<String> {
+    arboard::Clipboard::new().ok()?.get().html().ok()
+}
+
 /// How far each level of a list is set in.
 pub(crate) const LIST_INDENT: f32 = 26.;
 
@@ -190,6 +199,7 @@ impl MarkdownEditor {
             rows: Vec::new(),
             base_dir: None,
             pictures: HashMap::new(),
+            code_colors: HashMap::new(),
             allow_remote: false,
             slots: Vec::new(),
             content_w: None,
@@ -516,7 +526,24 @@ impl MarkdownEditor {
             content_w - indent - if code_block { px(16.) } else { px(0.) },
             px(40.),
         );
-        let runs = self.text_runs(&display, line.kind, line.quote);
+        let mut runs = self.text_runs(&display, line.kind, line.quote);
+        if line.kind == LineKind::Code
+            && let Some(spans) = self.code_spans(row.lines.start)
+        {
+            let start = self.syntax.lines[row.lines.start].range.start;
+            let local: Vec<highlight::Span> = spans
+                .iter()
+                .filter_map(|s| {
+                    let a = s.range.start.max(start);
+                    let b = s.range.end.min(display.source.end);
+                    (a < b).then(|| highlight::Span {
+                        range: a - start..b - start,
+                        ..s.clone()
+                    })
+                })
+                .collect();
+            runs = highlight::apply(runs, &local, display.text.len());
+        }
         let shaped = window
             .text_system()
             .shape_text(display.text.clone().into(), size, &runs, Some(wrap), None)
@@ -576,6 +603,52 @@ impl MarkdownEditor {
             slot.layout = Some(layout.clone());
         }
         layout
+    }
+
+    /// The colours of the fenced code block holding line `line`, as spans
+    /// in document offsets; `None` outside a block with a known language.
+    fn code_spans(&mut self, line: usize) -> Option<Rc<Vec<highlight::Span>>> {
+        let open = (0..line)
+            .rev()
+            .find(|&i| self.syntax.lines[i].kind != LineKind::Code)?;
+        let fence = &self.syntax.lines[open];
+        if fence.kind != LineKind::FenceOpen {
+            return None;
+        }
+        let lang = self.text[fence.lang.clone()?]
+            .split_whitespace()
+            .next()?
+            .to_string();
+        let body_start = fence.range.end + 1;
+        let close = (line..self.syntax.lines.len())
+            .find(|&i| self.syntax.lines[i].kind != LineKind::Code)
+            .unwrap_or(self.syntax.lines.len());
+        let body_end = if close < self.syntax.lines.len() {
+            self.syntax.lines[close].range.start
+        } else {
+            self.text.len()
+        };
+        let body = &self.text[body_start..body_end.max(body_start)];
+        let dark = self.style.palette.dark;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&(body, &lang, dark), &mut h);
+        let key = std::hash::Hasher::finish(&h);
+        if let Some(s) = self.code_colors.get(&key) {
+            return Some(s.clone());
+        }
+        let spans: Vec<highlight::Span> = highlight::highlight(body, &lang, dark)
+            .into_iter()
+            .map(|s| highlight::Span {
+                range: s.range.start + body_start..s.range.end + body_start,
+                ..s
+            })
+            .collect();
+        if self.code_colors.len() > 64 {
+            self.code_colors.clear();
+        }
+        let spans = Rc::new(spans);
+        self.code_colors.insert(key, spans.clone());
+        Some(spans)
     }
 
     fn text_runs(&self, d: &DisplayLine, kind: LineKind, quote: u8) -> Vec<TextRun> {
@@ -1063,8 +1136,16 @@ impl MarkdownEditor {
         }
     }
 
+    /// Smart paste: rich content (a web page, Word, Google Docs) arrives as
+    /// HTML and goes in as markdown. Ctrl/Cmd+Shift+V pastes plain text.
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
-        self.paste_text(cx);
+        let md = clipboard_html()
+            .map(|h| mdedit_core::html_import::html_to_markdown(&h))
+            .filter(|m| !m.trim().is_empty());
+        match md {
+            Some(md) => self.replace_selection(&md, Kind::Other, cx),
+            None => self.paste_text(cx),
+        }
     }
 
     fn paste_plain(&mut self, _: &PastePlain, _: &mut Window, cx: &mut Context<Self>) {

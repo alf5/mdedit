@@ -13,6 +13,7 @@ pub mod export;
 pub mod find;
 pub mod hex;
 pub mod history;
+pub mod html_import;
 pub mod markdown;
 pub mod math;
 pub mod mermaid;

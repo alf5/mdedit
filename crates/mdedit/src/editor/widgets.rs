@@ -344,8 +344,8 @@ impl MarkdownEditor {
                     .unwrap_or(3)
                     .clamp(3, 60) as f32
                     * self.style.size
-                    * 0.55
-                    + 24.
+                    * 0.68
+                    + 28.
             })
             .collect();
         let saved: Vec<Option<f32>> = (0..cols)

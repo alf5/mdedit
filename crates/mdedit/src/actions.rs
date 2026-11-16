@@ -17,6 +17,8 @@ gpui_kit::actions!(
         CloseFolder,
         CommandPalette,
         QuickOpen,
+        ImportHtml,
+        ImportWord,
         Save,
         SaveAs,
         CloseTab,

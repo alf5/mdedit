@@ -92,11 +92,13 @@ jobs:
             target/aarch64-apple-darwin/release/mdedit \
             target/x86_64-apple-darwin/release/mdedit
 
+      # Windows only makes the NSIS installer unless asked: ask for the MSI
+      # (WiX) too.
       - name: Package
         env:
           # linuxdeploy is itself an AppImage; runners have no FUSE.
           APPIMAGE_EXTRACT_AND_RUN: "1"
-        run: cargo packager --release -p mdedit
+        run: cargo packager --release -p mdedit ${{ runner.os == 'Windows' && '--formats nsis,wix' || '' }}
 
       - name: Package (RPM)
         if: runner.os == 'Linux'
@@ -117,6 +119,11 @@ jobs:
           find target/packages -maxdepth 1 -type f \
             \( -name '*.deb' -o -name '*.rpm' -o -name '*.AppImage' -o -name '*.exe' \
                -o -name '*.msi' -o -name '*.dmg' \) -exec cp {} dist-artifacts/ \;
+          # The disk image is named for the runner's arch, but the app in it
+          # is universal.
+          for f in dist-artifacts/*_aarch64.dmg; do
+            if [ -e "$f" ]; then mv "$f" "${f/_aarch64.dmg/_universal.dmg}"; fi
+          done
           ls -la dist-artifacts
 
       - uses: actions/upload-artifact@v4

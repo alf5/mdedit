@@ -19,6 +19,9 @@ gpui_kit::actions!(
         QuickOpen,
         ImportHtml,
         ImportWord,
+        ExportHtml,
+        ExportPdf,
+        Print,
         Save,
         SaveAs,
         CloseTab,
@@ -161,6 +164,7 @@ pub fn bind_keys(cx: &mut App) {
     bind(cx, "secondary-shift-l", ToggleSidebar, ws);
     bind(cx, "secondary-shift-p", CommandPalette, ws);
     bind(cx, "secondary-p", QuickOpen, ws);
+    bind(cx, "secondary-shift-e", ExportHtml, ws);
     bind(cx, "secondary-\\", SplitRight, ws);
     bind(cx, "ctrl-tab", NextTab, ws);
     bind(cx, "ctrl-shift-tab", PrevTab, ws);

@@ -24,10 +24,11 @@ use mdedit_core::prefs::{Mode, recent_parts};
 use mdedit_core::{os, project, themes};
 
 use crate::actions::*;
-use crate::doc::{DocEvent, DocView};
+use crate::doc::{DiskChoice, DocEvent, DocView};
 use crate::files::{FilesEvent, FilesPanel};
 use crate::state::AppState;
 use crate::theme;
+use mdedit_core::watch::{self, Watch};
 
 const SIDEBAR_WIDTH: f32 = 248.;
 const MAX_PANES: usize = 4;
@@ -104,6 +105,8 @@ pub struct Workspace {
     pending: Option<Pending>,
     /// Modified tabs the user chose not to save during this quit.
     quit_discarded: HashSet<EntityId>,
+    /// Notices files changed on disk underneath their tabs.
+    watch: Watch,
     _subs: Vec<Subscription>,
     _tasks: Vec<Task<()>>,
 }
@@ -144,6 +147,32 @@ impl Workspace {
             }
         });
 
+        // Files changed underneath their tabs, reported from the watcher's
+        // thread.
+        let (changed_tx, changed_rx) = async_channel::unbounded::<PathBuf>();
+        let watch = Watch::new(move |p| {
+            let _ = changed_tx.send_blocking(p);
+        });
+        let changes = cx.spawn_in(window, async move |this, cx| {
+            while let Ok(path) = changed_rx.recv().await {
+                if this
+                    .update_in(cx, |this, _, cx| this.disk_changed(&path, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        // Back in the window: look again, for filesystems that don't report
+        // changes (network mounts).
+        subs.push(cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                let watch = this.watch.clone();
+                cx.background_spawn(async move { watch.check_all() })
+                    .detach();
+            }
+        }));
+
         let ws = cx.entity().downgrade();
         window.on_window_should_close(cx, move |window, cx| {
             ws.update(cx, |ws, cx| ws.request_quit(window, cx))
@@ -162,8 +191,9 @@ impl Workspace {
             sidebar_tab: SidebarTab::Outline,
             pending: None,
             quit_discarded: HashSet::new(),
+            watch,
             _subs: subs,
-            _tasks: vec![ipc],
+            _tasks: vec![ipc, changes],
         };
         window.focus(&this.focus, cx);
         if !paths.is_empty() {
@@ -208,8 +238,14 @@ impl Workspace {
     }
 
     fn add_doc(&mut self, doc: Entity<DocView>, window: &mut Window, cx: &mut Context<Self>) {
-        self._subs
-            .push(cx.subscribe(&doc, |_, _, _: &DocEvent, cx| cx.notify()));
+        self._subs.push(
+            cx.subscribe_in(&doc, window, |this, doc, ev: &DocEvent, window, cx| {
+                if let DocEvent::Disk(choice) = ev {
+                    this.resolve_disk(doc.clone(), *choice, window, cx);
+                }
+                cx.notify();
+            }),
+        );
         let pane = &mut self.panes[self.active];
         let at = (pane.active + 1).min(pane.tabs.len());
         pane.tabs.insert(at, doc.clone());
@@ -260,6 +296,7 @@ impl Workspace {
                                 continue;
                             }
                             opened.push(file.path.clone());
+                            this.stamp(&file);
                             let doc = cx.new(|cx| DocView::from_file(file, window, cx));
                             this.add_doc(doc, window, cx);
                         }
@@ -276,6 +313,7 @@ impl Workspace {
                     }
                 }
                 AppState::update_prefs(cx, |p| p.push_recent(opened.iter().map(PathBuf::as_path)));
+                this.sync_watch(cx);
             })
             .ok();
         })
@@ -422,6 +460,81 @@ impl Workspace {
         self.import(mdedit_core::docx::docx_to_markdown, window, cx);
     }
 
+    /// The active markdown document's title (its file name) and text.
+    fn active_markdown(&self, cx: &App) -> Option<(String, String, Option<PathBuf>)> {
+        let d = self.active_doc()?.read(cx);
+        let text = d.markdown()?.read(cx).text().to_string();
+        Some((d.name(), text, d.path.clone()))
+    }
+
+    /// Ask where to write an export of the active document, then write
+    /// `make(title, markdown, base_dir)` there.
+    fn export(
+        &mut self,
+        ext: &'static str,
+        make: impl FnOnce(&str, &str, Option<&Path>, &App) -> Result<Vec<u8>, String> + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((name, md, path)) = self.active_markdown(cx) else {
+            return;
+        };
+        let stem = Path::new(&name)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Untitled".into());
+        let dir = path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .or_else(dirs::document_dir)
+            .or_else(dirs::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let rx = cx.prompt_for_new_path(&dir, Some(&format!("{stem}.{ext}")));
+        cx.spawn_in(window, async move |_, cx| {
+            let Ok(Ok(Some(out))) = rx.await else { return };
+            cx.update(|window, cx| {
+                let base = path.as_deref().and_then(Path::parent);
+                let result = make(&name, &md, base, cx)
+                    .and_then(|bytes| std::fs::write(&out, bytes).map_err(|e| e.to_string()));
+                match result {
+                    Ok(()) => window.push_notification(
+                        Notification::success(format!("Exported {}", out.display())),
+                        cx,
+                    ),
+                    Err(e) => window.push_notification(
+                        Notification::error(format!("Couldn't export: {e}")),
+                        cx,
+                    ),
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn export_html(&mut self, _: &ExportHtml, window: &mut Window, cx: &mut Context<Self>) {
+        self.export(
+            "html",
+            |name, md, _, cx| {
+                let p = AppState::prefs(cx);
+                let mut class = p.style.css_class().to_string();
+                if p.numbered {
+                    class.push_str(" md-numbered");
+                }
+                if p.reading_width.is_none() {
+                    class.push_str(" md-full-width");
+                }
+                Ok(
+                    mdedit_core::export::export_html(name, md, class.trim(), p.theme())
+                        .into_bytes(),
+                )
+            },
+            window,
+            cx,
+        );
+    }
+
     fn close_folder(&mut self, _: &CloseFolder, _: &mut Window, cx: &mut Context<Self>) {
         self.set_folder(None, cx);
     }
@@ -464,6 +577,20 @@ impl Workspace {
             return;
         }
         match path {
+            // A plain save never overwrites a file that changed underneath
+            // it: it asks the changed-on-disk question instead.
+            Some(path) if self.watch.changed(&path) => {
+                doc.update(cx, |d, cx| {
+                    d.stale = true;
+                    cx.notify();
+                });
+                window.push_notification(
+                    Notification::warning(
+                        "The file changed on disk, so it wasn't overwritten. Choose what to keep.",
+                    ),
+                    cx,
+                );
+            }
             Some(path) => self.write(doc, &path, then, window, cx),
             None => self.save_doc_as(doc, then, window, cx),
         }
@@ -514,6 +641,10 @@ impl Workspace {
     ) {
         match doc.update(cx, |d, cx| d.write_to(path, cx)) {
             Ok(()) => {
+                if let Some(bytes) = doc.read(cx).disk_bytes(cx) {
+                    self.watch.record_bytes(&project::canonical(path), &bytes);
+                }
+                self.sync_watch(cx);
                 AppState::update_prefs(cx, |p| p.push_recent([path]));
                 self.sync_files(cx);
                 match then {
@@ -586,6 +717,99 @@ impl Workspace {
             None => {
                 window.focus(&self.focus, cx);
                 self.sync_files(cx);
+            }
+        }
+        self.sync_watch(cx);
+        cx.notify();
+    }
+
+    // ---------- changes on disk ----------
+
+    /// Record what `file` held when read, so later reads can tell a real
+    /// change from a touch.
+    fn stamp(&self, file: &project::AnyFile) {
+        use project::Content;
+        match &file.content {
+            Content::Markdown(t) | Content::Text(t) => self.watch.record(&file.path, t),
+            Content::Image { bytes, .. } | Content::Binary(bytes) => {
+                self.watch.record_bytes(&file.path, bytes)
+            }
+            Content::Oversized => {}
+        }
+    }
+
+    /// Watch exactly the files that have tabs.
+    fn sync_watch(&self, cx: &App) {
+        let paths: Vec<PathBuf> = self
+            .docs()
+            .filter_map(|d| d.read(cx).path.clone())
+            .collect();
+        self.watch.set_paths(&paths);
+    }
+
+    fn disk_changed(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if let Some(doc) = self.find_path(path, cx) {
+            doc.update(cx, |d, cx| {
+                d.stale = true;
+                cx.notify();
+            });
+            cx.notify();
+        }
+    }
+
+    /// Act on the answer to the changed-on-disk banner.
+    fn resolve_disk(
+        &mut self,
+        doc: Entity<DocView>,
+        choice: DiskChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = doc.read(cx).path.clone() else {
+            return;
+        };
+        let file = match project::read_any(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                window.push_notification(
+                    Notification::error(format!("Couldn't read {}: {e}", path.display())),
+                    cx,
+                );
+                return;
+            }
+        };
+        self.stamp(&file);
+        match choice {
+            DiskChoice::Reload => doc.update(cx, |d, cx| d.reload(file, window, cx)),
+            DiskChoice::Keep => doc.update(cx, |d, cx| {
+                d.stale = false;
+                d.mark_dirty(cx);
+            }),
+            DiskChoice::Merge => {
+                let disk = match &file.content {
+                    project::Content::Markdown(t) | project::Content::Text(t) => t.clone(),
+                    _ => return doc.update(cx, |d, cx| d.reload(file, window, cx)),
+                };
+                let (base, ours) = {
+                    let d = doc.read(cx);
+                    (
+                        d.saved_text().unwrap_or_default(),
+                        d.current_text(cx).unwrap_or_default(),
+                    )
+                };
+                let (merged, conflicted) = watch::merge(&base, &ours, &disk);
+                doc.update(cx, |d, cx| d.set_texts(merged, disk, window, cx));
+                if conflicted {
+                    if let Some(editor) = doc.read(cx).markdown().cloned() {
+                        editor.update(cx, |e, cx| e.set_mode(Mode::Source, cx));
+                    }
+                    window.push_notification(
+                        Notification::warning(
+                            "Both sides changed the same lines: look for the <<<<<<< markers.",
+                        ),
+                        cx,
+                    );
+                }
             }
         }
         cx.notify();
@@ -853,10 +1077,12 @@ impl Workspace {
         let theme = cx.theme();
         let d = doc.read(cx);
         let name: SharedString = d.name().into();
-        let dirty = d.is_dirty();
+        let stale = d.stale;
+        let dirty = d.is_dirty() || stale;
         let selected = self.panes[pane].active == ix;
         let focused_pane = pane == self.active;
         let group: SharedString = format!("tab-{}", doc.entity_id()).into();
+        let warning = theme.warning;
         let (fg, muted, active_bg, hover_bg, accent, border) = (
             theme.tab_active_foreground,
             theme.tab_foreground,
@@ -917,7 +1143,9 @@ impl Workspace {
                             .justify_center()
                             .when(!dirty, |d| d.invisible())
                             .group_hover(group.clone(), |s| s.invisible())
-                            .child(div().size(px(7.)).rounded_full().bg(if selected {
+                            .child(div().size(px(7.)).rounded_full().bg(if stale {
+                                warning
+                            } else if selected {
                                 fg
                             } else {
                                 muted
@@ -1028,7 +1256,7 @@ impl Workspace {
             .icon(IconName::Menu)
             .tooltip("Menu")
             .dropdown_menu(move |menu, window, cx| {
-                let (has_doc, can_save_as, split, sidebar) = ws
+                let (has_doc, can_save_as, split, sidebar, has_markdown) = ws
                     .read_with(cx, |ws, cx| {
                         let doc = ws.active_doc().map(|d| d.read(cx));
                         (
@@ -1036,6 +1264,7 @@ impl Workspace {
                             doc.is_some_and(|d| d.can_save_as()),
                             ws.panes.len() > 1,
                             ws.sidebar_open,
+                            doc.is_some_and(|d| d.markdown().is_some()),
                         )
                     })
                     .unwrap_or_default();
@@ -1072,6 +1301,10 @@ impl Workspace {
                         }
                         m.separator().menu("Clear Recent", Box::new(ClearRecent))
                     })
+                    .separator()
+                    .menu_with_disabled("Export as HTML…", Box::new(ExportHtml), !has_markdown)
+                    .menu_with_disabled("Export as PDF…", Box::new(ExportPdf), !has_markdown)
+                    .menu_with_disabled("Print…", Box::new(Print), !has_markdown)
                     .separator()
                     .menu("Import HTML…", Box::new(ImportHtml))
                     .menu("Import Word Document…", Box::new(ImportWord))
@@ -1692,6 +1925,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::command_palette))
             .on_action(cx.listener(Self::import_html))
             .on_action(cx.listener(Self::import_word))
+            .on_action(cx.listener(Self::export_html))
             .on_action(cx.listener(Self::quick_open))
             .on_action(cx.listener(Self::open_recent))
             .on_action(cx.listener(Self::clear_recent))
@@ -1766,7 +2000,7 @@ mod tests {
         WindowOptions, px, size,
     };
 
-    use super::{Answer, Pending, Workspace};
+    use super::{Answer, DiskChoice, Pending, Workspace};
     use crate::actions::*;
     use crate::state::AppState;
 
@@ -1956,6 +2190,58 @@ mod tests {
         });
         assert_eq!(text, "**word**");
         assert_eq!(tabs(cx, &ws)[0].len(), 1);
+    }
+
+    #[gpui_kit::test]
+    fn outside_changes_are_noticed_and_merged(cx: &mut TestAppContext) {
+        let (h, ws) = setup(cx);
+        let dir = scratch("disk");
+        let path = dir.join("n.md");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        cx.update_window(h, |_, window, cx| {
+            ws.update(cx, |ws, cx| ws.open_paths(vec![path.clone()], window, cx))
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let doc = ws.read_with(cx, |ws, _| ws.active_doc().cloned().unwrap());
+        let editor = doc.read_with(cx, |d, _| d.markdown().cloned().unwrap());
+        // Our change at the top; someone else's at the bottom.
+        editor.update(cx, |e, cx| e.set_text("ONE\ntwo\nthree\n".into(), cx));
+        std::fs::write(&path, "one\ntwo\nTHREE\n").unwrap();
+        let watch = ws.read_with(cx, |ws, _| ws.watch.clone());
+        watch.check_all();
+        cx.run_until_parked();
+        assert!(doc.read_with(cx, |d, _| d.stale), "the change is noticed");
+
+        // Saving now would lose their change: it doesn't happen.
+        act(cx, h, Save);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\nTHREE\n");
+
+        cx.update_window(h, |_, window, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.resolve_disk(doc.clone(), DiskChoice::Merge, window, cx)
+            })
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!(
+            editor.read_with(cx, |e, _| e.text().to_string()),
+            "ONE\ntwo\nTHREE\n"
+        );
+        assert!(!doc.read_with(cx, |d, _| d.stale));
+        assert!(
+            doc.read_with(cx, |d, _| d.is_dirty()),
+            "the merge isn't saved yet"
+        );
+        act(cx, h, Save);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ONE\ntwo\nTHREE\n");
+
+        // A rewrite with the same bytes is not news.
+        std::fs::write(&path, "ONE\ntwo\nTHREE\n").unwrap();
+        watch.check_all();
+        cx.run_until_parked();
+        assert!(!doc.read_with(cx, |d, _| d.stale));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[gpui_kit::test]

@@ -8,8 +8,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use gpui_kit::component::ActiveTheme;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, InputEvent};
+use gpui_kit::component::{ActiveTheme, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mdedit_core::project::{self, AnyFile, Content};
@@ -46,6 +47,19 @@ pub enum Body {
 /// Something about the tab changed: modified state, name, or content.
 pub enum DocEvent {
     Changed,
+    /// The user answered the changed-on-disk banner.
+    Disk(DiskChoice),
+}
+
+/// What to do about a file that changed underneath its tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiskChoice {
+    /// Take the file's version.
+    Reload,
+    /// Three-way merge of the tab's changes and the file's.
+    Merge,
+    /// Keep the tab's version; the next save overwrites the file.
+    Keep,
 }
 
 pub struct DocView {
@@ -58,6 +72,8 @@ pub struct DocView {
     chars: usize,
     focus: FocusHandle,
     find: Option<Entity<FindBar>>,
+    /// The file changed on disk and the user hasn't said what to do yet.
+    pub stale: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -153,6 +169,7 @@ impl DocView {
             chars: 0,
             focus: cx.focus_handle(),
             find: None,
+            stale: false,
             _subs: Vec::new(),
         }
     }
@@ -234,6 +251,140 @@ impl DocView {
 
     fn find_replace(&mut self, _: &FindReplace, window: &mut Window, cx: &mut Context<Self>) {
         self.open_find(true, window, cx);
+    }
+
+    /// What was last read from or written to disk, as text: the common
+    /// ancestor for a merge.
+    pub fn saved_text(&self) -> Option<String> {
+        match &self.body {
+            Body::Markdown { saved, .. } => Some(saved.clone()),
+            Body::Text { saved, .. } => Some(saved.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Keep the tab's version over the file's: it differs, so it's modified.
+    pub fn mark_dirty(&mut self, cx: &mut Context<Self>) {
+        self.dirty = true;
+        cx.emit(DocEvent::Changed);
+        cx.notify();
+    }
+
+    /// The tab's current text.
+    pub fn current_text(&self, cx: &App) -> Option<String> {
+        match &self.body {
+            Body::Markdown { editor, .. } => Some(editor.read(cx).text().to_string()),
+            Body::Text { editor, .. } => Some(editor.read(cx).value().to_string()),
+            _ => None,
+        }
+    }
+
+    /// What saving would write.
+    pub fn disk_bytes(&self, cx: &App) -> Option<Vec<u8>> {
+        match &self.body {
+            Body::Hex(hex) => Some(hex.read(cx).doc.bytes().to_vec()),
+            _ => self.current_text(cx).map(String::into_bytes),
+        }
+    }
+
+    /// Replace the tab's content with `text` and make `disk` the new saved
+    /// version (both the same for a reload; a merge keeps changes).
+    pub fn set_texts(
+        &mut self,
+        text: String,
+        disk: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match &mut self.body {
+            Body::Markdown { editor, saved } => {
+                *saved = disk.clone();
+                editor.update(cx, |e, cx| e.set_text(text.clone(), cx));
+            }
+            Body::Text { editor, saved, .. } => {
+                *saved = disk.clone().into();
+                editor.update(cx, |e, cx| e.set_value(text.clone(), window, cx));
+            }
+            _ => return,
+        }
+        self.dirty = text != disk;
+        self.stale = false;
+        cx.emit(DocEvent::Changed);
+        cx.notify();
+    }
+
+    /// Start over from `file` (a reload of a picture or a binary).
+    pub fn reload(&mut self, file: AnyFile, window: &mut Window, cx: &mut Context<Self>) {
+        match file.content {
+            Content::Markdown(t) | Content::Text(t) if self.saved_text().is_some() => {
+                self.set_texts(t.clone(), t, window, cx);
+            }
+            _ => {
+                let fresh = DocView::from_file(file, window, cx);
+                self.body = fresh.body;
+                self._subs.extend(fresh._subs);
+                self.dirty = false;
+                self.stale = false;
+                cx.emit(DocEvent::Changed);
+                cx.notify();
+            }
+        }
+    }
+
+    /// The question asked of a stale tab, above its content.
+    fn render_banner(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (bg, border, fg) = (
+            theme.warning.opacity(0.14),
+            theme.warning.opacity(0.5),
+            theme.foreground,
+        );
+        let can_merge = self.saved_text().is_some() && self.dirty;
+        let choice = |id: &'static str,
+                      label: &'static str,
+                      c: DiskChoice,
+                      primary: bool,
+                      cx: &mut Context<Self>| {
+            Button::new(id)
+                .xsmall()
+                .label(label)
+                .map(|b| if primary { b.primary() } else { b.outline() })
+                .on_click(cx.listener(move |_, _, _, cx| cx.emit(DocEvent::Disk(c))))
+        };
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(8.))
+            .px(px(14.))
+            .py(px(7.))
+            .bg(bg)
+            .border_b_1()
+            .border_color(border)
+            .text_sm()
+            .text_color(fg)
+            .child(div().flex_1().child(if self.dirty {
+                "This file changed on disk, and you have changes too."
+            } else {
+                "This file changed on disk."
+            }))
+            .child(choice(
+                "disk-reload",
+                "Reload",
+                DiskChoice::Reload,
+                !self.dirty,
+                cx,
+            ))
+            .when(can_merge, |d| {
+                d.child(choice("disk-merge", "Merge", DiskChoice::Merge, true, cx))
+            })
+            .child(choice(
+                "disk-keep",
+                "Keep Mine",
+                DiskChoice::Keep,
+                false,
+                cx,
+            ))
     }
 
     /// Typography or colours changed: re-set the editor.
@@ -394,7 +545,9 @@ impl Render for DocView {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
         let page = div().size_full().track_focus(&self.focus);
-        match &self.body {
+        let stale = self.stale;
+        let banner = stale.then(|| self.render_banner(cx).into_any_element());
+        let content = match &self.body {
             Body::Markdown { editor, .. } => page
                 .key_context("DocView")
                 .on_action(cx.listener(Self::find))
@@ -459,6 +612,12 @@ impl Render for DocView {
                         "mdedit opens text and binaries up to 1 MB, and images up to 16 MB.",
                     ))
             }
-        }
+        };
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .children(banner)
+            .child(div().flex_1().min_h_0().child(content))
     }
 }

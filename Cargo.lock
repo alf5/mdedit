@@ -5080,6 +5080,7 @@ dependencies = [
  "mdedit-core",
  "mdedit-pdf",
  "syntect",
+ "tempfile",
  "two-face",
 ]
 

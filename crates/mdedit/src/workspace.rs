@@ -638,10 +638,20 @@ impl Workspace {
         #[cfg(feature = "pdf")]
         self.typeset(window, cx, |result, window, cx| match result {
             Ok(bytes) => {
-                let path =
-                    std::env::temp_dir().join(format!("mdedit-print-{}.pdf", std::process::id()));
-                match std::fs::write(&path, bytes) {
-                    Ok(()) => cx.open_with_system(&path),
+                // A fresh, randomly named file only this user can read,
+                // created exclusively: a predictable name in a shared
+                // temp directory could be a planted symlink.
+                let written = tempfile::Builder::new()
+                    .prefix("mdedit-print-")
+                    .suffix(".pdf")
+                    .tempfile()
+                    .and_then(|mut f| {
+                        std::io::Write::write_all(&mut f, &bytes)?;
+                        f.keep().map_err(|e| e.error)
+                    });
+                match written {
+                    // Kept for the viewer, which outlives this call.
+                    Ok((_, path)) => cx.open_with_system(&path),
                     Err(e) => window.push_notification(Notification::error(e.to_string()), cx),
                 }
             }

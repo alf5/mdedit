@@ -153,3 +153,62 @@ Arch, Wayland, RADV Vulkan). Kept here so later milestones don't relearn them.
   Enter.
 - **Ligatures:** JetBrains Mono turns `<!--` into an arrow.
   `FontFeatures::disable_ligatures()` turns that off for document code.
+
+## M4–M6 findings: widgets, files, export, shipping
+
+- **Widgets are rows.**
+  - **What they are:** tables, diagrams, display math and lone images.
+  - **Closed widget:** a single row drawn by a child `AnyElement`, laid out
+    with `layout_as_root` and painted at the row's origin.
+  - **Open widget:** each source line becomes its own row, and the widget
+    draws as a preview under the last one. Tables have no preview; the
+    caret edits their source with cell navigation.
+  - **Re-padding:** leaving a table re-pads it through `TableModel`.
+- **Mermaid text**: usvg's default font is Times New Roman, so diagram
+  labels came out as the wrong glyphs. Text is flattened with an explicit
+  `font_family` and the bundled fontdb.
+- **The file watcher** runs a thread, which trips GPUI's deterministic test
+  scheduler. Tests use `Watch::passive` and call `check_all` by hand.
+  mtime is coarse, so a same-size rewrite within one tick can go unnoticed
+  in tests; test writes change the size.
+- **PDF**: `mdedit-pdf` writes Typst markup and compiles it against an
+  in-memory `World` (bundled fonts plus virtual files for diagram SVGs).
+  - Text goes in as string literals (`#"…";`), so nothing in a document
+    is ever read as Typst code.
+  - A list whose items are all tasks gets `marker: []`; otherwise it shows
+    a bullet and a box.
+- **Print** writes through `tempfile` (random name, `O_EXCL`, mode 0600) and
+  hands the file to the system viewer. No GPUI print API exists.
+- **UI tests and custom elements**: `TestWindowExt::click(id)` only finds
+  components and elements that call `.test_support()`, which is the last
+  call in the builder chain. The status bar sits over the bottom of the
+  pane, so scroll a target well clear of it before clicking.
+- **Performance** (release build, 10k-line document):
+  - **Per keystroke, whole frame:** 4 ms median with the outline open, 3 ms
+    with it closed.
+  - **Core work:** `syntax::parse` 1.7 ms, `display::rows` 0.04 ms, counts
+    0.1 ms. Parse and rows are linear in size.
+  - **Fixed quadratic:** `rows` once looked up each line's widget among
+    all widgets.
+  - **The outline sidebar** was 7 of 10 ms when it built a row for every
+    heading. It is a `uniform_list` now.
+  - **Re-checking:** `cargo run --release -p mdedit-core --example perf
+    [lines]` measures the core. The ignored test
+    `typing_stays_quick_in_a_long_document` measures a keystroke plus a
+    frame (`cargo test --release -p mdedit -- --ignored typing_stays`).
+- **Packaging**:
+  - **Installers:** cargo-packager metadata in `crates/mdedit/Cargo.toml`,
+    plus cargo-generate-rpm for the RPM. The deb template is
+    `assets/mdedit.desktop` (handlebars). The RPM and AUR use
+    `packaging/linux/mdedit.desktop`.
+  - **Linux libraries:** the binary links libxcb and libxkbcommon(-x11).
+    It dlopens Wayland, Vulkan, EGL and fontconfig, and freetype is built
+    in. The packages declare all of these.
+  - **Icons:** cargo-packager names a file containing `@2x` as a scale-2
+    icon (`256x256@2` for a 256 px file, which is the slot for 512 px), so
+    the icons are listed as plain `256x256.png` and `512x512.png`.
+  - **File associations:** `role` is lower case (`"editor"`).
+  - **Desktop entry:** `Categories=Utility;TextEditor;`. Office as well
+    would list the app twice in menus.
+  - **Binary size:** the stripped release binary is 73 MB, or 45 MB without
+    the `pdf` feature, so Typst is 28 MB of it. The .deb is 31 MB.

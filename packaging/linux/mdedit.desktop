@@ -1,0 +1,12 @@
+[Desktop Entry]
+Categories=Utility;TextEditor;
+Comment=A Markdown editor that shows your writing, not your markup
+Exec=mdedit %F
+Icon=mdedit
+Name=mdedit
+GenericName=Markdown Editor
+Keywords=markdown;md;editor;notes;writing;
+Terminal=false
+Type=Application
+MimeType=text/markdown;text/x-markdown;
+StartupWMClass=mdedit

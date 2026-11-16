@@ -34,3 +34,66 @@ libc = "0.2"
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["syntect", "test-support"] }
+
+# Installers, built with cargo-packager (https://github.com/crabnebula-dev/cargo-packager)
+# from the release binary:
+#   cargo install cargo-packager --locked
+#   cargo build --release -p mdedit && cargo packager --release -p mdedit
+# Linux gets .deb and AppImage, Windows NSIS and MSI, macOS .app and .dmg.
+[package.metadata.packager]
+product-name = "mdedit"
+identifier = "com.alf5.mdedit"
+description = "A Markdown editor that shows your writing, not your markup"
+long-description = """
+mdedit edits Markdown files and draws them formatted as you type: headings,
+lists, tables, Mermaid diagrams and formulas, with the markup shown only
+where you want it. It exports HTML and PDF and imports HTML and Word."""
+homepage = "https://github.com/alf5/mdedit"
+publisher = "alf5"
+category = "Productivity"
+license-file = "../../LICENSE"
+out-dir = "../../target/packages"
+icons = [
+    "../../assets/icons/32x32.png",
+    "../../assets/icons/128x128.png",
+    "../../assets/icons/256x256.png",
+    "../../assets/icons/512x512.png",
+    "../../assets/icons/icon.icns",
+    "../../assets/icons/icon.ico",
+]
+
+[[package.metadata.packager.file-associations]]
+extensions = ["md", "markdown", "mdown", "mkd"]
+mime-type = "text/markdown"
+name = "Markdown document"
+description = "Markdown document"
+role = "editor"
+
+# libxcb and libxkbcommon are linked; Wayland, Vulkan and fontconfig are
+# loaded at run time, so nothing would pull them in otherwise.
+[package.metadata.packager.deb]
+desktop-template = "../../assets/mdedit.desktop"
+section = "editors"
+depends = [
+    "libxcb1",
+    "libxkbcommon0",
+    "libxkbcommon-x11-0",
+    "libwayland-client0",
+    "libvulkan1",
+    "libfontconfig1",
+]
+
+# RPM, built with cargo-generate-rpm after a release build:
+#   cargo build --release -p mdedit && cargo generate-rpm -p crates/mdedit
+[package.metadata.generate-rpm]
+summary = "A Markdown editor that shows your writing, not your markup"
+requires = { libxkbcommon-x11 = "*", libwayland-client = "*", vulkan-loader = "*", fontconfig = "*" }
+assets = [
+    { source = "target/release/mdedit", dest = "/usr/bin/mdedit", mode = "755" },
+    { source = "packaging/linux/mdedit.desktop", dest = "/usr/share/applications/mdedit.desktop", mode = "644" },
+    { source = "assets/icons/32x32.png", dest = "/usr/share/icons/hicolor/32x32/apps/mdedit.png", mode = "644" },
+    { source = "assets/icons/128x128.png", dest = "/usr/share/icons/hicolor/128x128/apps/mdedit.png", mode = "644" },
+    { source = "assets/icons/256x256.png", dest = "/usr/share/icons/hicolor/256x256/apps/mdedit.png", mode = "644" },
+    { source = "assets/icons/512x512.png", dest = "/usr/share/icons/hicolor/512x512/apps/mdedit.png", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/licenses/mdedit/LICENSE", mode = "644", doc = true },
+]

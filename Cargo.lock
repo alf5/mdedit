@@ -5069,7 +5069,7 @@ dependencies = [
 
 [[package]]
 name = "mdedit"
-version = "2.0.0-dev"
+version = "2.0.0"
 dependencies = [
  "arboard",
  "async-channel",
@@ -5086,7 +5086,7 @@ dependencies = [
 
 [[package]]
 name = "mdedit-core"
-version = "2.0.0-dev"
+version = "2.0.0"
 dependencies = [
  "bezel-mermaid",
  "diffy",
@@ -5107,7 +5107,7 @@ dependencies = [
 
 [[package]]
 name = "mdedit-pdf"
-version = "2.0.0-dev"
+version = "2.0.0"
 dependencies = [
  "mdedit-core",
  "pulldown-cmark",

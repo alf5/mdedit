@@ -47,13 +47,15 @@ pub struct Colors {
 }
 
 impl Colors {
-    /// A callout's colour. ZenNotes groups the kinds: an important note is a
-    /// tip (green) and a caution a warning (yellow).
+    /// A callout's colour, by its group.
     pub fn callout(&self, alert: Alert) -> Hsla {
         match alert {
             Alert::Note => self.alerts[0],
-            Alert::Tip | Alert::Important => self.alerts[1],
-            Alert::Warning | Alert::Caution => self.alerts[3],
+            Alert::Tip => self.alerts[1],
+            Alert::Question => self.alerts[2],
+            Alert::Warning => self.alerts[3],
+            Alert::Danger => self.alerts[4],
+            Alert::Quote => self.faint,
         }
     }
 }

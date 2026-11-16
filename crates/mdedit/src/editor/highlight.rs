@@ -115,6 +115,20 @@ const DECLARING: &[&str] = &[
     "def", "class", "var", "val", "func",
 ];
 
+/// Whether two fence words name the same language (`rs` and `rust` do);
+/// two empty ones are both plain text.
+pub fn same_language(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return a.is_empty() && b.is_empty();
+    }
+    if a.eq_ignore_ascii_case(b) {
+        return true;
+    }
+    let ss = syntaxes();
+    let find = |w: &str| ss.find_syntax_by_token(w).map(|s| s.name.clone());
+    find(a).is_some_and(|x| Some(x) == find(b))
+}
+
 /// Colour spans for `code` in language `lang` (a fence info word: `rust`,
 /// `py`, `json`…), offsets relative to `code`. Empty when the language is
 /// unknown.

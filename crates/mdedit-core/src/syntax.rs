@@ -24,6 +24,10 @@ pub mod style {
     pub const MATH: u16 = 1 << 6;
     /// A frontmatter key, `title:`.
     pub const KEY: u16 = 1 << 7;
+    /// An Obsidian `#tag`.
+    pub const TAG: u16 = 1 << 8;
+    /// A `[[wiki link]]`.
+    pub const WIKI: u16 = 1 << 9;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +55,8 @@ pub enum MarkupKind {
     /// An inline code span's backticks: drawn as a little padding inside
     /// its chip when hidden.
     CodeTick,
+    /// An inline formula's `$`s.
+    MathDelim,
     HeadingPrefix,
     QuotePrefix,
     /// `- `, `* `, `+ `: drawn as a bullet when hidden.
@@ -67,26 +73,57 @@ pub enum MarkupKind {
     Alert(Alert),
 }
 
-/// GitHub's alert kinds, `> [!NOTE]` and friends.
+/// A callout's kind, as ZenNotes groups them by colour: GitHub's alerts
+/// (`> [!NOTE]` and friends) and Obsidian's callouts (`> [!info]`, `> [!bug]
+/// Title`, …) alike.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Alert {
+    /// Blue: note, info, abstract, summary, tldr, todo, and anything else.
     Note,
+    /// Green: tip, hint, important, success, check, done.
     Tip,
-    Important,
+    /// Purple: question, help, faq, example.
+    Question,
+    /// Yellow: warning, warn, caution, attention.
     Warning,
-    Caution,
+    /// Red: danger, error, bug, failure, fail, missing.
+    Danger,
+    /// Grey: quote, cite.
+    Quote,
 }
 
 impl Alert {
-    pub fn title(self) -> &'static str {
-        match self {
-            Alert::Note => "Note",
-            Alert::Tip => "Tip",
-            Alert::Important => "Important",
-            Alert::Warning => "Warning",
-            Alert::Caution => "Caution",
+    /// The group a callout's type word belongs to.
+    pub fn of(word: &str) -> Alert {
+        match word.to_ascii_lowercase().as_str() {
+            "tip" | "hint" | "important" | "success" | "check" | "done" => Alert::Tip,
+            "question" | "help" | "faq" | "example" => Alert::Question,
+            "warning" | "warn" | "caution" | "attention" => Alert::Warning,
+            "danger" | "error" | "bug" | "failure" | "fail" | "missing" => Alert::Danger,
+            "quote" | "cite" => Alert::Quote,
+            _ => Alert::Note,
         }
     }
+}
+
+/// Where a callout's `[!type]` is at the start of `s`, and its type word:
+/// `[!info]`, `[!faq]-` (Obsidian's fold mark is taken along).
+pub fn callout_marker(s: &str) -> Option<(usize, &str)> {
+    let rest = s.strip_prefix("[!")?;
+    let close = rest.find(']')?;
+    let word = &rest[..close];
+    let ok = word.starts_with(|c: char| c.is_ascii_alphabetic())
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !ok {
+        return None;
+    }
+    let mut end = 2 + close + 1;
+    if s[end..].starts_with(['+', '-']) {
+        end += 1;
+    }
+    Some((end, word))
 }
 
 /// A block the rendered modes draw as something other than text.
@@ -126,6 +163,8 @@ pub struct Link {
     /// The link's visible text.
     pub range: Range<usize>,
     pub url: String,
+    /// A `[[wiki link]]`: `url` names a note.
+    pub wiki: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -161,6 +200,9 @@ pub struct Syntax {
     pub links: Vec<Link>,
     pub headings: Vec<Heading>,
     pub widgets: Vec<Widget>,
+    /// Inline formulas, `$…$` (and `$$…$$` within a paragraph), their
+    /// delimiters included.
+    pub maths: Vec<Range<usize>>,
 }
 
 pub fn options() -> Options {
@@ -171,6 +213,7 @@ pub fn options() -> Options {
     opts.insert(Options::ENABLE_TASKLISTS);
     opts.insert(Options::ENABLE_GFM);
     opts.insert(Options::ENABLE_MATH);
+    opts.insert(Options::ENABLE_WIKILINKS);
     opts
 }
 
@@ -311,8 +354,12 @@ pub fn parse(text: &str) -> Syntax {
     let mut markup = Vec::new();
     let mut links = Vec::new();
     let mut headings = Vec::new();
+    let mut maths = Vec::new();
     let mut stack: Vec<Open> = Vec::new();
     let mut heading_text: Option<(u8, usize, String)> = None;
+    // Obsidian callouts' title lines, which share a paragraph with the text
+    // after them but are drawn on their own.
+    let mut callout_heads: Vec<usize> = Vec::new();
 
     let count = |stack: &mut Vec<Open>| {
         if let Some(top) = stack.last_mut() {
@@ -459,29 +506,43 @@ pub fn parse(text: &str) -> Syntax {
                         }
                     }
                     Tag::BlockQuote(kind) => {
-                        let alert = kind.map(|k| match k {
-                            BlockQuoteKind::Note => Alert::Note,
-                            BlockQuoteKind::Tip => Alert::Tip,
-                            BlockQuoteKind::Important => Alert::Important,
-                            BlockQuoteKind::Warning => Alert::Warning,
-                            BlockQuoteKind::Caution => Alert::Caution,
-                        });
+                        // A GitHub alert, or an Obsidian callout: `[!type]`
+                        // opening the quote's first line.
+                        let lt = &text[r.start..lines[first].range.end];
+                        let after = lt.trim_start_matches('>').trim_start_matches([' ', '\t']);
+                        let at = r.start + (lt.len() - after.len());
+                        let marker = callout_marker(after);
+                        let alert = match (kind, marker) {
+                            (Some(k), _) => Some(match k {
+                                BlockQuoteKind::Note => Alert::Note,
+                                BlockQuoteKind::Tip | BlockQuoteKind::Important => Alert::Tip,
+                                BlockQuoteKind::Warning | BlockQuoteKind::Caution => Alert::Warning,
+                            }),
+                            (None, Some((_, word))) => Some(Alert::of(word)),
+                            (None, None) => None,
+                        };
                         for l in &mut lines[first..=last] {
                             l.quote += 1;
                             if alert.is_some() {
                                 l.alert = alert;
                             }
                         }
-                        if let Some(alert) = alert {
-                            let lt = &text[lines[first].range.clone()];
-                            if let Some(i) = lt.find("[!") {
-                                let end = lt[i..].find(']').map_or(lt.len(), |j| i + j + 1);
-                                let s = lines[first].range.start;
-                                markup.push(Markup {
-                                    range: s + i..s + end,
-                                    kind: MarkupKind::Alert(alert),
-                                });
-                            }
+                        if marker.is_some() && kind.is_none() {
+                            callout_heads.push(first);
+                        }
+                        if let (Some(alert), Some((len, _))) = (alert, marker) {
+                            // With a title of its own after it, the marker's
+                            // spaces go too.
+                            let rest = &after[len..];
+                            let len = if rest.trim().is_empty() {
+                                len
+                            } else {
+                                len + (rest.len() - rest.trim_start().len())
+                            };
+                            markup.push(Markup {
+                                range: at..at + len,
+                                kind: MarkupKind::Alert(alert),
+                            });
                         }
                     }
                     Tag::Item => {
@@ -560,7 +621,11 @@ pub fn parse(text: &str) -> Syntax {
                         dest_url,
                         ..
                     } => {
-                        open.style = style::LINK;
+                        open.style = if matches!(link_type, LinkType::WikiLink { .. }) {
+                            style::LINK | style::WIKI
+                        } else {
+                            style::LINK
+                        };
                         open.delimited = true;
                         open.autolink = matches!(link_type, LinkType::Autolink | LinkType::Email);
                         open.url = Some(dest_url.to_string());
@@ -629,11 +694,12 @@ pub fn parse(text: &str) -> Syntax {
                             });
                         }
                         if let Some(url) = open.url
-                            && open.style == style::LINK
+                            && open.style & style::LINK != 0
                         {
                             links.push(Link {
                                 range: first..last,
                                 url,
+                                wiki: open.style & style::WIKI != 0,
                             });
                         }
                     }
@@ -673,8 +739,34 @@ pub fn parse(text: &str) -> Syntax {
                     });
                 }
                 let s = style_now(&stack);
-                if s != 0 {
-                    spans.push(Span { range: r, style: s });
+                // `#tags` in prose (not headings, links or code) are pills.
+                let prose = heading_text.is_none()
+                    && s & (style::LINK | style::IMAGE) == 0
+                    && matches!(
+                        lines[line_at(r.start, &lines)].kind,
+                        LineKind::Paragraph | LineKind::Table
+                    );
+                let mut at = r.start;
+                if prose {
+                    for tag in hashtags(text, r.clone()) {
+                        if tag.start > at && s != 0 {
+                            spans.push(Span {
+                                range: at..tag.start,
+                                style: s,
+                            });
+                        }
+                        at = tag.end;
+                        spans.push(Span {
+                            range: tag,
+                            style: s | style::TAG,
+                        });
+                    }
+                }
+                if r.end > at && s != 0 {
+                    spans.push(Span {
+                        range: at..r.end,
+                        style: s,
+                    });
                 }
             }
             Event::Code(t) => {
@@ -708,11 +800,11 @@ pub fn parse(text: &str) -> Syntax {
                     1
                 };
                 // A paragraph that is just `$$…$$` is a display formula.
-                if n == 2
-                    && let Some(top) = stack.last()
-                    && top.paragraph
-                    && text[top.range.clone()].trim() == text[r.clone()].trim()
-                {
+                let display = n == 2
+                    && stack.last().is_some_and(|top| {
+                        top.paragraph && text[top.range.clone()].trim() == text[r.clone()].trim()
+                    });
+                if display {
                     let first = line_at(r.start, &lines);
                     let last = line_at(r.end.saturating_sub(1).max(r.start), &lines);
                     widgets.push(Widget {
@@ -723,13 +815,19 @@ pub fn parse(text: &str) -> Syntax {
                     });
                 }
                 if r.len() >= 2 * n {
+                    let kind = if display {
+                        MarkupKind::Inline
+                    } else {
+                        maths.push(r.clone());
+                        MarkupKind::MathDelim
+                    };
                     markup.push(Markup {
                         range: r.start..r.start + n,
-                        kind: MarkupKind::Inline,
+                        kind,
                     });
                     markup.push(Markup {
                         range: r.end - n..r.end,
-                        kind: MarkupKind::Inline,
+                        kind,
                     });
                     spans.push(Span {
                         range: r.start + n..r.end - n,
@@ -802,6 +900,10 @@ pub fn parse(text: &str) -> Syntax {
     }
 
     markup.retain(|m| !m.range.is_empty() || m.kind == MarkupKind::HeadingPrefix);
+    for l in callout_heads {
+        para_id += 1;
+        lines[l].para = Some(para_id);
+    }
     markup.sort_by_key(|m| (m.range.start, m.range.end));
     markup.dedup();
     spans.sort_by_key(|s| s.range.start);
@@ -812,6 +914,7 @@ pub fn parse(text: &str) -> Syntax {
         links,
         headings,
         widgets,
+        maths,
     }
 }
 
@@ -822,6 +925,33 @@ fn trim_newline(text: &str, floor: usize, end: usize) -> usize {
         e -= 1;
     }
     e
+}
+
+/// The `#tags` in `text[r]`, as ZenNotes finds them: a `#` at the start or
+/// after a space, then a letter, then letters, digits, `_`, `-` or `/`.
+pub fn hashtags(text: &str, r: Range<usize>) -> Vec<Range<usize>> {
+    let mut out = Vec::new();
+    for (i, _) in text[r.clone()].match_indices('#') {
+        let at = r.start + i;
+        if text[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| !c.is_whitespace())
+        {
+            continue;
+        }
+        let rest = &text[at + 1..r.end];
+        if !rest.starts_with(char::is_alphabetic) {
+            continue;
+        }
+        let len: usize = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '/'))
+            .map(char::len_utf8)
+            .sum();
+        out.push(at..at + 1 + len);
+    }
+    out
 }
 
 /// Where a frontmatter line's key is, colon included: `title:` in

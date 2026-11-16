@@ -38,8 +38,10 @@ pub(crate) struct Frame {
     /// goes behind the text.
     deco: Vec<PaintQuad>,
     tasks: Vec<Task>,
-    /// Code blocks' copy buttons, and the fence line each copies.
+    /// Code blocks' copy buttons and language buttons, and the header row
+    /// each belongs to.
     copy: Vec<(Bounds<Pixels>, Hitbox, usize)>,
+    langs: Vec<(Bounds<Pixels>, Hitbox, usize)>,
     copy_ink: Hsla,
     copy_hover: Hsla,
     /// The block just copied, and its button's colour for that moment.
@@ -167,6 +169,31 @@ impl MarkdownEditor {
                     layout.height.set(height);
                     self.slots[ix].height = height;
                 }
+                // Inline formulas, on the text's baseline in the room held
+                // for them.
+                for (range, image, s, base) in &layout.maths {
+                    let Some(r) = layout
+                        .rects(
+                            origin,
+                            range.start,
+                            range.end,
+                            false,
+                            content_w - layout.indent,
+                        )
+                        .into_iter()
+                        .next()
+                    else {
+                        continue;
+                    };
+                    let line = &layout.shaped.unwrapped_layout;
+                    let lh = layout.line_height;
+                    let baseline = r.top() + (lh - line.ascent - line.descent) / 2. + line.ascent;
+                    let at = point(r.left() + (r.size.width - s.width) / 2., baseline - *base);
+                    let mut el = img(image.clone()).w(s.width).h(s.height).into_any_element();
+                    el.layout_as_root(s.map(AvailableSpace::Definite), window, cx);
+                    el.prepaint_at(at, window, cx);
+                    widgets.push(el);
+                }
                 lines.push((ix, origin, layout.clone()));
                 y += layout.height.get();
             } else {
@@ -196,9 +223,11 @@ impl MarkdownEditor {
         Vec<PaintQuad>,
         Vec<Task>,
         Vec<(Bounds<Pixels>, Hitbox, usize)>,
+        Vec<(Bounds<Pixels>, Hitbox, usize)>,
     ) {
         let c = &self.style.colors;
-        let (mut deco, mut tasks, mut copy) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut deco, mut tasks, mut copy, mut langs) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
 
         // Cards: a run of rows on one, rounded where it starts and ends (a
         // card cut by the window's edge runs on past it).
@@ -319,6 +348,13 @@ impl MarkdownEditor {
                         size(px(20.), px(18.)),
                     );
                     copy.push((b, window.insert_hitbox(b, HitboxBehavior::Normal), *ix));
+                    // The language, with a chevron: a button for the menu.
+                    let label = l.shaped.width();
+                    let b = Bounds::new(
+                        point(origin.x + l.indent - px(7.), origin.y + (h - px(18.)) / 2.),
+                        size(label + px(7. + 3. + 8. + 5.), px(18.)),
+                    );
+                    langs.push((b, window.insert_hitbox(b, HitboxBehavior::Normal), *ix));
                 }
             }
             // Inline code's chips: a rounded fill a little taller than the
@@ -328,14 +364,16 @@ impl MarkdownEditor {
                 LineKind::Code | LineKind::FenceOpen | LineKind::FenceClose | LineKind::Meta
             ) {
                 let chip_h = px(self.style.size * 1.1 + 2.);
-                let mut spans: Vec<(usize, usize)> = Vec::new();
+                // Each stretch of code, and each tag (a pill, not a chip).
+                let mut spans: Vec<(usize, usize, bool)> = Vec::new();
                 let mut push_runs = |runs: &[display::Run], base: usize| {
                     let mut at = base;
                     for r in runs {
-                        if display::has(r.style, display::CODE) || r.role == Role::Pad {
+                        let tag = display::has(r.style, display::TAG);
+                        if tag || display::has(r.style, display::CODE) || r.role == Role::Pad {
                             match spans.last_mut() {
-                                Some((_, e)) if *e == at => *e = at + r.len,
-                                _ => spans.push((at, at + r.len)),
+                                Some((_, e, t)) if *e == at && *t == tag => *e = at + r.len,
+                                _ => spans.push((at, at + r.len, tag)),
                             }
                         }
                         at += r.len;
@@ -349,18 +387,46 @@ impl MarkdownEditor {
                     }
                     None => push_runs(&l.display.runs, 0),
                 }
-                for (a, b) in spans {
+                let mut pills: Vec<Bounds<Pixels>> = Vec::new();
+                for (a, b, tag) in spans {
                     for r in l.rects(*origin, a, b, false, content_w - l.indent) {
-                        let chip = Bounds::new(
+                        let band = Bounds::new(
                             point(r.left(), r.center().y - chip_h / 2.),
                             size(r.size.width, chip_h),
                         );
-                        deco.push(fill(chip, c.code_bg).corner_radii(px(4.)));
+                        if tag {
+                            pills.push(band);
+                        } else {
+                            deco.push(fill(band, c.code_bg).corner_radii(px(4.)));
+                        }
                     }
+                }
+                // A tag's pill reaches a little past its text, less where
+                // the next one is close, so two never touch.
+                let reach = |gap: Pixels| ((gap - px(2.)) / 2.).clamp(px(0.), px(4.));
+                for k in 0..pills.len() {
+                    let p = pills[k];
+                    let near = |q: &Bounds<Pixels>| (q.top() - p.top()).abs() < px(1.);
+                    let before = pills[..k]
+                        .iter()
+                        .filter(|q| near(q) && q.right() <= p.left())
+                        .map(|q| p.left() - q.right())
+                        .fold(px(8.), |a, b| if b < a { b } else { a });
+                    let after = pills[k + 1..]
+                        .iter()
+                        .filter(|q| near(q) && q.left() >= p.right())
+                        .map(|q| q.left() - p.right())
+                        .fold(px(8.), |a, b| if b < a { b } else { a });
+                    let (l_ext, r_ext) = (reach(before), reach(after));
+                    let pill = Bounds::from_corners(
+                        point(p.left() - l_ext, p.top()),
+                        point(p.right() + r_ext, p.bottom()),
+                    );
+                    deco.push(fill(pill, c.accent.opacity(0.1)).corner_radii(chip_h / 2.));
                 }
             }
         }
-        (deco, tasks, copy)
+        (deco, tasks, copy, langs)
     }
 
     /// The quads that draw the visible tables, and their controls when one
@@ -701,8 +767,8 @@ impl Element for EditorElement {
                 bounds,
                 lines: lines.clone(),
             };
-            let (deco, tasks, copy) = if ed.mode == Mode::Source {
-                (Vec::new(), Vec::new(), Vec::new())
+            let (deco, tasks, copy, langs) = if ed.mode == Mode::Source {
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
             } else {
                 ed.decorations(&lines, content_w, window)
             };
@@ -718,6 +784,7 @@ impl Element for EditorElement {
                 deco,
                 tasks,
                 copy,
+                langs,
                 copy_ink: colors.muted,
                 copy_hover: colors.border.opacity(0.85),
                 copied: ed.copied,
@@ -816,8 +883,23 @@ impl Element for EditorElement {
         }
 
         // A press on a code block's copy button copies the block.
-        for (_, hitbox, _) in &frame.copy {
+        for (_, hitbox, _) in frame.copy.iter().chain(&frame.langs) {
             window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+        }
+        // A press on a code block's language: the menu of languages.
+        if !frame.langs.is_empty() {
+            let editor = self.editor.clone();
+            let buttons: Vec<(Bounds<Pixels>, Hitbox, usize)> = frame.langs.clone();
+            window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
+                if !phase.bubble() || e.button != MouseButton::Left {
+                    return;
+                }
+                if let Some((b, _, ix)) = buttons.iter().find(|(_, h, _)| h.is_hovered(window)) {
+                    let at = b.bottom_left() + point(px(0.), px(2.));
+                    editor.update(cx, |ed, cx| ed.lang_menu_at(*ix, at, window, cx));
+                    cx.stop_propagation();
+                }
+            });
         }
         if !frame.copy.is_empty() {
             let editor = self.editor.clone();
@@ -866,6 +948,20 @@ impl Element for EditorElement {
             }
             for t in &frame.tasks {
                 t.paint(window);
+            }
+            // Code blocks' language buttons: a chevron after the label.
+            for (b, hitbox, _) in &frame.langs {
+                if hitbox.is_hovered(window) {
+                    window.paint_quad(fill(*b, frame.copy_hover).corner_radii(px(6.)));
+                }
+                let at = point(b.right() - px(5. + 8.), b.center().y - px(2.));
+                let mut chevron = PathBuilder::stroke(px(1.5));
+                chevron.move_to(at);
+                chevron.line_to(at + point(px(4.), px(4.)));
+                chevron.line_to(at + point(px(8.), px(0.)));
+                if let Ok(path) = chevron.build() {
+                    window.paint_path(path, frame.copy_ink.opacity(0.7));
+                }
             }
             // Code blocks' copy buttons.
             for (b, hitbox, ix) in &frame.copy {

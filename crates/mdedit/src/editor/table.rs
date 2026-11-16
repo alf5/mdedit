@@ -814,11 +814,11 @@ impl MarkdownEditor {
         });
         menu.focus_handle(cx).focus(window, cx);
         let sub = cx.subscribe_in(&menu, window, |this, _, _: &DismissEvent, window, cx| {
-            this.table_menu = None;
+            this.menu = None;
             this.focus.focus(window, cx);
             cx.notify();
         });
-        self.table_menu = Some((menu, p, sub));
+        self.menu = Some((menu, p, sub));
         cx.notify();
         true
     }

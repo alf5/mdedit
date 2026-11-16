@@ -63,7 +63,9 @@ nothing is converted back and forth behind your back.
     [bezel-mermaid](https://crates.io/crates/bezel-mermaid), a pure-Rust port
     of [Pele](https://pele.run).
   - `$…$` and `$$…$$` draw as formulas. A lone `$5` stays a price.
-  - Click either one to edit its source with a live preview beneath it.
+  - Click a diagram or a display formula to edit its source with a live
+    preview beneath it. An inline formula shows its source while the caret
+    is in it: click it, or arrow into it.
   - A diagram that doesn't parse shows the error and its line.
 - **Images** load from the document's folder.
   - **Web images** wait for a click, because fetching one tells its server
@@ -71,7 +73,17 @@ nothing is converted back and forth behind your back.
   - **Network shares and other schemes** are never loaded.
 - **GitHub-flavoured Markdown**: tables, task lists, strikethrough,
   footnotes, alerts (`> [!NOTE]` and the rest, as tinted cards), and fenced
-  code with syntax highlighting in the theme's colours and a copy button.
+  code with syntax highlighting in the theme's colours.
+  - **A code block's header** has its language, which opens a menu to change
+    it, and a copy button.
+- **Obsidian's Markdown** too:
+  - **Callouts** of every kind (`> [!info]`, `> [!bug] Its own title`, …),
+    coloured by group as ZenNotes colours them.
+  - **`#tags`** are pills.
+  - **`[[Wiki links]]`** and `[[Note|labels]]`: `Ctrl/Cmd`+click opens the
+    note, found by name in the document's folder or anywhere in the open
+    folder. `[[#Heading]]` goes to a heading in the document. A link to no
+    note is drawn faintly.
 - **Frontmatter**: a YAML block opening the document (between `---` lines)
   is drawn as a card of its keys and values. HTML and PDF exports leave it
   out.

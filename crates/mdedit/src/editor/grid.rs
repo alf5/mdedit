@@ -458,7 +458,7 @@ impl MarkdownEditor {
                     Reveal::Hide
                 };
                 let d = display::fragment(text, range.start, reveal);
-                let mut runs = self.text_runs(&d, LineKind::Paragraph, 0, None, false);
+                let mut runs = self.text_runs(&d, LineKind::Paragraph, 0, (None, false), false);
                 if sans {
                     for (run, src) in runs.iter_mut().zip(&d.runs) {
                         if !mdedit_core::display::has(src.style, mdedit_core::display::CODE)

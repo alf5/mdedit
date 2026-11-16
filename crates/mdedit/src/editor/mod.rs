@@ -10,6 +10,7 @@
 //! The caret moves in display offsets, which steps over hidden markup.
 //! Layout is per line and only for the lines on screen (`element.rs`).
 
+mod code;
 mod element;
 pub mod find_bar;
 mod grid;
@@ -24,6 +25,7 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use gpui_kit::component::menu::PopupMenu;
@@ -44,6 +46,9 @@ pub enum EditorEvent {
     Edited,
     /// The caret or selection moved, or the mode changed.
     Moved,
+    /// A `[[wiki link]]` was followed: the file its note is in, or `None`
+    /// when no note has that name.
+    FollowWiki { note: String, path: Option<PathBuf> },
 }
 
 /// A block drawn on a card, a rounded box behind its rows, in the rendered
@@ -72,9 +77,9 @@ pub(crate) const CARD_PAD_X: f32 = 14.;
 pub(crate) const CARD_PAD_Y: f32 = 8.;
 /// A code block's text sits further in, as ZenNotes has it.
 pub(crate) const CODE_PAD_X: f32 = 16.;
-/// From a code block's right edge to its language label's: the copy button
-/// and the gaps round it.
-pub(crate) const CODE_HEADER_RIGHT: f32 = 38.;
+/// From a code block's right edge to its language label's: the copy
+/// button, the label's chevron, and the gaps round them.
+pub(crate) const CODE_HEADER_RIGHT: f32 = 50.;
 
 /// One line, shaped for the current width and mode.
 pub(crate) struct LineLayout {
@@ -102,7 +107,18 @@ pub(crate) struct LineLayout {
     pub card_x: Pixels,
     /// How deep in lists it's drawn, for the guides.
     pub list: u8,
+    /// Its inline formulas: where each is in the display text, and its
+    /// picture.
+    pub maths: Vec<InlineMath>,
 }
+
+/// An inline formula in a row: where it is in the display text, its
+/// picture, the picture's size, and how far down its baseline is.
+pub(crate) type InlineMath = (Range<usize>, Arc<Image>, Size<Pixels>, Pixels);
+
+/// An inline formula drawn: its picture, its size, and how far down its
+/// baseline is; or why it couldn't be.
+pub(crate) type InlinePicture = Result<(Arc<Image>, Size<Pixels>, Pixels), String>;
 
 impl LineLayout {
     /// How many display offsets the row has.
@@ -278,6 +294,17 @@ pub struct MarkdownEditor {
     rows: Vec<Row>,
     /// Where relative image paths are looked up: the document's folder.
     base_dir: Option<PathBuf>,
+    /// The project folder open beside it, where `[[wiki links]]` look for
+    /// notes; an index of its files, made when a link is drawn and kept a
+    /// few seconds; and which notes were found.
+    root: Option<PathBuf>,
+    /// The inline formula the caret is in, shown as its source; the others'
+    /// pictures; and how wide the spaces are that hold their room, by size.
+    math_open: Option<Range<usize>>,
+    inline_pictures: HashMap<u64, InlinePicture>,
+    room_widths: HashMap<u32, Vec<(char, f32)>>,
+    wiki_index: Option<(Instant, Rc<mdedit_core::wiki::Index>)>,
+    wiki_found: HashMap<String, Option<PathBuf>>,
     /// Drawn diagrams and formulas, by source and look.
     pictures: HashMap<u64, widgets::Picture>,
     /// Highlighted code blocks, by content and language.
@@ -311,7 +338,7 @@ pub struct MarkdownEditor {
     /// Column widths while a border is dragged.
     table_resize: Option<table::ResizeDrag>,
     /// A table's right-click menu: the menu, where, and its dismissal.
-    table_menu: Option<(Entity<PopupMenu>, Point<Pixels>, Subscription)>,
+    menu: Option<(Entity<PopupMenu>, Point<Pixels>, Subscription)>,
     /// The code block (its header row) just copied, its button lit a moment.
     copied: Option<usize>,
 }
@@ -356,6 +383,12 @@ impl MarkdownEditor {
             focus: cx.focus_handle(),
             rows: Vec::new(),
             base_dir: None,
+            root: None,
+            math_open: None,
+            inline_pictures: HashMap::new(),
+            room_widths: HashMap::new(),
+            wiki_index: None,
+            wiki_found: HashMap::new(),
             pictures: HashMap::new(),
             code_colors: HashMap::new(),
             code_theme,
@@ -377,7 +410,7 @@ impl MarkdownEditor {
             table_hover: None,
             table_drag: None,
             table_resize: None,
-            table_menu: None,
+            menu: None,
             copied: None,
         };
         this.rebuild_slots();
@@ -455,10 +488,11 @@ impl MarkdownEditor {
 
     // ---------- model ----------
 
-    fn invalidate(&mut self) {
+    pub(crate) fn invalidate(&mut self) {
         for slot in &mut self.slots {
             slot.layout = None;
         }
+        self.wiki_found.clear();
     }
 
     fn estimate(&self, kind: LineKind) -> Pixels {
@@ -618,6 +652,27 @@ impl MarkdownEditor {
             }
             self.revealed = new;
         }
+        // The inline formula with the caret in it shows its source.
+        let head = self.sel.head;
+        let open = self
+            .rich()
+            .then(|| {
+                self.syntax
+                    .maths
+                    .iter()
+                    .find(|f| f.start < head && head < f.end)
+                    .cloned()
+            })
+            .flatten();
+        if open != self.math_open {
+            for f in self.math_open.iter().chain(&open) {
+                let ix = self.row_at(f.start);
+                if let Some(slot) = self.slots.get_mut(ix) {
+                    slot.layout = None;
+                }
+            }
+            self.math_open = open;
+        }
     }
 
     fn reveal_of(&self, ix: usize) -> Reveal {
@@ -631,6 +686,81 @@ impl MarkdownEditor {
 
     fn rich(&self) -> bool {
         self.mode != Mode::Source
+    }
+
+    /// Where `[[wiki links]]` look for notes beyond the document's folder.
+    pub fn set_root(&mut self, root: Option<PathBuf>, cx: &mut Context<Self>) {
+        if self.root != root {
+            self.root = root;
+            self.wiki_index = None;
+            self.wiki_found.clear();
+            self.invalidate();
+            cx.notify();
+        }
+    }
+
+    /// The file a wiki link's note is in, if there's one: in the document's
+    /// folder, or by name anywhere in the project. Remembered until the
+    /// layout is next rebuilt.
+    pub(crate) fn wiki_note(&mut self, note: &str) -> Option<PathBuf> {
+        if let Some(found) = self.wiki_found.get(note) {
+            return found.clone();
+        }
+        let base = self.root.clone().or_else(|| self.base_dir.clone());
+        let stale = self.wiki_index.as_ref().is_none_or(|(at, ix)| {
+            at.elapsed().as_secs() > 10 || Some(ix.root()) != base.as_deref()
+        });
+        if stale {
+            self.wiki_index =
+                base.map(|b| (Instant::now(), Rc::new(mdedit_core::wiki::Index::build(&b))));
+        }
+        let found = mdedit_core::wiki::resolve(
+            note,
+            self.base_dir.as_deref(),
+            self.root.as_deref(),
+            self.wiki_index.as_ref().map(|(_, ix)| ix.as_ref()),
+        );
+        self.wiki_found.insert(note.to_string(), found.clone());
+        found
+    }
+
+    /// Whether a wiki link goes anywhere: to a note, or to a heading here.
+    fn wiki_reaches(&mut self, target: &str) -> bool {
+        match mdedit_core::wiki::split(target) {
+            ("", Some(part)) => self.heading_named(part).is_some(),
+            ("", None) => false,
+            (note, _) => self.wiki_note(note).is_some(),
+        }
+    }
+
+    /// The first line of this document's heading called `name`, whatever its
+    /// case.
+    fn heading_named(&self, name: &str) -> Option<usize> {
+        self.syntax
+            .headings
+            .iter()
+            .find(|h| h.text.eq_ignore_ascii_case(name))
+            .map(|h| h.line)
+    }
+
+    /// Follow a wiki link: to a heading here, or out to its note.
+    fn follow_wiki(&mut self, target: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let (note, part) = mdedit_core::wiki::split(target);
+        if note.is_empty() {
+            if let Some(line) = part.and_then(|p| self.heading_named(p)) {
+                let at = self.syntax.lines[line].range.start;
+                self.reveal_offset(at, window, cx);
+            }
+            return;
+        }
+        // Look again: the note may have been made since it was drawn.
+        self.wiki_found.remove(note);
+        self.wiki_index = None;
+        let path = self.wiki_note(note);
+        cx.emit(EditorEvent::FollowWiki {
+            note: note.to_string(),
+            path,
+        });
     }
 
     /// Copy the code block whose header is row `ix`: its lines between the
@@ -660,6 +790,113 @@ impl MarkdownEditor {
             .ok();
         })
         .detach();
+    }
+
+    /// An inline formula's picture, at text size `size`, in the text's
+    /// colour.
+    fn inline_picture(&mut self, body: &str, text_size: f32) -> InlinePicture {
+        let p = &self.style.palette;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&(body, text_size.to_bits(), p.text), &mut h);
+        let key = std::hash::Hasher::finish(&h);
+        if let Some(found) = self.inline_pictures.get(&key) {
+            return found.clone();
+        }
+        // KaTeX's inline formulas are a little larger than their text.
+        let size_pt = text_size * 0.75 * 1.1;
+        let drawn = mdedit_core::math::draw(
+            body,
+            false,
+            size_pt as f64,
+            [p.text[0], p.text[1], p.text[2]],
+        )
+        .map(|m| {
+            let pt = |v: f64| px(v as f32 * 4. / 3.);
+            (
+                Arc::new(Image::from_bytes(ImageFormat::Svg, m.svg.into_bytes())),
+                size(pt(m.width_pt), pt(m.height_pt)),
+                pt(m.baseline_pt),
+            )
+        });
+        if self.inline_pictures.len() > 400 {
+            self.inline_pictures.clear();
+        }
+        self.inline_pictures.insert(key, drawn.clone());
+        drawn
+    }
+
+    /// Spaces as wide as `width` at text size `size`, to hold a picture's
+    /// room in the text: spaces that don't break (figure, no-break, narrow
+    /// no-break), then hair spaces for the last pixel or so.
+    fn room(&mut self, width: Pixels, size: Pixels, window: &mut Window) -> String {
+        let widths = self
+            .room_widths
+            .entry(f32::from(size).to_bits())
+            .or_insert_with(|| {
+                ['\u{2007}', '\u{00A0}', '\u{202F}', '\u{200A}']
+                    .into_iter()
+                    .map(|c| {
+                        let run = TextRun {
+                            len: c.len_utf8(),
+                            font: font(crate::theme::UI_FONT),
+                            color: Hsla::default(),
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        };
+                        let w = window
+                            .text_system()
+                            .shape_line(c.to_string().into(), size, &[run], None)
+                            .width;
+                        (c, f32::from(w))
+                    })
+                    .filter(|(_, w)| *w > 0.)
+                    .collect()
+            });
+        let mut left = f32::from(width);
+        let mut out = String::new();
+        let last = widths.len().saturating_sub(1);
+        for (i, (c, w)) in widths.iter().enumerate() {
+            let n = if i == last {
+                (left / w).round().max(0.)
+            } else {
+                (left / w).floor().max(0.)
+            };
+            for _ in 0..n as usize {
+                out.push(*c);
+            }
+            left -= n * w;
+        }
+        if out.is_empty() {
+            out.push('\u{200A}');
+        }
+        out
+    }
+
+    /// How many `$`s open (and close) the formula at `f`.
+    fn math_delims(&self, f: &Range<usize>) -> usize {
+        self.text[f.clone()]
+            .chars()
+            .take_while(|c| *c == '$')
+            .count()
+            .clamp(1, 2)
+    }
+
+    /// The inline formula drawn under `p` in row `ix`, if one is.
+    fn formula_at(&self, ix: usize, layout: &LineLayout, p: Point<Pixels>) -> Option<Range<usize>> {
+        let (_, origin, _) = self.geometry.lines.iter().find(|(i, ..)| *i == ix)?;
+        let width = self.content_w? - layout.indent;
+        layout.maths.iter().find_map(|(range, ..)| {
+            let r = layout
+                .rects(*origin, range.start, range.end, false, width)
+                .into_iter()
+                .next()?;
+            if r.contains(&p) {
+                layout.source_at(range.start)
+            } else {
+                None
+            }
+        })
     }
 
     /// The card source line `ix` is drawn on, if any.
@@ -728,6 +965,7 @@ impl MarkdownEditor {
                 card: None,
                 card_x: px(0.),
                 list: 0,
+                maths: Vec::new(),
             });
             if let Some(slot) = self.slots.get_mut(ix) {
                 slot.height = height;
@@ -766,18 +1004,55 @@ impl MarkdownEditor {
                 card: None,
                 card_x: px(0.),
                 list: 0,
+                maths: Vec::new(),
             });
             if let Some(slot) = self.slots.get_mut(ix) {
                 slot.layout = Some(layout.clone());
             }
             return layout;
         }
-        let display = display::display_row(
+        // Inline formulas: pictures, each in room held by spaces (the one
+        // the caret's in shows its source).
+        let mut drawn: HashMap<Range<usize>, (String, InlinePicture)> = HashMap::new();
+        if self.rich() && self.reveal_of(ix) == Reveal::Hide {
+            let src = self.row_range(ix);
+            let (size, _) = self.style.metrics(line.kind, self.mode);
+            let formulas: Vec<Range<usize>> = self
+                .syntax
+                .maths
+                .iter()
+                .filter(|f| src.start <= f.start && f.end <= src.end)
+                .filter(|f| Some(*f) != self.math_open.as_ref())
+                .cloned()
+                .collect();
+            for f in formulas {
+                let body = self.text[f.clone()].trim_matches('$').to_string();
+                let picture = self.inline_picture(&body, size);
+                if let Ok((_, s, _)) = &picture {
+                    let room = self.room(s.width, px(size), window);
+                    drawn.insert(f, (room, picture));
+                }
+            }
+        }
+        let hook = |f: Range<usize>| drawn.get(&f).map(|(room, _)| room.clone());
+        let display = display::display_row_with(
             &self.text,
             &self.syntax,
             row.lines.clone(),
             self.reveal_of(ix),
+            (self.rich() && self.reveal_of(ix) == Reveal::Hide)
+                .then_some(&hook as display::MathHook),
         );
+        let maths = display
+            .segs
+            .iter()
+            .filter(|seg| !seg.copy)
+            .filter_map(|seg| {
+                let (_, picture) = drawn.get(&seg.source)?;
+                let (image, s, base) = picture.as_ref().ok()?;
+                Some((seg.display.clone(), image.clone(), *s, *base))
+            })
+            .collect::<Vec<_>>();
         let (size, lh) = self.style.metrics(line.kind, self.mode);
         let (mut size, lh) = (px(size), px(lh));
         let rich = self.rich();
@@ -809,10 +1084,39 @@ impl MarkdownEditor {
         };
         let mut indent = card_x + card_in;
         let wrap = max(content_w - indent - card_in, px(40.));
-        let mut runs = self.text_runs(&display, line.kind, line.quote, line.alert, revealed);
+        let head = card.is_some_and(|k| matches!(k.card, Card::Callout(_)) && k.first);
+        let mut runs = self.text_runs(
+            &display,
+            line.kind,
+            line.quote,
+            (line.alert, head),
+            revealed,
+        );
         if header {
             for r in &mut runs {
                 r.font = font(crate::theme::UI_FONT);
+            }
+        }
+        // A wiki link that goes nowhere is drawn quietly, as ZenNotes does.
+        if rich {
+            let mut at = 0;
+            for (i, r) in display.runs.iter().enumerate() {
+                if display::has(r.style, display::WIKI) && r.role == Role::Text {
+                    let src = display.to_source(at);
+                    let target = self.syntax.link_at(src).map(|l| l.url.clone());
+                    if let Some(t) = target
+                        && !self.wiki_reaches(&t)
+                        && let Some(run) = runs.get_mut(i)
+                    {
+                        run.color = self.style.colors.muted;
+                        run.underline = Some(UnderlineStyle {
+                            thickness: px(1.),
+                            color: Some(self.style.colors.faint),
+                            wavy: false,
+                        });
+                    }
+                }
+                at += r.len;
             }
         }
         if line.kind == LineKind::Code
@@ -911,6 +1215,7 @@ impl MarkdownEditor {
             card,
             card_x,
             list: list_depth,
+            maths,
         });
         if let Some(slot) = self.slots.get_mut(ix) {
             if row.widget.is_none() {
@@ -967,14 +1272,15 @@ impl MarkdownEditor {
     }
 
     /// How a row's text is set, span by span: ZenNotes' editor's look.
-    /// `alert` is the callout the row is in; `shown` whether its markup is
-    /// showing (Live mode's caret row).
+    /// `alert` is the callout the row is in, and `head` whether it's the
+    /// callout's title line; `shown` whether its markup is showing (Live
+    /// mode's caret row).
     fn text_runs(
         &self,
         d: &DisplayLine,
         kind: LineKind,
         quote: u8,
-        alert: Option<syntax::Alert>,
+        (alert, head): (Option<syntax::Alert>, bool),
         shown: bool,
     ) -> Vec<TextRun> {
         let c = &self.style.colors;
@@ -1001,7 +1307,7 @@ impl MarkdownEditor {
             .iter()
             .map(|r| {
                 let code = display::has(r.style, display::CODE);
-                let mut f = font(if r.role == Role::Pad {
+                let mut f = font(if matches!(r.role, Role::Pad | Role::Math) {
                     // A thin space in a proportional face: a few pixels.
                     crate::theme::UI_FONT.into()
                 } else if (mono || code) && !meta {
@@ -1018,7 +1324,7 @@ impl MarkdownEditor {
                     || r.role == Role::Bullet
                 {
                     f.weight = FontWeight::BOLD;
-                } else if r.role == Role::Alert {
+                } else if r.role == Role::Alert || (head && r.role == Role::Text) {
                     f.weight = FontWeight::SEMIBOLD;
                 } else if display::has(r.style, display::KEY) {
                     f.weight = FontWeight::MEDIUM;
@@ -1043,10 +1349,13 @@ impl MarkdownEditor {
                     Role::Alert => alert.map_or(c.accent, |a| c.callout(a)),
                     Role::TaskOpen | Role::TaskDone => c.alerts[3],
                     Role::Text if display::has(r.style, display::KEY) => c.muted,
+                    Role::Text if display::has(r.style, display::TAG) => c.accent,
                     Role::Text if link => c.accent,
                     Role::Text if display::has(r.style, display::MATH) => c.accent,
                     Role::Text if heading && source => c.accent,
-                    Role::Text | Role::Break | Role::Pad => base_color,
+                    // A callout's own title, in its colour.
+                    Role::Text if head && !source => alert.map_or(base_color, |a| c.callout(a)),
+                    Role::Text | Role::Break | Role::Pad | Role::Math => base_color,
                 };
                 TextRun {
                     len: r.len,
@@ -1115,6 +1424,19 @@ impl MarkdownEditor {
             if (forward && d >= cell.base + cell.display.text.len()) || (!forward && d <= cell.base)
             {
                 return;
+            }
+        }
+        // Into a formula: its source opens, the caret inside its `$`s.
+        if !extend && self.rich() {
+            let into = if forward {
+                (layout.role_at(d) == Role::Math).then_some(d)
+            } else {
+                (d > 0 && layout.role_at(layout.prev(d)) == Role::Math).then(|| layout.prev(d))
+            };
+            if let Some(f) = into.and_then(|at| layout.source_at(at)) {
+                let n = self.math_delims(&f);
+                let pos = if forward { f.start + n } else { f.end - n };
+                return self.move_to(pos, false, cx);
             }
         }
         let pos = if forward {
@@ -1863,17 +2185,29 @@ impl MarkdownEditor {
         let Some((ix, d, layout)) = self.hit(e.position) else {
             return;
         };
-        let pos = layout.to_source(d);
+        let mut pos = layout.to_source(d);
+        // A press on a formula opens it.
+        if self.rich()
+            && e.click_count == 1
+            && let Some(f) = self.formula_at(ix, &layout, e.position)
+        {
+            pos = f.start + self.math_delims(&f);
+        }
         // A link opens with Ctrl/Cmd held.
         if self.rich()
             && e.click_count == 1
             && !e.modifiers.shift
             && e.modifiers.secondary(cx)
             && let Some(link) = self.syntax.link_at(pos)
-            && os::is_openable_link(&link.url)
         {
-            cx.open_url(&link.url);
-            return;
+            if link.wiki {
+                let target = link.url.clone();
+                return self.follow_wiki(&target, window, cx);
+            }
+            if os::is_openable_link(&link.url) {
+                cx.open_url(&link.url);
+                return;
+            }
         }
         self.goal_x = None;
         let (grain, sel) = match e.click_count {
@@ -2130,7 +2464,7 @@ impl Render for MarkdownEditor {
             .cursor(CursorStyle::IBeam)
             .child(EditorElement::new(cx.entity()))
             .children(overlay)
-            .children(self.table_menu.as_ref().map(|(menu, at, _)| {
+            .children(self.menu.as_ref().map(|(menu, at, _)| {
                 deferred(
                     anchored()
                         .position(*at)

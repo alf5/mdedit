@@ -17,6 +17,7 @@ pub fn to_html(md: &str) -> String {
     opts.insert(Options::ENABLE_TASKLISTS);
     opts.insert(Options::ENABLE_GFM);
     opts.insert(Options::ENABLE_MATH);
+    opts.insert(Options::ENABLE_WIKILINKS);
     // Frontmatter is the document's data, not its text.
     let md = &md[crate::syntax::frontmatter_end(md).unwrap_or(0)..];
     let parser = Parser::new_ext(md, opts);

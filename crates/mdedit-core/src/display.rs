@@ -29,7 +29,14 @@ pub enum Role {
     /// A hidden code span's backticks, drawn as a thin space ([`PAD`]) that
     /// pads its chip.
     Pad,
+    /// An inline formula, drawn as a picture over the room this holds.
+    Math,
 }
+
+/// What an inline formula is drawn as, given its source range (`$`s and
+/// all): the text that holds room for its picture, or `None` to show its
+/// source, as when the caret is in it.
+pub type MathHook<'a> = &'a dyn Fn(Range<usize>) -> Option<String>;
 
 /// What a hidden inline code span's backticks are drawn as: a thin space,
 /// so the chip behind the code has room on either side of it.
@@ -154,21 +161,40 @@ impl DisplayLine {
         self.source.end
     }
 
-    /// A `<br>` drawn as a newline, or a code span's padding: the caret
-    /// before it is before its source, and after it, after.
+    /// A `<br>` drawn as a newline, a code span's padding, or a formula:
+    /// the caret before it is before its source, and after it, after.
     fn is_break(&self, seg: &Seg) -> bool {
-        !seg.copy && matches!(self.text.get(seg.display.clone()), Some("\n" | PAD))
+        !seg.copy
+            && (matches!(self.text.get(seg.display.clone()), Some("\n" | PAD))
+                || (!seg.display.is_empty() && self.role_at(seg.display.start) == Role::Math))
     }
 
     /// The previous and next display character boundaries.
+    /// The offset a step back from `d`: a character, or a whole drawn
+    /// element (a formula, a callout's title).
     pub fn prev(&self, d: usize) -> usize {
+        if let Some(seg) = self
+            .segs
+            .iter()
+            .find(|s| !s.copy && s.display.end == d && !s.display.is_empty())
+        {
+            return seg.display.start;
+        }
         self.text[..d]
             .char_indices()
             .next_back()
             .map_or(0, |(i, _)| i)
     }
 
+    /// The offset a step on from `d`, as [`DisplayLine::prev`].
     pub fn next(&self, d: usize) -> usize {
+        if let Some(seg) = self
+            .segs
+            .iter()
+            .find(|s| !s.copy && s.display.start == d && !s.display.is_empty())
+        {
+            return seg.display.end;
+        }
         self.text[d..]
             .chars()
             .next()
@@ -198,6 +224,17 @@ impl DisplayLine {
 
 /// Build the display form of line `ix`.
 pub fn display_line(text: &str, syntax: &Syntax, ix: usize, reveal: Reveal) -> DisplayLine {
+    display_line_with(text, syntax, ix, reveal, None)
+}
+
+/// [`display_line`], with inline formulas drawn as `math` says.
+pub fn display_line_with(
+    text: &str,
+    syntax: &Syntax,
+    ix: usize,
+    reveal: Reveal,
+    math: Option<MathHook>,
+) -> DisplayLine {
     let line = &syntax.lines[ix];
     let l = line.range.clone();
     let mut out = DisplayLine {
@@ -271,6 +308,34 @@ pub fn display_line(text: &str, syntax: &Syntax, ix: usize, reveal: Reveal) -> D
         // Marker markup starts at the item, after its indentation.
         let lead = &text[l.start..r.start];
         let marker_line = lead.trim().is_empty();
+        // An inline formula on this line: a picture, or its source with its
+        // `$`s showing (the caret's in it, or it couldn't be drawn).
+        if *kind == MarkupKind::MathDelim
+            && !show
+            && let Some(hook) = math
+        {
+            let formula = syntax
+                .maths
+                .iter()
+                .find(|f| {
+                    (f.start == r.start || f.end == r.end) && f.end <= l.end && f.start >= l.start
+                })
+                .cloned();
+            if let Some(f) = formula {
+                match hook(f.clone()) {
+                    Some(room) if f.start == r.start => {
+                        out.push(&room, f.clone(), false, 0, Role::Math);
+                        at = f.end;
+                    }
+                    Some(_) => {}
+                    None => {
+                        out.push(src, r.clone(), true, 0, Role::Markup);
+                        at = r.end;
+                    }
+                }
+                continue;
+            }
+        }
         match kind {
             MarkupKind::Number if show => out.push(src, r.clone(), true, 0, Role::Number),
             _ if show => out.push(src, r.clone(), true, 0, Role::Markup),
@@ -288,7 +353,15 @@ pub fn display_line(text: &str, syntax: &Syntax, ix: usize, reveal: Reveal) -> D
             }
             MarkupKind::Number => out.push(src, r.clone(), true, 0, Role::Number),
             MarkupKind::Bullet => out.push("", r.clone(), false, 0, Role::Text),
-            MarkupKind::Alert(a) => out.push(a.title(), r.clone(), false, style::BOLD, Role::Alert),
+            MarkupKind::Alert(_) => {
+                // Its type, capitalised, unless it has a title of its own.
+                let titled = !text[r.end..l.end].trim().is_empty();
+                let title = match crate::syntax::callout_marker(src) {
+                    Some((_, word)) if !titled => capitalise(word),
+                    _ => String::new(),
+                };
+                out.push(&title, r.clone(), false, style::BOLD, Role::Alert)
+            }
             MarkupKind::CodeTick => out.push(PAD, r.clone(), false, style::CODE, Role::Pad),
             MarkupKind::TaskBox(done) => {
                 out.push("", r.clone(), false, 0, Role::Text);
@@ -312,6 +385,15 @@ pub fn display_line(text: &str, syntax: &Syntax, ix: usize, reveal: Reveal) -> D
         });
     }
     out
+}
+
+/// `info` as `Info`, `NOTE` as `Note`.
+fn capitalise(word: &str) -> String {
+    let lower = word.to_lowercase();
+    let mut cs = lower.chars();
+    cs.next()
+        .map(|c| c.to_uppercase().chain(cs).collect())
+        .unwrap_or_default()
 }
 
 fn plain(out: &mut DisplayLine, text: &str, r: Range<usize>, lang: &Option<Range<usize>>) {
@@ -434,10 +516,21 @@ pub fn display_row(
     lines: Range<usize>,
     reveal: Reveal,
 ) -> DisplayLine {
+    display_row_with(text, syntax, lines, reveal, None)
+}
+
+/// [`display_row`], with inline formulas drawn as `math` says.
+pub fn display_row_with(
+    text: &str,
+    syntax: &Syntax,
+    lines: Range<usize>,
+    reveal: Reveal,
+    math: Option<MathHook>,
+) -> DisplayLine {
     let first = lines.start;
-    let mut out = display_line(text, syntax, first, reveal);
+    let mut out = display_line_with(text, syntax, first, reveal, math);
     for ix in lines.start + 1..lines.end {
-        let next = display_line(text, syntax, ix, reveal);
+        let next = display_line_with(text, syntax, ix, reveal, math);
         let nl = syntax.lines[ix - 1].range.end;
         // The newline shows as a space: one byte for one byte.
         out.push(" ", nl..nl + 1, true, 0, Role::Text);
@@ -570,7 +663,7 @@ pub fn has(style: u16, flags: u16) -> bool {
     style & flags != 0
 }
 
-pub use style::{BOLD, CODE, IMAGE, ITALIC, KEY, LINK, MATH, STRIKE};
+pub use style::{BOLD, CODE, IMAGE, ITALIC, KEY, LINK, MATH, STRIKE, TAG, WIKI};
 
 #[cfg(test)]
 mod tests {
@@ -582,6 +675,122 @@ mod tests {
         (0..s.lines.len())
             .map(|i| display_line(text, &s, i, reveal).text)
             .collect()
+    }
+
+    #[test]
+    fn tags_are_found_where_zennotes_finds_them() {
+        let t = "Notes #smoke and #reference/sub. Not#this, #1, `#code`, **a #bold**.";
+        let s = parse(t);
+        let tags: Vec<_> = s
+            .spans
+            .iter()
+            .filter(|sp| has(sp.style, TAG))
+            .map(|sp| &t[sp.range.clone()])
+            .collect();
+        assert_eq!(tags, ["#smoke", "#reference/sub", "#bold"]);
+        // A tag in bold splits the bold's span: none overlap.
+        let bold: Vec<_> = s.spans.iter().filter(|sp| has(sp.style, BOLD)).collect();
+        assert_eq!(bold.len(), 2);
+        assert!(!has(bold[0].style, TAG) && has(bold[1].style, TAG));
+        assert!(
+            s.spans
+                .windows(2)
+                .all(|w| w[0].range.end <= w[1].range.start)
+        );
+        // Not in headings, links or code blocks.
+        for t in ["## Head #tag", "[a #tag](x)", "```\n#tag\n```"] {
+            let s = parse(t);
+            assert!(!s.spans.iter().any(|sp| has(sp.style, TAG)), "{t}");
+        }
+    }
+
+    #[test]
+    fn wiki_links_show_their_label() {
+        let t = "A [[wiki link]] to [[Linked Note|renamed]].";
+        let s = parse(t);
+        assert_eq!(show(t, Reveal::Hide), ["A wiki link to renamed."]);
+        let links: Vec<_> = s
+            .links
+            .iter()
+            .map(|l| (&t[l.range.clone()], l.url.as_str(), l.wiki))
+            .collect();
+        assert_eq!(
+            links,
+            [
+                ("wiki link", "wiki link", true),
+                ("renamed", "Linked Note", true)
+            ]
+        );
+        assert!(s.spans.iter().any(|sp| has(sp.style, WIKI)));
+        let s = parse("[a](http://x)");
+        assert!(!s.links[0].wiki);
+    }
+
+    #[test]
+    fn callouts_of_every_kind_show_their_title() {
+        use crate::syntax::Alert;
+        let cases = [
+            ("> [!info]\n> body", Alert::Note, "Info"),
+            ("> [!IMPORTANT]\n> body", Alert::Tip, "Important"),
+            ("> [!faq]-\n> body", Alert::Question, "Faq"),
+            ("> [!caution]\n> body", Alert::Warning, "Caution"),
+            (
+                "> [!bug] Crash on save\n> body",
+                Alert::Danger,
+                "Crash on save",
+            ),
+            ("> [!cite]\n> body", Alert::Quote, "Cite"),
+            ("> [!whatever]\n> body", Alert::Note, "Whatever"),
+        ];
+        for (t, alert, title) in cases {
+            let s = parse(t);
+            assert_eq!(s.lines[0].alert, Some(alert), "{t}");
+            assert_eq!(s.lines[1].alert, Some(alert), "{t}");
+            assert_eq!(
+                show(t, Reveal::Hide)[0].trim_start_matches("> "),
+                title,
+                "{t}"
+            );
+        }
+        // The title is a row of its own, though it's in one paragraph with
+        // the body.
+        let t = "> [!info] Title\n> body\n> more";
+        let s = parse(t);
+        let r = rows(t, &s, true, None);
+        assert_eq!(
+            r.iter().map(|r| r.lines.clone()).collect::<Vec<_>>(),
+            [0..1, 1..3]
+        );
+        // Not at the start of the quote: just text.
+        let s = parse("> see [!info] here");
+        assert_eq!(s.lines[0].alert, None);
+    }
+
+    #[test]
+    fn a_formula_is_drawn_as_one_thing_unless_it_is_open() {
+        let t = "Inline: $e^x$ done";
+        let s = parse(t);
+        assert_eq!(s.maths, vec![8..13]);
+        let room = |f: Range<usize>| (f.start == 8).then(|| "··".to_string());
+        let d = display_line_with(t, &s, 0, Reveal::Hide, Some(&room));
+        assert_eq!(d.text, "Inline: ·· done");
+        let (a, b) = (8, 8 + "··".len());
+        assert_eq!(d.role_at(a), Role::Math);
+        // One step over it, either way; before it is before its `$`.
+        assert_eq!(d.next(a), b);
+        assert_eq!(d.prev(b), a);
+        assert_eq!(d.to_display(8), a);
+        assert_eq!(d.to_source(a), 8);
+        assert_eq!(d.to_source(b), 13);
+        assert_eq!(d.source_at(a), Some(8..13));
+        // Open (the hook says so): its source, `$`s and all.
+        let open = |_: Range<usize>| None;
+        let d = display_line_with(t, &s, 0, Reveal::Hide, Some(&open));
+        assert_eq!(d.text, t);
+        // No hook: as before, the `$`s hidden.
+        assert_eq!(show(t, Reveal::Hide), ["Inline: e^x done"]);
+        // A paragraph that's only a formula is a display one, not inline.
+        assert!(parse("$$x$$").maths.is_empty());
     }
 
     #[test]

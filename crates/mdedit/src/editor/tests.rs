@@ -444,17 +444,17 @@ fn a_right_click_on_a_cell_opens_the_table_menu(cx: &mut TestAppContext) {
     })
     .unwrap();
     cx.run_until_parked();
-    assert!(ed.read_with(cx, |e, _| e.table_menu.is_some()));
+    assert!(ed.read_with(cx, |e, _| e.menu.is_some()));
     let two = text(cx, &ed).find('2').unwrap();
     assert_eq!(head(cx, &ed), two + 1, "the caret went into the cell");
     // Elsewhere, no menu of ours.
-    ed.update(cx, |e, _| e.table_menu = None);
+    ed.update(cx, |e, _| e.menu = None);
     let after = o + gpui_kit::point(px(4.), *rows.last().unwrap() + px(40.));
     cx.update_window(h, |_, window, cx| {
         window.pointer_down(after, gpui_kit::MouseButton::Right, cx);
     })
     .unwrap();
-    assert!(ed.read_with(cx, |e, _| e.table_menu.is_none()));
+    assert!(ed.read_with(cx, |e, _| e.menu.is_none()));
 }
 
 #[gpui_kit::test]
@@ -585,5 +585,120 @@ fn the_copy_button_copies_its_code_block(cx: &mut TestAppContext) {
     let copied = cx.read_from_clipboard().and_then(|c| c.text());
     assert_eq!(copied.as_deref(), Some("echo one\necho two"));
     // The document is as it was, and the caret didn't move into the block.
+    assert_eq!(text(cx, &ed), doc);
+}
+
+#[gpui_kit::test]
+fn wiki_links_lead_to_their_notes(cx: &mut TestAppContext) {
+    use super::EditorEvent;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let dir = std::env::temp_dir().join(format!("mdedit-wikilinks-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Linked Note.md"), "# Linked\n").unwrap();
+    let doc = "See [[Linked Note|it]] and [[Nowhere]].\n\n## Later\n\n[[#later]]\n";
+    let (h, ed) = open(cx, doc, Mode::Rendered);
+    type Followed = Vec<(String, Option<std::path::PathBuf>)>;
+    let seen: Rc<RefCell<Followed>> = Rc::default();
+    let log = seen.clone();
+    cx.update(|cx| {
+        cx.subscribe(&ed, move |_, ev: &EditorEvent, _| {
+            if let EditorEvent::FollowWiki { note, path } = ev {
+                log.borrow_mut().push((note.clone(), path.clone()));
+            }
+        })
+        .detach()
+    });
+    let dir2 = dir.clone();
+    ed.update(cx, |e, cx| e.set_base_dir(Some(dir2), cx));
+    assert!(ed.update(cx, |e, _| e.wiki_reaches("Linked Note")));
+    assert!(!ed.update(cx, |e, _| e.wiki_reaches("Nowhere")));
+    assert!(ed.update(cx, |e, _| e.wiki_reaches("#Later")));
+    cx.update_window(h, |_, window, cx| {
+        ed.update(cx, |e, cx| {
+            e.follow_wiki("Linked Note", window, cx);
+            e.follow_wiki("Nowhere", window, cx);
+            // A heading here: the caret goes to it.
+            e.follow_wiki("#later", window, cx);
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        *seen.borrow(),
+        [
+            ("Linked Note".to_string(), Some(dir.join("Linked Note.md"))),
+            ("Nowhere".to_string(), None)
+        ]
+    );
+    let at = ed.read_with(cx, |e, _| e.selection().head);
+    assert_eq!(at, doc.find("## Later").unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[gpui_kit::test]
+fn the_language_menu_rewrites_the_fence(cx: &mut TestAppContext) {
+    let cases = [
+        (
+            "```rust\nfn x() {}\n```\n",
+            "python",
+            "```python\nfn x() {}\n```\n",
+        ),
+        (
+            "```rust title=a.rs\nx\n```\n",
+            "go",
+            "```go title=a.rs\nx\n```\n",
+        ),
+        ("```\nx\n```\n", "toml", "```toml\nx\n```\n"),
+        ("```rust\nx\n```\n", "", "```\nx\n```\n"),
+        (
+            "```rust title=a.rs\nx\n```\n",
+            "",
+            "```title=a.rs\nx\n```\n",
+        ),
+    ];
+    for (doc, word, want) in cases {
+        let (_, ed) = open(cx, doc, Mode::Rendered);
+        let current = ed.read_with(cx, |e, _| e.fence_lang(0));
+        assert!(current.is_some(), "{doc}");
+        ed.update(cx, |e, cx| e.set_fence_lang(0, word, cx));
+        assert_eq!(text(cx, &ed), want, "{doc} → {word}");
+    }
+    assert!(super::highlight::same_language("rs", "rust"));
+    assert!(super::highlight::same_language("", ""));
+    assert!(!super::highlight::same_language("rust", "python"));
+}
+
+#[gpui_kit::test]
+fn inline_formulas_are_pictures_until_the_caret_goes_in(cx: &mut TestAppContext) {
+    let doc = "Inline: $e^{i\\pi} + 1 = 0$ done\n";
+    let (h, ed) = open(cx, doc, Mode::Rendered);
+    let row = |cx: &mut TestAppContext| {
+        ed.read_with(cx, |e, _| {
+            let (_, _, l) = e.geometry.lines[0].clone();
+            (l.display.text.clone(), l.maths.len())
+        })
+    };
+    let (shown, pictures) = row(cx);
+    assert_eq!(pictures, 1);
+    assert!(!shown.contains('$') && shown.starts_with("Inline: ") && shown.ends_with(" done"));
+    // Right from just before it: into its source, which shows.
+    caret(cx, &ed, 8);
+    keys(cx, h, &["right"]);
+    assert_eq!(ed.read_with(cx, |e, _| e.selection().head), 9);
+    let (shown, pictures) = row(cx);
+    assert_eq!(
+        (shown.as_str(), pictures),
+        ("Inline: $e^{i\\pi} + 1 = 0$ done", 0)
+    );
+    // Out the other side: a picture again.
+    let end = doc.find(" done").unwrap();
+    caret(cx, &ed, end - 1);
+    keys(cx, h, &["right"]);
+    assert_eq!(ed.read_with(cx, |e, _| e.selection().head), end);
+    assert_eq!(row(cx).1, 1);
+    // Left from just after it: back in, at its end.
+    keys(cx, h, &["left"]);
+    assert_eq!(ed.read_with(cx, |e, _| e.selection().head), end - 1);
     assert_eq!(text(cx, &ed), doc);
 }

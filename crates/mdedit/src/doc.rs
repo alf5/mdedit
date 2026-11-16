@@ -51,6 +51,11 @@ pub enum DocEvent {
     Changed,
     /// The user answered the changed-on-disk banner.
     Disk(DiskChoice),
+    /// A `[[wiki link]]` was followed: open its note, if it has one.
+    FollowWiki {
+        note: String,
+        path: Option<PathBuf>,
+    },
 }
 
 /// What to do about a file that changed underneath its tab.
@@ -205,6 +210,13 @@ impl DocView {
         });
         self._subs
             .push(cx.subscribe(&editor, |this, editor, ev: &EditorEvent, cx| {
+                if let EditorEvent::FollowWiki { note, path } = ev {
+                    cx.emit(DocEvent::FollowWiki {
+                        note: note.clone(),
+                        path: path.clone(),
+                    });
+                    return;
+                }
                 // Escape in the text closes the search too.
                 if editor.read(cx).find.is_none() {
                     this.find = None;
@@ -406,6 +418,13 @@ impl DocView {
         if let Body::Markdown { editor, .. } = &self.body {
             let style = DocStyle::new(AppState::prefs(cx), crate::theme::palette(cx));
             editor.update(cx, |e, cx| e.set_style(style, cx));
+        }
+    }
+
+    /// Where its wiki links look for notes: the project folder.
+    pub fn set_root(&mut self, root: Option<PathBuf>, cx: &mut Context<Self>) {
+        if let Some(editor) = self.markdown() {
+            editor.update(cx, |e, cx| e.set_root(root, cx));
         }
     }
 

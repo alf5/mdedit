@@ -246,12 +246,22 @@ impl Workspace {
     fn add_doc(&mut self, doc: Entity<DocView>, window: &mut Window, cx: &mut Context<Self>) {
         self._subs.push(
             cx.subscribe_in(&doc, window, |this, doc, ev: &DocEvent, window, cx| {
-                if let DocEvent::Disk(choice) = ev {
-                    this.resolve_disk(doc.clone(), *choice, window, cx);
+                match ev {
+                    DocEvent::Disk(choice) => this.resolve_disk(doc.clone(), *choice, window, cx),
+                    DocEvent::FollowWiki {
+                        path: Some(path), ..
+                    } => this.open_paths(vec![path.clone()], window, cx),
+                    DocEvent::FollowWiki { note, path: None } => window.push_notification(
+                        Notification::warning(format!("There's no note called “{note}” here.")),
+                        cx,
+                    ),
+                    DocEvent::Changed => {}
                 }
                 cx.notify();
             }),
         );
+        let root = self.files.read(cx).root().map(Path::to_path_buf);
+        doc.update(cx, |d, cx| d.set_root(root, cx));
         let pane = &mut self.panes[self.active];
         let at = (pane.active + 1).min(pane.tabs.len());
         pane.tabs.insert(at, doc.clone());
@@ -332,7 +342,11 @@ impl Workspace {
         } else {
             SidebarTab::Outline
         };
-        self.files.update(cx, |f, cx| f.set_root(root, cx));
+        self.files.update(cx, |f, cx| f.set_root(root.clone(), cx));
+        let docs: Vec<_> = self.docs().cloned().collect();
+        for doc in docs {
+            doc.update(cx, |d, cx| d.set_root(root.clone(), cx));
+        }
         self.sync_files(cx);
         if !self.sidebar_open {
             self.sidebar_open = true;

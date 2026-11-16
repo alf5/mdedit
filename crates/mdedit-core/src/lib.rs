@@ -24,3 +24,4 @@ pub mod syntax;
 pub mod table;
 pub mod themes;
 pub mod watch;
+pub mod wiki;

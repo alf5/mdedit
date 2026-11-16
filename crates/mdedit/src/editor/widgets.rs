@@ -74,6 +74,9 @@ impl MarkdownEditor {
     pub fn set_base_dir(&mut self, dir: Option<PathBuf>, cx: &mut Context<Self>) {
         if self.base_dir != dir {
             self.base_dir = dir;
+            // Wiki links look for their notes from here.
+            self.wiki_index = None;
+            self.invalidate();
             cx.notify();
         }
     }

@@ -8,7 +8,7 @@ use mdedit_core::syntax::LineKind;
 
 use mdedit_core::display::{Gutter, RowWidget};
 
-use super::table::{Control, Drag, controls};
+use super::table::{Control, Drag, RAIL, controls};
 use super::{Geometry, LIST_INDENT, MarkdownEditor, Placed, max, min};
 
 const PAD_X: f32 = 32.;
@@ -162,8 +162,14 @@ impl MarkdownEditor {
         let c = &self.style.colors;
         let p = &self.style.palette;
         let accent_text = super::style::hsla(p.accent_text);
-        let soft = super::style::hsla(p.bg_soft);
+        // The controls take ZenNotes' colours, which every theme here was made
+        // from: its bg-1 at 90% for the rails, bg-2 for the grips, and bg-3 at
+        // 90% round both. Those are our soft background, the diagrams' second
+        // surface, and the border.
         let bg = super::style::hsla(p.bg);
+        let rail = bg.blend(super::style::hsla(p.bg_soft).opacity(0.9));
+        let grip = super::style::hsla(p.diagram_surface_alt);
+        let edge = super::style::hsla(p.border).opacity(0.9);
         let (mut under, mut over, mut cursors) = (Vec::new(), Vec::new(), Vec::new());
         let drag = self.table_dragging();
         let drag_cursor = match drag {
@@ -235,25 +241,28 @@ impl MarkdownEditor {
             for (control, b) in controls(g) {
                 let b = at(b);
                 match control {
+                    // A pill along the edge with a fine `+` in its middle. The
+                    // one under the pointer lights up.
                     Control::AddCol | Control::AddRow => {
                         let lit = under_pointer == Some(control)
                             || matches!(active, Some(Drag::Rail { control: k, .. }) if k == control);
+                        let pill = px(RAIL / 2.);
                         over.push(if lit {
-                            fill(b, c.accent.opacity(0.85)).corner_radii(px(5.))
+                            fill(b, c.accent.opacity(0.85)).corner_radii(pill)
                         } else {
-                            fill(b, bg.opacity(0.9))
-                                .corner_radii(px(5.))
+                            fill(b, rail)
+                                .corner_radii(pill)
                                 .border_widths(px(1.))
-                                .border_color(c.border)
+                                .border_color(edge)
                         });
                         let ink = if lit { accent_text } else { c.muted };
                         let mid = b.center();
                         over.push(fill(
-                            Bounds::new(mid - point(px(3.5), px(0.75)), size(px(7.), px(1.5))),
+                            Bounds::new(mid - point(px(3.5), px(0.5)), size(px(7.), px(1.))),
                             ink,
                         ));
                         over.push(fill(
-                            Bounds::new(mid - point(px(0.75), px(3.5)), size(px(1.5), px(7.))),
+                            Bounds::new(mid - point(px(0.5), px(3.5)), size(px(1.), px(7.))),
                             ink,
                         ));
                         cursors.push((
@@ -275,27 +284,42 @@ impl MarkdownEditor {
                         if !on || moving || resizing.is_some() {
                             continue;
                         }
-                        let inner = Bounds::from_corners(
-                            b.origin + point(px(1.), px(1.)),
-                            b.bottom_right() - point(px(1.), px(1.)),
-                        );
+                        // A tab the length of the column (or row), flush with
+                        // the table: its inner edge lies on the table's border
+                        // and its ends on the rules either side.
+                        let pill = if col {
+                            Bounds::from_corners(
+                                point(b.left(), b.top() + px(1.)),
+                                point((b.right() + px(1.)).min(table.right()), b.bottom() + px(1.)),
+                            )
+                        } else {
+                            Bounds::from_corners(
+                                point(b.left() + px(1.), b.top()),
+                                point(
+                                    b.right() + px(1.),
+                                    (b.bottom() + px(1.)).min(table.bottom()),
+                                ),
+                            )
+                        };
                         over.push(
-                            fill(inner, soft)
+                            fill(pill, grip)
                                 .corner_radii(px(4.))
                                 .border_widths(px(1.))
-                                .border_color(c.border),
+                                .border_color(edge),
                         );
-                        // ⠿, on its side for a column.
+                        // ⠿ in fine dots, on its side for a column.
                         let (across, down) = if col { (3, 2) } else { (2, 3) };
-                        let mid = inner.center();
+                        let (dot, pitch) = (1.5, 2.75);
+                        let mid = pill.center();
                         for a in 0..across {
                             for d in 0..down {
-                                let x =
-                                    mid.x + px((a as f32 - (across - 1) as f32 / 2.) * 3.5 - 1.);
-                                let y = mid.y + px((d as f32 - (down - 1) as f32 / 2.) * 3.5 - 1.);
+                                let x = mid.x
+                                    + px((a as f32 - (across - 1) as f32 / 2.) * pitch - dot / 2.);
+                                let y = mid.y
+                                    + px((d as f32 - (down - 1) as f32 / 2.) * pitch - dot / 2.);
                                 over.push(
-                                    fill(Bounds::new(point(x, y), size(px(2.), px(2.))), c.muted)
-                                        .corner_radii(px(1.)),
+                                    fill(Bounds::new(point(x, y), size(px(dot), px(dot))), c.muted)
+                                        .corner_radii(px(dot / 2.)),
                                 );
                             }
                         }

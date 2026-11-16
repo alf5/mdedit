@@ -38,6 +38,7 @@ nothing is converted back and forth behind your back.
     - `Tab` and `Shift+Tab` move between cells, and `Tab` past the last
       cell adds a row.
     - `Enter` goes down a column.
+    - `Shift+Enter` starts a new line in the cell, saved as `<br>`.
     - `Up` and `Down` change row.
     - `Left` and `Right` stop at the cell's edges.
     - `Esc` leaves the table.

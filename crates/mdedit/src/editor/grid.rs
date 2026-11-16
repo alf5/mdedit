@@ -23,14 +23,25 @@ const PAD_Y: f32 = 6.;
 /// The narrowest a column can be dragged.
 pub(crate) const MIN_COL: f32 = 48.;
 
+/// One line of a cell's text: a `<br>` starts another.
+pub(crate) struct CellLine {
+    /// Its first display offset in the cell.
+    pub start: usize,
+    /// Where it's drawn, from the cell's text origin (aligned).
+    pub at: Point<Pixels>,
+    pub shaped: WrappedLine,
+}
+
 pub(crate) struct GridCell {
     pub r: usize,
     pub c: usize,
     pub display: DisplayLine,
-    pub shaped: WrappedLine,
+    pub lines: Vec<CellLine>,
+    /// The text's height.
+    pub height: Pixels,
     /// The cell's first display offset in the grid.
     pub base: usize,
-    /// Where the cell's text is drawn from, relative to the row's box.
+    /// Where the cell's text starts, relative to the row's box.
     pub origin: Point<Pixels>,
     pub wrap: Pixels,
 }
@@ -38,6 +49,65 @@ pub(crate) struct GridCell {
 impl GridCell {
     fn len(&self) -> usize {
         self.display.text.len()
+    }
+
+    /// The line holding cell offset `d`.
+    fn line_of(&self, d: usize) -> usize {
+        self.lines
+            .partition_point(|l| l.start <= d)
+            .saturating_sub(1)
+    }
+
+    fn line_end(&self, i: usize) -> usize {
+        self.lines
+            .get(i + 1)
+            .map_or(self.len(), |next| next.start - 1)
+    }
+
+    /// Where cell offset `d` is drawn, from the cell's origin.
+    fn pos(&self, d: usize, lh: Pixels) -> Point<Pixels> {
+        let Some(line) = self.lines.get(self.line_of(d)) else {
+            return point(px(0.), px(0.));
+        };
+        let p = line
+            .shaped
+            .position_for_index(d - line.start, lh)
+            .unwrap_or_else(|| point(line.shaped.width(), px(0.)));
+        line.at + p
+    }
+
+    /// The cell offset nearest `p` (from the cell's origin).
+    fn index(&self, p: Point<Pixels>, lh: Pixels) -> usize {
+        let i = self.lines.iter().rposition(|l| l.at.y <= p.y).unwrap_or(0);
+        let Some(line) = self.lines.get(i) else {
+            return 0;
+        };
+        let local = point(p.x - line.at.x, (p.y - line.at.y).max(px(0.)));
+        let at = match line.shaped.closest_index_for_position(local, lh) {
+            Ok(i) | Err(i) => i,
+        };
+        (line.start + at).min(self.line_end(i))
+    }
+
+    /// Rectangles covering cell offsets `a..b`, drawn at `origin`.
+    fn rects(&self, origin: Point<Pixels>, a: usize, b: usize, lh: Pixels) -> Vec<Bounds<Pixels>> {
+        let mut out = Vec::new();
+        for (i, line) in self.lines.iter().enumerate() {
+            let (s, e) = (a.max(line.start), b.min(self.line_end(i)));
+            if s >= e {
+                continue;
+            }
+            out.extend(wrapped_rects(
+                origin + line.at,
+                &line.shaped,
+                lh,
+                s - line.start,
+                e - line.start,
+                false,
+                self.wrap,
+            ));
+        }
+        out
     }
 
     fn end(&self) -> usize {
@@ -165,11 +235,7 @@ impl Grid {
             return point(px(0.), px(TOP));
         };
         let local = (d - cell.base).min(cell.len());
-        let p = cell
-            .shaped
-            .position_for_index(local, self.line_height)
-            .unwrap_or_else(|| point(cell.shaped.width(), px(0.)));
-        cell.origin + p
+        cell.origin + cell.pos(local, self.line_height)
     }
 
     /// The table row and column under `p` (relative to the row's box),
@@ -211,14 +277,8 @@ impl Grid {
     /// The display offset in cell `k` nearest `p`.
     pub fn index_in(&self, k: usize, p: Point<Pixels>) -> usize {
         let cell = &self.cells[k];
-        let local = point(p.x - cell.origin.x, (p.y - cell.origin.y).max(px(0.)));
-        let i = match cell
-            .shaped
-            .closest_index_for_position(local, self.line_height)
-        {
-            Ok(i) | Err(i) => i,
-        };
-        cell.base + i.min(cell.len())
+        let local = point(p.x - cell.origin.x, p.y - cell.origin.y);
+        cell.base + cell.index(local, self.line_height)
     }
 
     /// A line up or down from `p` (the caret's top): within its cell if
@@ -230,8 +290,7 @@ impl Grid {
         if let Some(k) = self.cell_in(r, c) {
             let cell = &self.cells[k];
             let y = p.y + lh * step as f32;
-            let h = cell.shaped.size(lh).height;
-            if y >= cell.origin.y && y < cell.origin.y + h {
+            if y >= cell.origin.y && y < cell.origin.y + cell.height {
                 return Some(y);
             }
         }
@@ -240,7 +299,7 @@ impl Grid {
             return None;
         }
         let cell = &self.cells[self.cell_in(next as usize, c)?];
-        let h = cell.shaped.size(lh).height;
+        let h = cell.height;
         Some(if step > 0 || h <= lh {
             cell.origin.y
         } else {
@@ -275,14 +334,11 @@ impl Grid {
             if s >= e {
                 continue;
             }
-            out.extend(wrapped_rects(
+            out.extend(cell.rects(
                 origin + cell.origin,
-                &cell.shaped,
-                self.line_height,
                 s - cell.base,
                 e - cell.base,
-                false,
-                cell.wrap,
+                self.line_height,
             ));
         }
         out
@@ -405,11 +461,17 @@ impl MarkdownEditor {
                         run.font.weight = FontWeight::SEMIBOLD;
                     }
                 }
-                let one_line =
-                    window
-                        .text_system()
-                        .shape_line(d.text.clone().into(), size, &runs, None);
-                let wide = f32::from(one_line.width).ceil() + PAD_X * 2. + 2.;
+                let widest = window
+                    .text_system()
+                    .shape_text(d.text.clone().into(), size, &runs, None, None)
+                    .map(|lines| {
+                        lines
+                            .iter()
+                            .map(|l| f32::from(l.width()))
+                            .fold(0., f32::max)
+                    })
+                    .unwrap_or(0.);
+                let wide = widest.ceil() + PAD_X * 2. + 2.;
                 natural[c] = natural[c].max(wide);
                 out.push((range.clone(), d, runs));
             }
@@ -432,16 +494,39 @@ impl MarkdownEditor {
                 let shaped = window
                     .text_system()
                     .shape_text(d.text.clone().into(), size, &runs, Some(wrap), None)
-                    .ok()
-                    .and_then(|mut v| (!v.is_empty()).then(|| v.remove(0)))
+                    .map(|v| v.into_vec())
                     .unwrap_or_default();
-                tallest = super::max(tallest, shaped.size(lh).height);
+                // Each line starts after the previous one's break.
+                let mut starts = vec![0];
+                starts.extend(d.text.match_indices('\n').map(|(i, _)| i + 1));
+                let align = model.aligns.get(c).copied().unwrap_or(Align::None);
+                let mut y = px(0.);
+                let mut lines = Vec::with_capacity(shaped.len());
+                for (shaped, start) in shaped.into_iter().zip(starts) {
+                    let spare = wrap - shaped.width();
+                    let x = match align {
+                        _ if spare <= px(0.) => px(0.),
+                        Align::Center => spare / 2.,
+                        Align::Right => spare,
+                        _ => px(0.),
+                    };
+                    let h = shaped.size(lh).height;
+                    lines.push(CellLine {
+                        start,
+                        at: point(x, y),
+                        shaped,
+                    });
+                    y += super::max(h, lh);
+                }
+                let height = super::max(y, lh);
+                tallest = super::max(tallest, height);
                 let len = d.text.len();
                 cells.push(GridCell {
                     r,
                     c,
                     display: d,
-                    shaped,
+                    lines,
+                    height,
                     base,
                     origin: point(col_x[c] + px(PAD_X), px(0.)),
                     wrap,
@@ -449,15 +534,8 @@ impl MarkdownEditor {
                 base += len + 1;
             }
             let top = *row_y.last().unwrap();
-            for (c, cell) in cells[first..].iter_mut().enumerate() {
-                let spare = cell.wrap - cell.shaped.width();
-                let shift = match model.aligns.get(c).copied().unwrap_or(Align::None) {
-                    _ if spare <= px(0.) => px(0.),
-                    Align::Center => spare / 2.,
-                    Align::Right => spare,
-                    _ => px(0.),
-                };
-                cell.origin = point(cell.origin.x + shift, top + px(PAD_Y));
+            for cell in &mut cells[first..] {
+                cell.origin.y = top + px(PAD_Y);
             }
             row_y.push(top + tallest + px(PAD_Y * 2.));
         }

@@ -645,16 +645,18 @@ impl Element for EditorElement {
             for (_, origin, l) in &frame.lines {
                 if let Some(g) = &l.grid {
                     for cell in &g.cells {
-                        cell.shaped
-                            .paint(
-                                *origin + cell.origin,
-                                g.line_height,
-                                TextAlign::Left,
-                                None,
-                                window,
-                                cx,
-                            )
-                            .ok();
+                        for line in &cell.lines {
+                            line.shaped
+                                .paint(
+                                    *origin + cell.origin + line.at,
+                                    g.line_height,
+                                    TextAlign::Left,
+                                    None,
+                                    window,
+                                    cx,
+                                )
+                                .ok();
+                        }
                     }
                     continue;
                 }

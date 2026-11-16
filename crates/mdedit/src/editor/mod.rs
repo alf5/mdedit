@@ -876,7 +876,7 @@ impl MarkdownEditor {
                     Role::Text if link => c.accent,
                     Role::Text if display::has(r.style, display::MATH) => c.accent,
                     Role::Text if heading && source => c.accent,
-                    Role::Text => base_color,
+                    Role::Text | Role::Break => base_color,
                 };
                 TextRun {
                     len: r.len,
@@ -1235,7 +1235,8 @@ impl MarkdownEditor {
         } else {
             let prev = layout.prev(d);
             match layout.role_at(prev) {
-                Role::Bullet | Role::TaskOpen | Role::TaskDone => {
+                // A drawn element, or a cell's line break: all of its source.
+                Role::Bullet | Role::TaskOpen | Role::TaskDone | Role::Break => {
                     layout.source_at(prev).unwrap_or(caret..caret)
                 }
                 _ => {
@@ -1264,8 +1265,13 @@ impl MarkdownEditor {
             let end = self.row_range(ix).end;
             caret..(end + 1).min(self.text.len()).max(caret)
         } else {
-            let s = layout.to_source(d);
-            s..buffer::next_char(&self.text, s)
+            match layout.role_at(d) {
+                Role::Break => layout.source_at(d).unwrap_or(caret..caret),
+                _ => {
+                    let s = layout.to_source(d);
+                    s..buffer::next_char(&self.text, s)
+                }
+            }
         };
         let range = range.start.min(caret)..range.end;
         self.delete_range(range, cx);
@@ -1311,7 +1317,12 @@ impl MarkdownEditor {
     }
 
     fn soft_break(&mut self, _: &SoftBreak, _: &mut Window, cx: &mut Context<Self>) {
+        // In a table cell, Shift+Enter breaks the line the only way a cell
+        // can hold one.
         if self.grid_widget(self.sel.head).is_some() {
+            if self.cell_range(self.sel.start()).is_some() {
+                self.replace_selection("<br>", Kind::Other, cx);
+            }
             return;
         }
         let c = edit::soft_break(&self.text, self.sel);

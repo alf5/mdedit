@@ -478,3 +478,45 @@ fn live_mode_shows_the_caret_cells_markdown(cx: &mut TestAppContext) {
     });
     assert_eq!(shown, ("**a**".to_string(), "b".to_string()));
 }
+
+#[gpui_kit::test]
+fn shift_enter_breaks_a_line_in_a_cell(cx: &mut TestAppContext) {
+    let src = "| a | b |\n|---|---|\n| 1 | 2 |";
+    let (h, ed) = open(cx, src, Mode::Rendered);
+    caret(cx, &ed, src.find('1').unwrap() + 1);
+    keys(cx, h, &["shift-enter"]);
+    typed(cx, h, "two");
+    assert!(
+        text(cx, &ed).contains("| 1<br>two | 2 |"),
+        "{}",
+        text(cx, &ed)
+    );
+    // Drawn as two lines in one cell, the row grown to hold them.
+    let lines = ed.read_with(cx, |e, _| {
+        let (_, _, l) = e
+            .geometry
+            .lines
+            .iter()
+            .find(|(_, _, l)| l.grid.is_some())
+            .unwrap();
+        let cell = &l.grid.as_ref().unwrap().cells[2];
+        (
+            cell.display.text.clone(),
+            cell.lines.len(),
+            cell.height > l.grid.as_ref().unwrap().line_height,
+        )
+    });
+    assert_eq!(lines, ("1\ntwo".to_string(), 2, true));
+    // Up stays in the cell, on its first line; End is that line's end.
+    keys(cx, h, &["up", "end"]);
+    let one = text(cx, &ed).find('1').unwrap();
+    assert_eq!(head(cx, &ed), one + 1, "before the break");
+    // Delete there takes the whole tag.
+    keys(cx, h, &["delete"]);
+    assert!(text(cx, &ed).contains("| 1two | 2 |"), "{}", text(cx, &ed));
+    // Outside a table it's still a hard line break.
+    let (h, ed) = open(cx, "para", Mode::Rendered);
+    caret(cx, &ed, 4);
+    keys(cx, h, &["shift-enter"]);
+    assert!(!text(cx, &ed).contains("<br>"));
+}

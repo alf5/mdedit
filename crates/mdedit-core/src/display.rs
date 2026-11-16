@@ -24,6 +24,8 @@ pub enum Role {
     Lang,
     /// An alert's title, drawn in place of its `[!NOTE]`.
     Alert,
+    /// A `<br>` in a table cell, drawn as a line break.
+    Break,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +105,10 @@ impl DisplayLine {
     pub fn to_display(&self, src: usize) -> usize {
         let mut last = 0;
         for seg in &self.segs {
+            // Just before a line break: the end of the line it ends.
+            if src == seg.source.start && self.is_break(seg) {
+                return seg.display.start;
+            }
             if src < seg.source.start {
                 return seg.display.start.min(last.max(seg.display.start));
             }
@@ -128,6 +134,9 @@ impl DisplayLine {
             if seg.display.contains(&d) {
                 return if seg.copy {
                     seg.source.start + (d - seg.display.start)
+                } else if self.is_break(seg) {
+                    // Typing at the end of a line goes before its break.
+                    seg.source.start
                 } else {
                     seg.source.end
                 };
@@ -136,6 +145,11 @@ impl DisplayLine {
         // Past the last character: the end of the line, after any markup
         // that closes it.
         self.source.end
+    }
+
+    /// A `<br>` drawn as a newline.
+    fn is_break(&self, seg: &Seg) -> bool {
+        !seg.copy && self.text.get(seg.display.clone()) == Some("\n")
     }
 
     /// The previous and next display character boundaries.
@@ -442,6 +456,79 @@ pub fn display_row(
 /// in the document. A cell holds only inline markdown, so anything that
 /// would read as a block on its own (`# x`, `- x`) is shown as it is.
 pub fn fragment(text: &str, at: usize, reveal: Reveal) -> DisplayLine {
+    // Rendered, a `<br>` breaks the line; each stretch between is drawn on
+    // its own.
+    let breaks = if reveal == Reveal::Hide {
+        br_tags(text)
+    } else {
+        Vec::new()
+    };
+    if breaks.is_empty() {
+        return fragment_piece(text, at, reveal);
+    }
+    let mut out = DisplayLine {
+        source: at..at + text.len(),
+        ..Default::default()
+    };
+    let mut start = 0;
+    for br in breaks {
+        append(
+            &mut out,
+            fragment_piece(&text[start..br.start], at + start, reveal),
+        );
+        out.push("\n", at + br.start..at + br.end, false, 0, Role::Break);
+        start = br.end;
+    }
+    append(&mut out, fragment_piece(&text[start..], at + start, reveal));
+    out
+}
+
+/// Where the `<br>`s (`<br/>`, `<br />`, any case) are in `text`.
+fn br_tags(text: &str) -> Vec<Range<usize>> {
+    let lower = text.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = lower[from..].find("<br") {
+        let start = from + i;
+        let rest = &lower[start + 3..];
+        let len = ["/>", " />", ">"]
+            .iter()
+            .find(|end| rest.starts_with(*end))
+            .map(|end| 3 + end.len());
+        match len {
+            Some(n) => {
+                out.push(start..start + n);
+                from = start + n;
+            }
+            None => from = start + 3,
+        }
+    }
+    out
+}
+
+/// `piece` added to the end of `out`.
+fn append(out: &mut DisplayLine, piece: DisplayLine) {
+    let base = out.text.len();
+    out.text.push_str(&piece.text);
+    for seg in piece.segs {
+        if seg.display.is_empty() && seg.source.is_empty() {
+            continue;
+        }
+        out.segs.push(Seg {
+            display: seg.display.start + base..seg.display.end + base,
+            source: seg.source,
+            copy: seg.copy,
+        });
+    }
+    for run in piece.runs {
+        match out.runs.last_mut() {
+            Some(r) if r.style == run.style && r.role == run.role => r.len += run.len,
+            _ => out.runs.push(run),
+        }
+    }
+}
+
+fn fragment_piece(text: &str, at: usize, reveal: Reveal) -> DisplayLine {
     let plain = |text: &str| {
         let mut out = DisplayLine {
             source: at..at + text.len(),
@@ -635,6 +722,32 @@ mod tests {
         );
         let empty = fragment("", 5, Reveal::Hide);
         assert_eq!((empty.text.as_str(), empty.to_source(0)), ("", 5));
+    }
+
+    #[test]
+    fn a_br_in_a_cell_breaks_the_line() {
+        let d = fragment("one<br>**two**", 10, Reveal::Hide);
+        assert_eq!(d.text, "one\ntwo");
+        assert_eq!(
+            d.to_source(3),
+            13,
+            "the end of the first line is before the tag"
+        );
+        assert_eq!(d.to_display(13), 3);
+        assert_eq!(d.to_source(4), 19, "the second line starts inside the bold");
+        assert_eq!(d.role_at(3), Role::Break);
+        assert_eq!(
+            d.source_at(3),
+            Some(13..17),
+            "deleting it takes the whole tag"
+        );
+        assert_eq!(fragment("a<BR/>b<br />c", 0, Reveal::Hide).text, "a\nb\nc");
+        assert_eq!(
+            fragment("a<br>b", 0, Reveal::Show).text,
+            "a<br>b",
+            "shown as written"
+        );
+        assert_eq!(fragment("<bread>", 0, Reveal::Hide).text, "<bread>");
     }
 
     #[test]

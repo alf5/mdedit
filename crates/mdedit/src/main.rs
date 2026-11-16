@@ -8,6 +8,7 @@
 mod actions;
 mod assets;
 mod doc;
+mod editor;
 mod files;
 mod hex_view;
 mod single;

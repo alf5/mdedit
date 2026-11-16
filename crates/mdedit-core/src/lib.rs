@@ -6,6 +6,7 @@
 
 pub mod buffer;
 pub mod detach;
+pub mod display;
 pub mod docx;
 pub mod edit;
 pub mod export;

@@ -196,6 +196,16 @@ impl Prefs {
         self.recent.retain(|p| p != path);
     }
 
+    /// The rendered mode to return to from Source: the default, unless
+    /// the default *is* Source.
+    pub fn mode_or_rendered(&self) -> Mode {
+        if self.mode == Mode::Source {
+            Mode::Rendered
+        } else {
+            self.mode
+        }
+    }
+
     /// The theme, if it still exists; an unknown one follows the system.
     pub fn theme(&self) -> &str {
         if crate::themes::is_known(&self.theme) {

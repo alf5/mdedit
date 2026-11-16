@@ -1,9 +1,9 @@
 //! One open document: a tab's content, whatever kind of file it is.
 //!
-//! What a file *is* decides what it gets: markdown and text get an editor,
-//! images are shown, binaries get the hex editor, and a file past its size
-//! limit says so rather than pretending to be empty. Markdown is edited as
-//! source for now; the live-preview editor replaces that in M3.
+//! What a file *is* decides what it gets: markdown gets the live-preview
+//! editor, other text a code editor, images are shown, binaries get the hex
+//! editor, and a file past its size limit says so rather than pretending to
+//! be empty.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,10 +13,17 @@ use gpui_kit::component::input::{Editor, EditorState, InputEvent};
 use gpui_kit::*;
 use mdedit_core::project::{self, AnyFile, Content};
 
+use crate::editor::style::DocStyle;
+use crate::editor::{EditorEvent, MarkdownEditor};
 use crate::hex_view::{HexEvent, HexView};
+use crate::state::AppState;
 use crate::theme::{MONO_FONT, UI_FONT};
 
 pub enum Body {
+    Markdown {
+        editor: Entity<MarkdownEditor>,
+        saved: String,
+    },
     Text {
         editor: Entity<EditorState>,
         markdown: bool,
@@ -55,6 +62,7 @@ impl EventEmitter<DocEvent> for DocView {}
 impl Focusable for DocView {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         match &self.body {
+            Body::Markdown { editor, .. } => editor.focus_handle(cx),
             Body::Text { editor, .. } => editor.focus_handle(cx),
             Body::Hex(hex) => hex.focus_handle(cx),
             _ => self.focus.clone(),
@@ -88,17 +96,17 @@ fn image_format(mime: &str) -> Option<ImageFormat> {
 
 impl DocView {
     /// A new, empty markdown document.
-    pub fn untitled(number: usize, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn untitled(number: usize, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut doc = Self::blank(None, cx);
         doc.untitled = number;
-        doc.body = doc.text_body(String::new(), true, window, cx);
+        doc.body = doc.markdown_body(String::new(), cx);
         doc
     }
 
     pub fn from_file(file: AnyFile, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut doc = Self::blank(Some(file.path.clone()), cx);
         doc.body = match file.content {
-            Content::Markdown(text) => doc.text_body(text, true, window, cx),
+            Content::Markdown(text) => doc.markdown_body(text, cx),
             Content::Text(text) => doc.text_body(text, false, window, cx),
             Content::Image { bytes, mime } => Body::Image {
                 image: image_format(mime).map(|f| Arc::new(Image::from_bytes(f, bytes))),
@@ -129,6 +137,47 @@ impl DocView {
             chars: 0,
             focus: cx.focus_handle(),
             _subs: Vec::new(),
+        }
+    }
+
+    fn markdown_body(&mut self, text: String, cx: &mut Context<Self>) -> Body {
+        let prefs = AppState::prefs(cx);
+        let mode = prefs.mode;
+        let style = DocStyle::new(prefs, crate::theme::palette(cx));
+        let saved = text.clone();
+        let editor = cx.new(|cx| MarkdownEditor::new(text, mode, style, cx));
+        self._subs
+            .push(cx.subscribe(&editor, |this, editor, ev: &EditorEvent, cx| {
+                if let EditorEvent::Edited = ev
+                    && let Body::Markdown { saved, .. } = &this.body
+                {
+                    let e = editor.read(cx);
+                    this.dirty = e.text() != saved;
+                    let (w, c) = e.counts();
+                    this.words = w;
+                    this.chars = c;
+                }
+                cx.emit(DocEvent::Changed);
+                cx.notify();
+            }));
+        let (w, c) = editor.read(cx).counts();
+        self.words = w;
+        self.chars = c;
+        Body::Markdown { editor, saved }
+    }
+
+    /// Typography or colours changed: re-set the editor.
+    pub fn restyle(&mut self, cx: &mut Context<Self>) {
+        if let Body::Markdown { editor, .. } = &self.body {
+            let style = DocStyle::new(AppState::prefs(cx), crate::theme::palette(cx));
+            editor.update(cx, |e, cx| e.set_style(style, cx));
+        }
+    }
+
+    pub fn markdown(&self) -> Option<&Entity<MarkdownEditor>> {
+        match &self.body {
+            Body::Markdown { editor, .. } => Some(editor),
+            _ => None,
         }
     }
 
@@ -197,16 +246,24 @@ impl DocView {
 
     /// Text can be saved anywhere; a binary only back where it came from.
     pub fn can_save_as(&self) -> bool {
-        matches!(self.body, Body::Text { .. })
+        matches!(self.body, Body::Text { .. } | Body::Markdown { .. })
     }
 
     pub fn can_save(&self) -> bool {
-        matches!(self.body, Body::Text { .. } | Body::Hex(_))
+        matches!(
+            self.body,
+            Body::Text { .. } | Body::Markdown { .. } | Body::Hex(_)
+        )
     }
 
     /// Write the document to `path`, which becomes its path.
     pub fn write_to(&mut self, path: &Path, cx: &mut Context<Self>) -> Result<(), String> {
         match &mut self.body {
+            Body::Markdown { editor, saved } => {
+                let text = editor.read(cx).text().to_string();
+                std::fs::write(path, text.as_bytes()).map_err(|e| e.to_string())?;
+                *saved = text;
+            }
             Body::Text { editor, saved, .. } => {
                 let text = editor.read(cx).value();
                 std::fs::write(path, text.as_bytes()).map_err(|e| e.to_string())?;
@@ -229,6 +286,10 @@ impl DocView {
     /// The status bar's facts about this document, left to right.
     pub fn status(&self, cx: &App) -> Vec<SharedString> {
         match &self.body {
+            Body::Markdown { .. } => vec![
+                format!("{} words", self.words).into(),
+                format!("{} characters", self.chars).into(),
+            ],
             Body::Text { markdown, .. } => vec![
                 format!("{} words", self.words).into(),
                 format!("{} characters", self.chars).into(),
@@ -260,6 +321,7 @@ impl Render for DocView {
         let muted = theme.muted_foreground;
         let page = div().size_full().track_focus(&self.focus);
         match &self.body {
+            Body::Markdown { editor, .. } => page.child(editor.clone()),
             Body::Text {
                 editor,
                 markdown: true,

@@ -20,7 +20,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use mdedit_core::prefs::recent_parts;
+use mdedit_core::prefs::{Mode, recent_parts};
 use mdedit_core::{os, project, themes};
 
 use crate::actions::*;
@@ -116,10 +116,11 @@ impl Workspace {
                     this.open_paths(vec![path.clone()], window, cx);
                 }),
             ];
-        subs.push(cx.observe_window_appearance(window, |_, window, cx| {
+        subs.push(cx.observe_window_appearance(window, |this, window, cx| {
             let id = AppState::prefs(cx).theme().to_string();
             if id.is_empty() {
                 theme::apply("", window, cx);
+                this.restyle(cx);
             }
         }));
 
@@ -696,7 +697,16 @@ impl Workspace {
         let id = action.id.to_string();
         AppState::update_prefs(cx, |p| p.theme = id.clone());
         theme::apply(&id, window, cx);
+        self.restyle(cx);
         cx.notify();
+    }
+
+    /// Colours or typography changed: every open document re-sets itself.
+    fn restyle(&mut self, cx: &mut Context<Self>) {
+        let docs: Vec<_> = self.docs().cloned().collect();
+        for doc in docs {
+            doc.update(cx, |d, cx| d.restyle(cx));
+        }
     }
 
     fn about(&mut self, _: &About, window: &mut Window, cx: &mut Context<Self>) {
@@ -1260,6 +1270,11 @@ impl Workspace {
             theme.status_bar,
         );
         let doc = self.active_doc().cloned();
+        let mode = doc
+            .as_ref()
+            .and_then(|d| d.read(cx).markdown().cloned())
+            .map(|e| (e.read(cx).mode(), e));
+        let segment_bg = cx.theme().secondary;
         let (path, facts, hex_mode) = match &doc {
             Some(doc) => {
                 let d = doc.read(cx);
@@ -1310,6 +1325,33 @@ impl Workspace {
                             .into_iter()
                             .map(|f| div().whitespace_nowrap().child(f)),
                     )
+                    .when_some(mode, |d, (current, editor)| {
+                        d.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(1.))
+                                .p(px(1.))
+                                .rounded(px(6.))
+                                .bg(segment_bg)
+                                .children([Mode::Rendered, Mode::Live, Mode::Source].map(|m| {
+                                    let editor = editor.clone();
+                                    let label = match m {
+                                        Mode::Rendered => "Rendered",
+                                        Mode::Live => "Live",
+                                        Mode::Source => "Source",
+                                    };
+                                    Button::new(label)
+                                        .xsmall()
+                                        .label(label)
+                                        .map(|b| if m == current { b.outline() } else { b.ghost() })
+                                        .on_click(move |_, _, cx| {
+                                            editor.update(cx, |e, cx| e.set_mode(m, cx));
+                                            AppState::update_prefs(cx, |p| p.mode = m);
+                                        })
+                                })),
+                        )
+                    })
                     .when_some(hex_mode, |d, overwrite| {
                         d.child(
                             Button::new("hex-mode")
@@ -1510,16 +1552,12 @@ mod tests {
     fn type_into_active(
         cx: &mut TestAppContext,
         handle: AnyWindowHandle,
-        ws: &Entity<Workspace>,
+        _ws: &Entity<Workspace>,
         text: &str,
     ) {
-        let doc = ws.read_with(cx, |ws, _| ws.active_doc().cloned().unwrap());
         cx.update_window(handle, |_, window, cx| {
-            if let crate::doc::Body::Text { editor, .. } = &doc.read(cx).body {
-                editor
-                    .clone()
-                    .update(cx, |e, cx| e.insert(text, window, cx));
-            }
+            window.render_frame(cx);
+            window.input(text, cx);
         })
         .unwrap();
         cx.run_until_parked();

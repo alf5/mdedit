@@ -148,8 +148,25 @@ fn hsla(c: Rgba) -> Hsla {
     .into()
 }
 
+/// The palette in force, for what the gpui-kit theme has no word for (the
+/// document's code background, quote bar, alert colours).
+pub struct CurrentPalette(pub Palette);
+
+impl Global for CurrentPalette {}
+
+pub fn palette(cx: &App) -> &Palette {
+    &cx.global::<CurrentPalette>().0
+}
+
 /// Install `theme_id` (empty: follow the system) as the app's theme.
 pub fn apply(theme_id: &str, window: &mut Window, cx: &mut App) {
+    let current = themes::palette(theme_id).unwrap_or_else(|| {
+        themes::system_palette(matches!(
+            ThemeMode::from(window.appearance()),
+            ThemeMode::Dark
+        ))
+    });
+    cx.set_global(CurrentPalette(current));
     let (light, dark, mode) = match themes::palette(theme_id) {
         Some(p) => {
             let mode = if p.dark {

@@ -826,6 +826,10 @@ impl Element for EditorElement {
             frame.drag_cursor.unwrap_or(CursorStyle::IBeam),
             &frame.hitbox,
         );
+        // Over a link with Ctrl/Cmd held: a click follows it.
+        if frame.drag_cursor.is_none() && self.editor.read(cx).link_hovered() {
+            window.set_cursor_style(CursorStyle::PointingHand, &frame.hitbox);
+        }
         if frame.drag_cursor.is_none() {
             for (hitbox, style) in &frame.cursors {
                 window.set_cursor_style(*style, hitbox);
@@ -868,9 +872,13 @@ impl Element for EditorElement {
                 } else {
                     // Hovering a table shows its controls; a press on one
                     // drags.
-                    editor.update(cx, |ed, cx| ed.table_pointer(e.position, cx));
+                    editor.update(cx, |ed, cx| {
+                        ed.table_pointer(e.position, cx);
+                        ed.hover_link(e.position, e.modifiers, cx);
+                    });
                 }
             });
+
             let editor = self.editor.clone();
             window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
                 if phase.bubble() {

@@ -28,6 +28,9 @@ nothing is converted back and forth behind your back.
     Type to filter it; `h2` finds Heading 2.
   - **The command palette** (`Ctrl/Cmd+Shift+P`) has every command and its
     shortcut.
+- **Links open with `Ctrl/Cmd`+click**: web and mail addresses in the
+  browser or mail app, and wiki links in a tab. Hold `Ctrl/Cmd` and the
+  pointer turns to a hand over one.
 - **Lists that keep going**: `Enter` continues a list, a task list or a
   quote, and `Enter` on an empty item ends it. `Tab` and `Shift+Tab` indent
   and outdent. Task boxes tick with a click.

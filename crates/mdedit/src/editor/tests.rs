@@ -743,3 +743,123 @@ fn a_table_cells_formulas_are_pictures_too(cx: &mut TestAppContext) {
     assert_eq!(cell(cx).1, 1);
     assert_eq!(text(cx, &ed), doc);
 }
+
+#[gpui_kit::test]
+fn ctrl_over_a_link_makes_the_pointer_a_hand(cx: &mut TestAppContext) {
+    use gpui_kit::{
+        InputEvent as _, Modifiers, ModifiersChangedEvent, MouseMoveEvent, Pixels, point,
+    };
+    let doc = "Go to [the site](https://example.com) or [[Note]], not [here](notes.md).\n";
+    let (h, ed) = open(cx, doc, Mode::Rendered);
+    // The middle of the first character of `text` (as drawn).
+    let at = |cx: &mut TestAppContext, text: &str| -> Point<Pixels> {
+        ed.read_with(cx, |e, _| {
+            let (_, origin, l) = e.geometry.lines[0].clone();
+            let src = doc.find(text).unwrap();
+            let d = l.to_display(src);
+            let r = l.rects(origin, d, l.next(d), false, px(800.))[0];
+            r.center()
+        })
+    };
+    let ctrl = cx.update(|cx| Modifiers::secondary_key(cx));
+    let send = |cx: &mut TestAppContext, p: Point<Pixels>, modifiers: Modifiers| {
+        cx.update_window(h, |_, window, cx| {
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: p,
+                    pressed_button: None,
+                    modifiers,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+        })
+        .unwrap();
+    };
+    let modifiers = |cx: &mut TestAppContext, modifiers: Modifiers| {
+        cx.update_window(h, |_, window, cx| {
+            window.dispatch_event(
+                ModifiersChangedEvent {
+                    modifiers,
+                    capslock: window.capslock(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+        })
+        .unwrap();
+    };
+    let hand = |cx: &mut TestAppContext| ed.read_with(cx, |e, _| e.link_hovered());
+
+    let site = at(cx, "site");
+    assert!(
+        ed.read_with(cx, |e, _| e.link_under(site).is_some()),
+        "{site:?}"
+    );
+    send(cx, site, Modifiers::none());
+    assert!(!hand(cx), "no Ctrl: the text cursor");
+    modifiers(cx, ctrl);
+    assert!(hand(cx), "Ctrl pressed over a web link");
+    modifiers(cx, Modifiers::none());
+    assert!(!hand(cx), "Ctrl let go");
+    let p = at(cx, "Note");
+    send(cx, p, ctrl);
+    assert!(hand(cx), "a wiki link");
+    let p = at(cx, "Go");
+    send(cx, p, ctrl);
+    assert!(!hand(cx), "plain text");
+    // A link to a file isn't followed by a click, so isn't a hand.
+    let p = at(cx, "here");
+    send(cx, p, ctrl);
+    assert!(!hand(cx), "a relative link");
+    // Past the end of the line, level with a link: not over it.
+    let end = point(site.x + px(700.), site.y);
+    send(cx, end, ctrl);
+    assert!(!hand(cx), "past the line's end");
+    // And a Ctrl/Cmd+click where the hand was follows the link.
+    let followed = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let log = followed.clone();
+    cx.update(|cx| {
+        cx.subscribe(&ed, move |_, ev: &super::EditorEvent, _| {
+            if let super::EditorEvent::FollowWiki { note, .. } = ev {
+                log.borrow_mut().push(note.clone());
+            }
+        })
+        .detach()
+    });
+    let note = at(cx, "Note");
+    cx.update_window(h, |_, window, cx| {
+        for event in [
+            gpui_kit::MouseDownEvent {
+                button: gpui_kit::MouseButton::Left,
+                position: note,
+                modifiers: ctrl,
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+            gpui_kit::MouseUpEvent {
+                button: gpui_kit::MouseButton::Left,
+                position: note,
+                modifiers: ctrl,
+                click_count: 1,
+            }
+            .to_platform_input(),
+        ] {
+            window.dispatch_event(event, cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(*followed.borrow(), ["Note"]);
+    assert_eq!(text(cx, &ed), doc);
+    // Shown as source, nothing is a link.
+    ed.update(cx, |e, cx| e.set_mode(Mode::Source, cx));
+    cx.update_window(h, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    let p = at(cx, "site");
+    send(cx, p, ctrl);
+    assert!(!hand(cx), "source mode");
+}

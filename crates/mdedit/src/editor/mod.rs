@@ -305,6 +305,9 @@ pub struct MarkdownEditor {
     room_widths: HashMap<u32, Vec<(char, f32)>>,
     wiki_index: Option<(Instant, Rc<mdedit_core::wiki::Index>)>,
     wiki_found: HashMap<String, Option<PathBuf>>,
+    /// The pointer's over a link with Ctrl/Cmd held: a click follows it,
+    /// and the pointer's a hand.
+    link_hover: bool,
     /// Drawn diagrams and formulas, by source and look.
     pictures: HashMap<u64, widgets::Picture>,
     /// Highlighted code blocks, by content and language.
@@ -389,6 +392,7 @@ impl MarkdownEditor {
             room_widths: HashMap::new(),
             wiki_index: None,
             wiki_found: HashMap::new(),
+            link_hover: false,
             pictures: HashMap::new(),
             code_colors: HashMap::new(),
             code_theme,
@@ -2166,6 +2170,61 @@ impl MarkdownEditor {
         Some((last.0, last.2.len(), last.2.clone()))
     }
 
+    /// The link whose text is under `p`, if a Ctrl/Cmd+click there would
+    /// follow it: a `[[wiki link]]`, or a web or mail address.
+    fn link_under(&self, p: Point<Pixels>) -> Option<syntax::Link> {
+        if !self.rich() {
+            return None;
+        }
+        let (_, origin, layout) = self
+            .geometry
+            .lines
+            .iter()
+            .find(|(_, o, l)| p.y >= o.y && p.y < o.y + l.height.get())?;
+        let width = self.content_w? - layout.indent;
+        let src = layout.to_source(layout.index(p - *origin));
+        // The nearest offset can be just past a link's last character.
+        self.syntax
+            .links
+            .iter()
+            .filter(|l| l.range.start <= src && src <= l.range.end)
+            .filter(|l| l.wiki || os::is_openable_link(&l.url))
+            .find(|l| {
+                let (a, b) = (
+                    layout.to_display(l.range.start),
+                    layout.to_display(l.range.end),
+                );
+                a < b
+                    && layout
+                        .rects(*origin, a, b, false, width)
+                        .iter()
+                        .any(|r| r.contains(&p))
+            })
+            .cloned()
+    }
+
+    /// The pointer's at `p` with `modifiers` held: over a link with
+    /// Ctrl/Cmd, it's a hand.
+    pub(crate) fn hover_link(
+        &mut self,
+        p: Point<Pixels>,
+        modifiers: Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        let on = modifiers.secondary(cx)
+            && !modifiers.shift
+            && !self.is_selecting()
+            && self.link_under(p).is_some();
+        if on != self.link_hover {
+            self.link_hover = on;
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn link_hovered(&self) -> bool {
+        self.link_hover
+    }
+
     /// The task box at `p`, in a list line's margin.
     fn task_at(&self, p: Point<Pixels>) -> Option<Range<usize>> {
         let (_, origin, l) = self
@@ -2224,11 +2283,10 @@ impl MarkdownEditor {
             pos = f.start + self.math_delims(&f);
         }
         // A link opens with Ctrl/Cmd held.
-        if self.rich()
-            && e.click_count == 1
+        if e.click_count == 1
             && !e.modifiers.shift
             && e.modifiers.secondary(cx)
-            && let Some(link) = self.syntax.link_at(pos)
+            && let Some(link) = self.link_under(e.position)
         {
             if link.wiki {
                 let target = link.url.clone();
@@ -2432,6 +2490,11 @@ impl Render for MarkdownEditor {
         div()
             .key_context("MdEditor")
             .track_focus(&self.focus)
+            // Ctrl/Cmd pressed or let go with the pointer still: over a
+            // link, it's a hand or not.
+            .on_modifiers_changed(cx.listener(|ed, e: &ModifiersChangedEvent, window, cx| {
+                ed.hover_link(window.mouse_position(), e.modifiers, cx)
+            }))
             .on_action(cx.listener(Self::move_left))
             .on_action(cx.listener(Self::move_right))
             .on_action(cx.listener(Self::move_up))

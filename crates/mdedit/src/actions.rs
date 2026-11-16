@@ -15,6 +15,8 @@ gpui_kit::actions!(
         Open,
         OpenFolder,
         CloseFolder,
+        CommandPalette,
+        QuickOpen,
         Save,
         SaveAs,
         CloseTab,
@@ -155,6 +157,8 @@ pub fn bind_keys(cx: &mut App) {
     bind(cx, "secondary-w", CloseTab, ws);
     bind(cx, "secondary-q", Quit, ws);
     bind(cx, "secondary-shift-l", ToggleSidebar, ws);
+    bind(cx, "secondary-shift-p", CommandPalette, ws);
+    bind(cx, "secondary-p", QuickOpen, ws);
     bind(cx, "secondary-\\", SplitRight, ws);
     bind(cx, "ctrl-tab", NextTab, ws);
     bind(cx, "ctrl-shift-tab", PrevTab, ws);
@@ -201,7 +205,6 @@ pub fn bind_keys(cx: &mut App) {
         ("secondary-k", Box::new(InsertLink)),
         ("secondary-0", Box::new(Paragraph)),
         ("secondary-shift-m", Box::new(ToggleSource)),
-        ("secondary-f", Box::new(Find)),
         ("f3", Box::new(FindNext)),
         ("shift-f3", Box::new(FindPrevious)),
     ] {
@@ -227,17 +230,26 @@ pub fn bind_keys(cx: &mut App) {
         bind(cx, "cmd-down", DocEnd, ed);
         bind(cx, "cmd-shift-up", SelectDocStart, ed);
         bind(cx, "cmd-shift-down", SelectDocEnd, ed);
-        bind(cx, "cmd-alt-f", FindReplace, ed);
     } else {
         bind(cx, "ctrl-home", DocStart, ed);
         bind(cx, "ctrl-end", DocEnd, ed);
         bind(cx, "ctrl-shift-home", SelectDocStart, ed);
         bind(cx, "ctrl-shift-end", SelectDocEnd, ed);
         bind(cx, "ctrl-y", Redo, ed);
-        bind(cx, "ctrl-h", FindReplace, ed);
     }
     for level in 1..=6u8 {
         bind(cx, &format!("secondary-{level}"), Heading { level }, ed);
+    }
+
+    let find = Some("FindBar");
+    bind(cx, "escape", CloseFind, find);
+    bind(cx, "f3", FindNext, find);
+    bind(cx, "shift-f3", FindPrevious, find);
+    bind(cx, "secondary-f", Find, Some("DocView"));
+    if cfg!(target_os = "macos") {
+        bind(cx, "cmd-alt-f", FindReplace, Some("DocView"));
+    } else {
+        bind(cx, "ctrl-h", FindReplace, Some("DocView"));
     }
 
     let hex = Some("HexView");

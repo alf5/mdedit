@@ -10,9 +10,12 @@ use std::sync::Arc;
 
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::input::{Editor, EditorState, InputEvent};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mdedit_core::project::{self, AnyFile, Content};
 
+use crate::actions::{Find, FindReplace};
+use crate::editor::find_bar::{FindBar, FindBarEvent};
 use crate::editor::style::DocStyle;
 use crate::editor::{EditorEvent, MarkdownEditor};
 use crate::hex_view::{HexEvent, HexView};
@@ -54,6 +57,7 @@ pub struct DocView {
     words: usize,
     chars: usize,
     focus: FocusHandle,
+    find: Option<Entity<FindBar>>,
     _subs: Vec<Subscription>,
 }
 
@@ -136,6 +140,7 @@ impl DocView {
             words: 0,
             chars: 0,
             focus: cx.focus_handle(),
+            find: None,
             _subs: Vec::new(),
         }
     }
@@ -148,6 +153,10 @@ impl DocView {
         let editor = cx.new(|cx| MarkdownEditor::new(text, mode, style, cx));
         self._subs
             .push(cx.subscribe(&editor, |this, editor, ev: &EditorEvent, cx| {
+                // Escape in the text closes the search too.
+                if editor.read(cx).find.is_none() {
+                    this.find = None;
+                }
                 if let EditorEvent::Edited = ev
                     && let Body::Markdown { saved, .. } = &this.body
                 {
@@ -164,6 +173,46 @@ impl DocView {
         self.words = w;
         self.chars = c;
         Body::Markdown { editor, saved }
+    }
+
+    fn open_find(&mut self, replacing: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.markdown().cloned() else {
+            return;
+        };
+        let bar = match &self.find {
+            Some(bar) => bar.clone(),
+            None => {
+                let bar = cx.new(|cx| FindBar::new(editor.clone(), window, cx));
+                self._subs.push(cx.subscribe_in(
+                    &bar,
+                    window,
+                    |this, _, _: &FindBarEvent, window, cx| {
+                        this.find = None;
+                        if let Some(editor) = this.markdown().cloned() {
+                            editor.update(cx, |e, cx| e.close_find(cx));
+                            editor.focus_handle(cx).focus(window, cx);
+                        }
+                        cx.notify();
+                    },
+                ));
+                self.find = Some(bar.clone());
+                bar
+            }
+        };
+        let e = editor.read(cx);
+        let sel = e.selection().range();
+        let seed = (!sel.is_empty() && !e.text()[sel.clone()].contains('\n'))
+            .then(|| e.text()[sel].to_string());
+        bar.update(cx, |b, cx| b.focus(seed, replacing, window, cx));
+        cx.notify();
+    }
+
+    fn find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_find(false, window, cx);
+    }
+
+    fn find_replace(&mut self, _: &FindReplace, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_find(true, window, cx);
     }
 
     /// Typography or colours changed: re-set the editor.
@@ -321,7 +370,15 @@ impl Render for DocView {
         let muted = theme.muted_foreground;
         let page = div().size_full().track_focus(&self.focus);
         match &self.body {
-            Body::Markdown { editor, .. } => page.child(editor.clone()),
+            Body::Markdown { editor, .. } => page
+                .key_context("DocView")
+                .on_action(cx.listener(Self::find))
+                .on_action(cx.listener(Self::find_replace))
+                .relative()
+                .child(editor.clone())
+                .when_some(self.find.clone(), |d, bar| {
+                    d.child(div().absolute().top(px(12.)).right(px(28.)).child(bar))
+                }),
             Body::Text {
                 editor,
                 markdown: true,

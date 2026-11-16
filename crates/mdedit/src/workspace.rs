@@ -324,6 +324,34 @@ impl Workspace {
         .detach();
     }
 
+    fn command_palette(&mut self, _: &CommandPalette, window: &mut Window, cx: &mut Context<Self>) {
+        let markdown = self
+            .active_doc()
+            .is_some_and(|d| d.read(cx).markdown().is_some());
+        crate::palette::open_commands(markdown, window, cx);
+    }
+
+    fn quick_open(&mut self, _: &QuickOpen, window: &mut Window, cx: &mut Context<Self>) {
+        let recent = AppState::prefs(cx).recent.clone();
+        let root = self.files.read(cx).root().map(Path::to_path_buf);
+        let files = root
+            .as_deref()
+            .map(|r| project::walk_files(r, 5000))
+            .unwrap_or_default();
+        let ws = cx.entity().downgrade();
+        crate::palette::open_files(
+            recent,
+            root,
+            files,
+            move |path, window, cx| {
+                ws.update(cx, |ws, cx| ws.open_paths(vec![path], window, cx))
+                    .ok();
+            },
+            window,
+            cx,
+        );
+    }
+
     fn close_folder(&mut self, _: &CloseFolder, _: &mut Window, cx: &mut Context<Self>) {
         self.set_folder(None, cx);
     }
@@ -959,7 +987,10 @@ impl Workspace {
                     })
                     .collect();
                 let current_theme = prefs.theme().to_string();
-                menu.menu("New", Box::new(NewFile))
+                menu.menu("Command Palette…", Box::new(CommandPalette))
+                    .menu("Quick Open…", Box::new(QuickOpen))
+                    .separator()
+                    .menu("New", Box::new(NewFile))
                     .menu("Open…", Box::new(Open))
                     .menu("Open Folder…", Box::new(OpenFolder))
                     .submenu("Open Recent", window, cx, move |mut m, _, _| {
@@ -1049,6 +1080,16 @@ impl Workspace {
                     .items_center()
                     .pr(px(4.))
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
+                        Button::new("command-palette")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Search)
+                            .tooltip("Command Palette")
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(Box::new(CommandPalette), cx)
+                            }),
+                    )
                     .child(
                         Button::new("new-tab")
                             .ghost()
@@ -1438,6 +1479,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::open))
             .on_action(cx.listener(Self::open_folder))
             .on_action(cx.listener(Self::close_folder))
+            .on_action(cx.listener(Self::command_palette))
+            .on_action(cx.listener(Self::quick_open))
             .on_action(cx.listener(Self::open_recent))
             .on_action(cx.listener(Self::clear_recent))
             .on_action(cx.listener(Self::save))
@@ -1625,6 +1668,74 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         assert_eq!(ws.read_with(cx, |ws, _| ws.sidebar_open), !open);
+    }
+
+    #[gpui_kit::test]
+    fn find_steps_through_matches_and_escape_closes(cx: &mut TestAppContext) {
+        let (h, ws) = setup(cx);
+        act(cx, h, NewFile);
+        type_into_active(cx, h, &ws, "cat hat cat");
+        let editor = ws.read_with(cx, |ws, cx| {
+            ws.active_doc()
+                .unwrap()
+                .read(cx)
+                .markdown()
+                .cloned()
+                .unwrap()
+        });
+        cx.update_window(h, |_, window, cx| {
+            window.press("ctrl-home", cx);
+            window.render_frame(cx);
+            window.press("ctrl-f", cx);
+            window.render_frame(cx);
+            window.input("cat", cx);
+            window.render_frame(cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let sel = editor.read_with(cx, |e, _| e.selection().range());
+        assert_eq!(sel, 8..11, "Enter goes to the next match after the caret's");
+        cx.update_window(h, |_, window, cx| {
+            window.render_frame(cx);
+            window.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(
+            editor.read_with(cx, |e, _| e.find.is_none()),
+            "Escape closes it"
+        );
+    }
+
+    #[gpui_kit::test]
+    fn the_palette_runs_commands_on_the_editor(cx: &mut TestAppContext) {
+        let (h, ws) = setup(cx);
+        act(cx, h, NewFile);
+        type_into_active(cx, h, &ws, "word");
+        cx.update_window(h, |_, window, cx| {
+            window.render_frame(cx);
+            window.press("ctrl-a", cx);
+            window.press("ctrl-shift-p", cx);
+            window.render_frame(cx);
+            window.render_frame(cx);
+            window.input("Bold", cx);
+        })
+        .unwrap();
+        // The palette filters in the background.
+        cx.run_until_parked();
+        cx.update_window(h, |_, window, cx| {
+            window.render_frame(cx);
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let text = ws.read_with(cx, |ws, cx| {
+            let doc = ws.active_doc().unwrap().read(cx);
+            doc.markdown().unwrap().read(cx).text().to_string()
+        });
+        assert_eq!(text, "**word**");
+        assert_eq!(tabs(cx, &ws)[0].len(), 1);
     }
 
     #[gpui_kit::test]

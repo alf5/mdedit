@@ -11,6 +11,7 @@ mod doc;
 mod editor;
 mod files;
 mod hex_view;
+mod palette;
 mod single;
 mod state;
 mod theme;

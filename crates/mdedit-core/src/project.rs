@@ -169,6 +169,41 @@ pub fn read_any(path: &Path) -> Result<AnyFile, String> {
     }))
 }
 
+/// Folders Quick Open doesn't look in: hidden ones, and the usual build
+/// and dependency directories, which are large and never hand-edited.
+fn skipped(name: &str) -> bool {
+    name.starts_with('.')
+        || matches!(
+            name,
+            "node_modules" | "target" | "dist" | "build" | "__pycache__"
+        )
+}
+
+/// Every file under `root`, for Quick Open: breadth-first, so a huge
+/// subtree can't crowd out the top of the project, and at most `limit`.
+pub fn walk_files(root: &Path, limit: usize) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut queue = std::collections::VecDeque::from([root.to_path_buf()]);
+    while let Some(dir) = queue.pop_front() {
+        let Ok(entries) = list_dir(&dir) else {
+            continue;
+        };
+        for e in entries {
+            if e.dir {
+                if !skipped(&e.name) {
+                    queue.push_back(e.path);
+                }
+            } else {
+                out.push(e.path);
+                if out.len() >= limit {
+                    return out;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// `1.5 MB`, `12.0 KB`, `300 bytes`.
 pub fn human_size(bytes: u64) -> String {
     const KB: u64 = 1024;
@@ -208,6 +243,26 @@ mod tests {
         assert_eq!(image_mime(Path::new("a.jpeg")), Some("image/jpeg"));
         assert_eq!(image_mime(Path::new("icon.svg")), Some("image/svg+xml"));
         assert_eq!(image_mime(Path::new("a.rs")), None);
+    }
+
+    #[test]
+    fn walks_files_breadth_first_skipping_the_usual_suspects() {
+        let dir = scratch("walk");
+        std::fs::create_dir_all(dir.join("docs/deep")).unwrap();
+        std::fs::create_dir_all(dir.join("node_modules/x")).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join("a.md"), "").unwrap();
+        std::fs::write(dir.join("docs/b.md"), "").unwrap();
+        std::fs::write(dir.join("docs/deep/c.md"), "").unwrap();
+        std::fs::write(dir.join("node_modules/x/d.js"), "").unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "").unwrap();
+        let names: Vec<String> = walk_files(&dir, 100)
+            .iter()
+            .map(|p| p.strip_prefix(&dir).unwrap().display().to_string())
+            .collect();
+        assert_eq!(names, ["a.md", "docs/b.md", "docs/deep/c.md"]);
+        assert_eq!(walk_files(&dir, 2).len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

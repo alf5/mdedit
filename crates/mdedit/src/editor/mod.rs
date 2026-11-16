@@ -11,6 +11,7 @@
 //! Layout is per line and only for the lines on screen (`element.rs`).
 
 mod element;
+pub mod find_bar;
 pub mod style;
 
 use std::ops::Range;
@@ -1041,8 +1042,14 @@ impl MarkdownEditor {
         find.query = query;
         find.case = case;
         self.refresh_find();
-        if let Some(f) = &mut self.find {
+        // Search as you type: the first match from the selection on becomes
+        // the selection.
+        let hit = self.find.as_mut().and_then(|f| {
             f.current = find::next_match(&f.matches, self.sel.start(), true);
+            f.current.map(|i| f.matches[i].clone())
+        });
+        if let Some(r) = hit {
+            self.set_selection(Selection::new(r.start, r.end), cx);
         }
         self.autoscroll = true;
         cx.notify();

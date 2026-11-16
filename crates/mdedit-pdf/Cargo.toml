@@ -1,0 +1,15 @@
+[package]
+name = "mdedit-pdf"
+description = "mdedit's PDF export: markdown typeset with Typst"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+mdedit-core.workspace = true
+pulldown-cmark = { version = "0.13", default-features = false }
+typst = "0.15.1"
+typst-pdf = "0.15.1"
+typst-layout = "0.15.1"

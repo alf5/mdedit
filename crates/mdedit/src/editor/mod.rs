@@ -15,7 +15,7 @@ pub mod find_bar;
 mod highlight;
 mod overlays;
 pub mod style;
-mod widgets;
+pub(crate) mod widgets;
 
 use std::cell::Cell;
 use std::collections::HashMap;

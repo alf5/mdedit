@@ -65,6 +65,9 @@ type OnChange = dyn Fn(PathBuf) + Send + Sync;
 struct Shared {
     inner: Mutex<Inner>,
     on_change: Box<OnChange>,
+    /// No OS watcher: changes are found only by `check_all`. For tests,
+    /// where a watcher thread would race them.
+    passive: bool,
 }
 
 /// The change detector. Cheap to clone; every clone is the same detector.
@@ -100,6 +103,17 @@ impl Watch {
         Watch(Arc::new(Shared {
             inner: Mutex::new(Inner::default()),
             on_change: Box::new(on_change),
+            passive: false,
+        }))
+    }
+
+    /// A detector with no OS watcher behind it: it notices changes only when
+    /// `check_all` runs.
+    pub fn passive(on_change: impl Fn(PathBuf) + Send + Sync + 'static) -> Self {
+        Watch(Arc::new(Shared {
+            inner: Mutex::new(Inner::default()),
+            on_change: Box::new(on_change),
+            passive: true,
         }))
     }
 
@@ -209,7 +223,7 @@ impl Watch {
         for (p, stamp) in seeded {
             inner.files.entry(p).or_insert(stamp);
         }
-        if inner.watcher.is_none() {
+        if inner.watcher.is_none() && !self.0.passive {
             inner.watcher = start(Arc::downgrade(&self.0));
         }
         // Taken out so the watcher can be borrowed mutably alongside it.

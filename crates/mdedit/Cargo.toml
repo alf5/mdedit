@@ -7,12 +7,19 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+default = ["pdf"]
+# PDF export and printing, typeset with Typst. A large dependency: build
+# with --no-default-features to leave it out.
+pdf = ["dep:mdedit-pdf"]
+
 [[bin]]
 name = "mdedit"
 path = "src/main.rs"
 
 [dependencies]
 mdedit-core.workspace = true
+mdedit-pdf = { path = "../mdedit-pdf", optional = true }
 gpui-kit = { workspace = true, features = ["syntect"] }
 interprocess = "2.4"
 async-channel = "2"

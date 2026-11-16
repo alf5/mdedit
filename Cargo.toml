@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/mdedit-core", "crates/mdedit"]
+members = ["crates/mdedit-core", "crates/mdedit-pdf", "crates/mdedit"]
 
 [workspace.package]
 version = "2.0.0-dev"

@@ -29,7 +29,7 @@ pub(crate) type Picture = Result<(Arc<Image>, f32, f32), String>;
 
 /// The diagram renderer's fonts: the app's own, so labels are measured and
 /// outlined in the face the rest of the UI uses.
-fn fonts() -> Arc<fontdb::Database> {
+pub(crate) fn fonts() -> Arc<fontdb::Database> {
     static DB: OnceLock<Arc<fontdb::Database>> = OnceLock::new();
     DB.get_or_init(|| {
         let mut db = fontdb::Database::new();
@@ -49,6 +49,31 @@ fn hash_of(parts: &[&dyn Fn(&mut std::collections::hash_map::DefaultHasher)]) ->
         p(&mut h);
     }
     h.finish()
+}
+
+/// A palette's colours as a diagram's.
+pub(crate) fn diagram_colors(p: &mdedit_core::themes::Palette) -> Colors {
+    Colors {
+        bg: p.bg,
+        fg: p.text,
+        muted: p.text_muted,
+        line: p.text,
+        surface: p.bg_soft,
+        surface_alt: p.diagram_surface_alt,
+        border: p.diagram_border,
+        accent: p.accent,
+        critical: p.danger,
+        series: [
+            p.accent,
+            p.alert_tip,
+            p.alert_warning,
+            p.alert_important,
+            p.alert_caution,
+            p.alert_note,
+            p.text_muted,
+            p.diagram_border,
+        ],
+    }
 }
 
 /// A table command from the cell menu.
@@ -121,30 +146,8 @@ impl MarkdownEditor {
     }
 
     fn draw_diagram(&self, body: &str) -> Picture {
-        let p = &self.style.palette;
-        let colors = Colors {
-            bg: p.bg,
-            fg: p.text,
-            muted: p.text_muted,
-            line: p.text,
-            surface: p.bg_soft,
-            surface_alt: p.diagram_surface_alt,
-            border: p.diagram_border,
-            accent: p.accent,
-            critical: p.danger,
-            series: [
-                p.accent,
-                p.alert_tip,
-                p.alert_warning,
-                p.alert_important,
-                p.alert_caution,
-                p.alert_note,
-                p.text_muted,
-                p.diagram_border,
-            ],
-        };
         let opts = DrawOptions {
-            colors,
+            colors: diagram_colors(&self.style.palette),
             font_family: UI_FONT.into(),
             font_family_mono: MONO_FONT.into(),
             fontdb: fonts(),

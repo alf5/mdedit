@@ -150,9 +150,15 @@ impl Workspace {
         // Files changed underneath their tabs, reported from the watcher's
         // thread.
         let (changed_tx, changed_rx) = async_channel::unbounded::<PathBuf>();
-        let watch = Watch::new(move |p| {
+        let report = move |p| {
             let _ = changed_tx.send_blocking(p);
-        });
+        };
+        // Tests check by hand: a watcher thread would race them.
+        let watch = if cfg!(test) {
+            Watch::passive(report)
+        } else {
+            Watch::new(report)
+        };
         let changes = cx.spawn_in(window, async move |this, cx| {
             while let Ok(path) = changed_rx.recv().await {
                 if this
@@ -531,6 +537,121 @@ impl Workspace {
                 )
             },
             window,
+            cx,
+        );
+    }
+
+    /// Typeset the active document as a PDF, in the background, then
+    /// `done` with the result.
+    #[cfg(feature = "pdf")]
+    fn typeset(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        done: impl FnOnce(Result<Vec<u8>, String>, &mut Window, &mut App) + 'static,
+    ) {
+        let Some((name, md, path)) = self.active_markdown(cx) else {
+            return;
+        };
+        let p = AppState::prefs(cx);
+        let lang = std::env::var("LC_PAPER")
+            .or_else(|_| std::env::var("LANG"))
+            .unwrap_or_default();
+        let opts = mdedit_pdf::Options {
+            style: p.style,
+            numbered: p.numbered,
+            letter: ["en_US", "en_CA", "es_MX", "fr_CA"]
+                .iter()
+                .any(|l| lang.starts_with(l)),
+            fonts: theme::FONT_FILES.to_vec(),
+            base_dir: path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf),
+            // Paper is white: diagrams print in the light palette.
+            diagrams: Some(mdedit_core::mermaid::DrawOptions {
+                colors: crate::editor::widgets::diagram_colors(&themes::system_palette(false)),
+                font_family: theme::UI_FONT.into(),
+                font_family_mono: theme::MONO_FONT.into(),
+                fontdb: crate::editor::widgets::fonts(),
+            }),
+        };
+        window.push_notification(Notification::info("Typesetting…"), cx);
+        let job =
+            cx.background_spawn(async move { mdedit_pdf::markdown_to_pdf(&md, &name, &opts) });
+        cx.spawn_in(window, async move |_, cx| {
+            let result = job.await;
+            cx.update(|window, cx| done(result, window, cx)).ok();
+        })
+        .detach();
+    }
+
+    fn export_pdf(&mut self, _: &ExportPdf, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(feature = "pdf")]
+        {
+            let Some((name, _, path)) = self.active_markdown(cx) else {
+                return;
+            };
+            let stem = Path::new(&name)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Untitled".into());
+            let dir = path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+                .or_else(dirs::document_dir)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let rx = cx.prompt_for_new_path(&dir, Some(&format!("{stem}.pdf")));
+            cx.spawn_in(window, async move |this, cx| {
+                let Ok(Ok(Some(out))) = rx.await else { return };
+                this.update_in(cx, |this, window, cx| {
+                    this.typeset(window, cx, move |result, window, cx| {
+                        let result =
+                            result.and_then(|b| std::fs::write(&out, b).map_err(|e| e.to_string()));
+                        match result {
+                            Ok(()) => window.push_notification(
+                                Notification::success(format!("Exported {}", out.display())),
+                                cx,
+                            ),
+                            Err(e) => window.push_notification(
+                                Notification::error(format!("Couldn't export the PDF: {e}")),
+                                cx,
+                            ),
+                        }
+                    });
+                })
+                .ok();
+            })
+            .detach();
+        }
+        #[cfg(not(feature = "pdf"))]
+        window.push_notification(
+            Notification::warning("This build of mdedit has no PDF export."),
+            cx,
+        );
+    }
+
+    /// Print: typeset a PDF and hand it to the system's viewer, whose print
+    /// dialog does the rest (and can save to a file with any paper size).
+    fn print(&mut self, _: &Print, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(feature = "pdf")]
+        self.typeset(window, cx, |result, window, cx| match result {
+            Ok(bytes) => {
+                let path =
+                    std::env::temp_dir().join(format!("mdedit-print-{}.pdf", std::process::id()));
+                match std::fs::write(&path, bytes) {
+                    Ok(()) => cx.open_with_system(&path),
+                    Err(e) => window.push_notification(Notification::error(e.to_string()), cx),
+                }
+            }
+            Err(e) => {
+                window.push_notification(Notification::error(format!("Couldn't typeset: {e}")), cx)
+            }
+        });
+        #[cfg(not(feature = "pdf"))]
+        window.push_notification(
+            Notification::warning("This build of mdedit can't print."),
             cx,
         );
     }
@@ -1926,6 +2047,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::import_html))
             .on_action(cx.listener(Self::import_word))
             .on_action(cx.listener(Self::export_html))
+            .on_action(cx.listener(Self::export_pdf))
+            .on_action(cx.listener(Self::print))
             .on_action(cx.listener(Self::quick_open))
             .on_action(cx.listener(Self::open_recent))
             .on_action(cx.listener(Self::clear_recent))
@@ -2207,7 +2330,9 @@ mod tests {
         let editor = doc.read_with(cx, |d, _| d.markdown().cloned().unwrap());
         // Our change at the top; someone else's at the bottom.
         editor.update(cx, |e, cx| e.set_text("ONE\ntwo\nthree\n".into(), cx));
-        std::fs::write(&path, "one\ntwo\nTHREE\n").unwrap();
+        // A different size, so the change shows even within one tick of the
+        // filesystem's coarse clock.
+        std::fs::write(&path, "one\ntwo\nTHREE!\n").unwrap();
         let watch = ws.read_with(cx, |ws, _| ws.watch.clone());
         watch.check_all();
         cx.run_until_parked();
@@ -2215,7 +2340,10 @@ mod tests {
 
         // Saving now would lose their change: it doesn't happen.
         act(cx, h, Save);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "one\ntwo\nTHREE\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "one\ntwo\nTHREE!\n"
+        );
 
         cx.update_window(h, |_, window, cx| {
             ws.update(cx, |ws, cx| {
@@ -2226,7 +2354,7 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(
             editor.read_with(cx, |e, _| e.text().to_string()),
-            "ONE\ntwo\nTHREE\n"
+            "ONE\ntwo\nTHREE!\n"
         );
         assert!(!doc.read_with(cx, |d, _| d.stale));
         assert!(
@@ -2234,10 +2362,13 @@ mod tests {
             "the merge isn't saved yet"
         );
         act(cx, h, Save);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ONE\ntwo\nTHREE\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "ONE\ntwo\nTHREE!\n"
+        );
 
         // A rewrite with the same bytes is not news.
-        std::fs::write(&path, "ONE\ntwo\nTHREE\n").unwrap();
+        std::fs::write(&path, "ONE\ntwo\nTHREE!\n").unwrap();
         watch.check_all();
         cx.run_until_parked();
         assert!(!doc.read_with(cx, |d, _| d.stale));

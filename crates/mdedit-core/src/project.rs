@@ -53,7 +53,10 @@ pub fn list_dir(path: &Path) -> Result<Vec<Entry>, String> {
 pub enum Content {
     Markdown(String),
     Text(String),
-    Image { bytes: Vec<u8>, mime: &'static str },
+    Image {
+        bytes: Vec<u8>,
+        mime: &'static str,
+    },
     Binary(Vec<u8>),
     /// Past the limit for its kind; the tab says so rather than pretending
     /// the file is empty.
@@ -166,6 +169,18 @@ pub fn read_any(path: &Path) -> Result<AnyFile, String> {
     }))
 }
 
+/// `1.5 MB`, `12.0 KB`, `300 bytes`.
+pub fn human_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    match bytes {
+        b if b >= MB => format!("{:.1} MB", b as f64 / MB as f64),
+        b if b >= KB => format!("{:.1} KB", b as f64 / KB as f64),
+        1 => "1 byte".to_string(),
+        b => format!("{b} bytes"),
+    }
+}
+
 /// The path with symlinks and `..` resolved, which is how open tabs and
 /// recent files are compared. A path that can't be resolved (not saved yet,
 /// deleted) is kept as given.
@@ -193,6 +208,14 @@ mod tests {
         assert_eq!(image_mime(Path::new("a.jpeg")), Some("image/jpeg"));
         assert_eq!(image_mime(Path::new("icon.svg")), Some("image/svg+xml"));
         assert_eq!(image_mime(Path::new("a.rs")), None);
+    }
+
+    #[test]
+    fn sizes_read_naturally() {
+        assert_eq!(human_size(1), "1 byte");
+        assert_eq!(human_size(300), "300 bytes");
+        assert_eq!(human_size(1536), "1.5 KB");
+        assert_eq!(human_size(3 * 1024 * 1024), "3.0 MB");
     }
 
     #[test]
@@ -235,14 +258,23 @@ mod tests {
         std::fs::write(dir.join("c.bin"), [0u8, 1, 2, 3]).unwrap();
         std::fs::write(dir.join("d.png"), [0x89, b'P', b'N', b'G']).unwrap();
 
-        assert_eq!(read_any(&dir.join("a.md")).unwrap().content.kind(), "markdown");
+        assert_eq!(
+            read_any(&dir.join("a.md")).unwrap().content.kind(),
+            "markdown"
+        );
         let text = read_any(&dir.join("b.rs")).unwrap();
         assert_eq!(text.content, Content::Text("fn main() {}\n".into()));
         let bin = read_any(&dir.join("c.bin")).unwrap();
         assert_eq!(bin.content, Content::Binary(vec![0u8, 1, 2, 3]));
         let img = read_any(&dir.join("d.png")).unwrap();
         assert_eq!(img.name, "d.png");
-        assert!(matches!(img.content, Content::Image { mime: "image/png", .. }));
+        assert!(matches!(
+            img.content,
+            Content::Image {
+                mime: "image/png",
+                ..
+            }
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

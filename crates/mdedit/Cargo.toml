@@ -13,4 +13,13 @@ path = "src/main.rs"
 
 [dependencies]
 mdedit-core.workspace = true
-gpui-kit.workspace = true
+gpui-kit = { workspace = true, features = ["syntect"] }
+interprocess = "2.4"
+async-channel = "2"
+dirs = "6"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+gpui-kit = { workspace = true, features = ["syntect", "test-support"] }

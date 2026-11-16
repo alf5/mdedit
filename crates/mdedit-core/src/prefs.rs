@@ -154,7 +154,11 @@ impl Prefs {
         Some(Prefs {
             recent: v1.recent.into_iter().map(PathBuf::from).collect(),
             theme,
-            mode: if v1.reveal { Mode::Live } else { Mode::Rendered },
+            mode: if v1.reveal {
+                Mode::Live
+            } else {
+                Mode::Rendered
+            },
             ..Prefs::default()
         })
     }
@@ -237,8 +241,7 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("mdedit-prefs-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("mdedit-prefs-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -278,7 +281,10 @@ mod tests {
         )
         .unwrap();
         let p = Prefs::from_v1(&path).unwrap();
-        assert_eq!(p.recent, vec![PathBuf::from("/a/x.md"), PathBuf::from("/b/y.md")]);
+        assert_eq!(
+            p.recent,
+            vec![PathBuf::from("/a/x.md"), PathBuf::from("/b/y.md")]
+        );
         assert_eq!(p.mode, Mode::Live);
         assert_eq!(p.theme, "apple-dark");
 
@@ -292,7 +298,9 @@ mod tests {
     #[test]
     fn recent_moves_to_front_and_caps() {
         let mut p = Prefs::default();
-        let paths: Vec<PathBuf> = (0..12).map(|i| PathBuf::from(format!("/nope/{i}.md"))).collect();
+        let paths: Vec<PathBuf> = (0..12)
+            .map(|i| PathBuf::from(format!("/nope/{i}.md")))
+            .collect();
         p.push_recent(paths.iter().map(PathBuf::as_path));
         assert_eq!(p.recent.len(), RECENT_MAX);
         assert_eq!(p.recent[0], PathBuf::from("/nope/11.md"));

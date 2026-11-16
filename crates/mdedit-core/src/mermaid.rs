@@ -105,9 +105,9 @@ pub fn render_block(src: &str) -> String {
 fn wrap(src: &str, drawn: Result<String, String>) -> String {
     let attr = escape_attr(src);
     match drawn {
-        Ok(svg) => format!(
-            "<div class=\"{WRAPPER_CLASS}\" {SOURCE_ATTR}=\"{attr}\">\n{svg}\n</div>"
-        ),
+        Ok(svg) => {
+            format!("<div class=\"{WRAPPER_CLASS}\" {SOURCE_ATTR}=\"{attr}\">\n{svg}\n</div>")
+        }
         Err(e) => format!(
             "<div class=\"{WRAPPER_CLASS} mermaid-error\" {SOURCE_ATTR}=\"{attr}\">\n<p class=\"mermaid-error-msg\">{}</p>\
              <pre><code class=\"language-mermaid\">{}</code></pre>\n</div>",

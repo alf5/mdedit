@@ -114,11 +114,7 @@ pub fn display_title(name: &str) -> &str {
         .or_else(|| name.strip_suffix(".mkd"))
         .unwrap_or(name)
         .trim();
-    if stem.is_empty() {
-        "Untitled"
-    } else {
-        stem
-    }
+    if stem.is_empty() { "Untitled" } else { stem }
 }
 
 #[cfg(test)]

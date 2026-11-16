@@ -72,3 +72,52 @@ Arch, Wayland, RADV Vulkan). Kept here so later milestones don't relearn them.
 - `render_svg_with_metrics` returns `SvgImage{width_pt,height_pt,baseline_pt}`
   for aligning inline math to the text baseline.
 - HTML export keeps math-core's MathML.
+
+## M2 findings: the shell (gpui-kit 0.9.1)
+
+- **Dock isn't used for document tabs.** It can't veto a close (no
+  unsaved-changes prompt), can't close its last panel, has no tab context
+  menu, and can't put tabs in the title bar. `workspace.rs` draws its own
+  panes and tabs: `h_resizable` for splits, and GPUI
+  `on_drag`/`drag_over`/`on_drop` for moving tabs.
+- **Keys:** write `secondary-…` and build bindings with `KeyBinding::load`,
+  because `KeyBinding::new("secondary-…")` panics. Actions carrying data
+  need `#[derive(gpui_kit::Action)] #[action(namespace = mdedit, no_json)]`.
+- **Menus:** on Linux, `cx.set_menus` draws nothing. The ☰ button is
+  `Button::dropdown_menu(|menu, window, cx| …)`, which is rebuilt every time
+  it opens. Shortcut hints show automatically. `ContextMenuExt::context_menu`
+  works on any element that has an id.
+- **Dialogs:**
+  - `window.open_dialog(cx, |dialog, …| …)` needs gpui-kit's `Root`, which
+    `gpui_kit::open_window` adds.
+  - `on_cancel` fires on Escape and on a backdrop click, never on
+    `close_dialog`. So a button closes the dialog first and answers second.
+  - A plain `Dialog` has no buttons until you give it a `DialogFooter`.
+- **Closing:**
+  - `window.on_window_should_close` catches the window manager closing the
+    window.
+  - TitleBar's own ✕ calls `remove_window`, which skips that check, so
+    `TitleBar::on_close_window` dispatches `Quit` instead.
+  - On Linux, `cx.activate` does nothing; use `window.activate_window()`,
+    which needs an `app_id` on Wayland.
+- **Theme:** start from `ThemeConfig::default()` with only the palette's
+  colours set; the kit derives hover, list and tab shades from them.
+  - **Setting `config.highlight` replaces the syntax palette.** Start it from
+    `HighlightTheme::default_{dark,light}().style` and change only the
+    editor colours.
+- **File dialogs:** `cx.prompt_for_paths` and `prompt_for_new_path` take no
+  type filters. Await them inside
+  `cx.spawn_in(window, async move |this, cx| …)`, then call
+  `this.update_in(…)`.
+- **Linux file events:** `Application::on_open_urls` fires only on macOS.
+  On Linux, files from later launches come through `single.rs`'s socket.
+- **Text editing:** `EditorState` (with the `syntect` feature) handles
+  markdown and source until M3. `set_value` emits no `Change` event;
+  `insert` does.
+- **Tests:**
+  - Open a real rooted window with `gpui_kit::open_window` inside
+    `cx.update`.
+  - Drive it with `gpui_kit::test::TestWindowExt`: `press("ctrl-n")`,
+    `click("dont-save")`, `render_frame`.
+  - `AppState::init_ephemeral` keeps tests away from the real settings
+    file.

@@ -56,9 +56,7 @@ pub fn render(src: &str, display: bool) -> String {
         classes.push_str(DISPLAY_CLASS);
     }
     match convert(src.trim(), display) {
-        Ok(mathml) => format!(
-            "<span class=\"{classes}\" {SOURCE_ATTR}=\"{attr}\">{mathml}</span>"
-        ),
+        Ok(mathml) => format!("<span class=\"{classes}\" {SOURCE_ATTR}=\"{attr}\">{mathml}</span>"),
         Err(e) => format!(
             "<span class=\"{classes} math-error\" \
              {SOURCE_ATTR}=\"{attr}\" title=\"{}\"><code>{}</code></span>",

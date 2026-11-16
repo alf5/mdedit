@@ -103,31 +103,31 @@ impl Watch {
         }))
     }
 
-pub fn record(&self, path: &Path, content: &str) {
-    self.record_bytes(path, content.as_bytes());
-}
+    pub fn record(&self, path: &Path, content: &str) {
+        self.record_bytes(path, content.as_bytes());
+    }
 
-/// The same, for the files the editor holds as bytes rather than text.
-pub fn record_bytes(&self, path: &Path, bytes: &[u8]) {
-    let stamp = stamp_of(path, bytes);
-    let mut inner = self.0.inner.lock().unwrap();
-    inner.files.insert(path.to_path_buf(), stamp);
-    // The two agree again, so the next divergence is news even if it happens
-    // to restore the very content that was announced last time.
-    inner.announced.remove(path);
-}
+    /// The same, for the files the editor holds as bytes rather than text.
+    pub fn record_bytes(&self, path: &Path, bytes: &[u8]) {
+        let stamp = stamp_of(path, bytes);
+        let mut inner = self.0.inner.lock().unwrap();
+        inner.files.insert(path.to_path_buf(), stamp);
+        // The two agree again, so the next divergence is news even if it happens
+        // to restore the very content that was announced last time.
+        inner.announced.remove(path);
+    }
 
-/// Has `path` changed since it was last stamped? Answers `false` for a path
-/// with no stamp (never opened from disk) and for one that has been deleted —
-/// saving over a deleted file recreates it, which is not a conflict.
-pub fn changed(&self, path: &Path) -> bool {
-    let known = {
-        let inner = self.0.inner.lock().unwrap();
-        inner.files.get(path).cloned()
-    };
-    let Some(known) = known else { return false };
-    matches!(look(path, &known), Look::Changed(_))
-}
+    /// Has `path` changed since it was last stamped? Answers `false` for a path
+    /// with no stamp (never opened from disk) and for one that has been deleted —
+    /// saving over a deleted file recreates it, which is not a conflict.
+    pub fn changed(&self, path: &Path) -> bool {
+        let known = {
+            let inner = self.0.inner.lock().unwrap();
+            inner.files.get(path).cloned()
+        };
+        let Some(known) = known else { return false };
+        matches!(look(path, &known), Look::Changed(_))
+    }
 }
 
 /// What a fresh look at a file says about its stamp.
@@ -179,54 +179,54 @@ fn look(path: &Path, known: &Stamp) -> Look {
 /// lose their stamps; paths that arrive without one (which shouldn't happen —
 /// they are stamped when read) are seeded from disk.
 impl Watch {
-pub fn set_paths(&self, paths: &[PathBuf]) {
-    let wanted: HashSet<PathBuf> = paths.iter().cloned().collect();
-    let dirs: HashSet<PathBuf> = paths
-        .iter()
-        .filter_map(|p| p.parent().map(Path::to_path_buf))
-        .collect();
-    let missing: Vec<PathBuf> = {
-        let inner = self.0.inner.lock().unwrap();
-        wanted
+    pub fn set_paths(&self, paths: &[PathBuf]) {
+        let wanted: HashSet<PathBuf> = paths.iter().cloned().collect();
+        let dirs: HashSet<PathBuf> = paths
             .iter()
-            .filter(|p| !inner.files.contains_key(*p))
-            .cloned()
-            .collect()
-    };
-    // Read outside the lock: a slow filesystem must not block a save.
-    let seeded: Vec<(PathBuf, Stamp)> = missing
-        .into_iter()
-        .filter_map(|p| {
-            let bytes = std::fs::read(&p).ok()?;
-            let stamp = stamp_of(&p, &bytes);
-            Some((p, stamp))
-        })
-        .collect();
+            .filter_map(|p| p.parent().map(Path::to_path_buf))
+            .collect();
+        let missing: Vec<PathBuf> = {
+            let inner = self.0.inner.lock().unwrap();
+            wanted
+                .iter()
+                .filter(|p| !inner.files.contains_key(*p))
+                .cloned()
+                .collect()
+        };
+        // Read outside the lock: a slow filesystem must not block a save.
+        let seeded: Vec<(PathBuf, Stamp)> = missing
+            .into_iter()
+            .filter_map(|p| {
+                let bytes = std::fs::read(&p).ok()?;
+                let stamp = stamp_of(&p, &bytes);
+                Some((p, stamp))
+            })
+            .collect();
 
-    let mut inner = self.0.inner.lock().unwrap();
-    inner.files.retain(|p, _| wanted.contains(p));
-    inner.announced.retain(|p, _| wanted.contains(p));
-    for (p, stamp) in seeded {
-        inner.files.entry(p).or_insert(stamp);
-    }
-    if inner.watcher.is_none() {
-        inner.watcher = start(Arc::downgrade(&self.0));
-    }
-    // Taken out so the watcher can be borrowed mutably alongside it.
-    let old = std::mem::take(&mut inner.dirs);
-    if let Some(watcher) = inner.watcher.as_mut() {
-        for dir in old.difference(&dirs) {
-            let _ = watcher.unwatch(dir);
+        let mut inner = self.0.inner.lock().unwrap();
+        inner.files.retain(|p, _| wanted.contains(p));
+        inner.announced.retain(|p, _| wanted.contains(p));
+        for (p, stamp) in seeded {
+            inner.files.entry(p).or_insert(stamp);
         }
-        for dir in dirs.difference(&old) {
-            // A directory that can't be watched (deleted, permissions, an
-            // unsupported filesystem) just means no live notifications for
-            // it; the focus check still covers those files.
-            let _ = watcher.watch(dir, RecursiveMode::NonRecursive);
+        if inner.watcher.is_none() {
+            inner.watcher = start(Arc::downgrade(&self.0));
         }
+        // Taken out so the watcher can be borrowed mutably alongside it.
+        let old = std::mem::take(&mut inner.dirs);
+        if let Some(watcher) = inner.watcher.as_mut() {
+            for dir in old.difference(&dirs) {
+                let _ = watcher.unwatch(dir);
+            }
+            for dir in dirs.difference(&old) {
+                // A directory that can't be watched (deleted, permissions, an
+                // unsupported filesystem) just means no live notifications for
+                // it; the focus check still covers those files.
+                let _ = watcher.watch(dir, RecursiveMode::NonRecursive);
+            }
+        }
+        inner.dirs = dirs;
     }
-    inner.dirs = dirs;
-}
 }
 
 /// Could this event mean someone *wrote*? Excluding reads is not an
@@ -255,7 +255,9 @@ fn start(shared: Weak<Shared>) -> Option<RecommendedWatcher> {
         if !is_write(&event.kind) {
             return;
         }
-        let Some(shared) = shared.upgrade() else { return };
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
         // Every watched file is re-checked rather than just the event's
         // own path: one external save can arrive as create + rename +
         // remove on paths that are all temporaries, and comparing stamps
@@ -270,53 +272,53 @@ fn start(shared: Weak<Shared>) -> Option<RecommendedWatcher> {
 /// Runs on the watcher's thread and on window focus, so it must not hold the
 /// lock across its file IO.
 impl Watch {
-pub fn check_all(&self) {
-    let known: Vec<(PathBuf, Stamp)> = {
-        let inner = self.0.inner.lock().unwrap();
-        inner
-            .files
-            .iter()
-            .map(|(p, s)| (p.clone(), s.clone()))
-            .collect()
-    };
-    for (path, stamp) in known {
-        let bytes = match look(&path, &stamp) {
-            Look::Unchanged | Look::Absent => continue,
-            // Nothing to tell the app, but the fresh stat is worth
-            // keeping: it is what lets the next check stop at the stat.
-            Look::Restat(fresh) => {
-                let mut inner = self.0.inner.lock().unwrap();
-                if let Some(cur) = inner.files.get_mut(&path) {
-                    // Only if nothing re-stamped it while this was reading.
-                    if *cur == stamp {
-                        *cur = fresh;
-                    }
-                }
-                continue;
-            }
-            Look::Changed(bytes) => bytes,
+    pub fn check_all(&self) {
+        let known: Vec<(PathBuf, Stamp)> = {
+            let inner = self.0.inner.lock().unwrap();
+            inner
+                .files
+                .iter()
+                .map(|(p, s)| (p.clone(), s.clone()))
+                .collect()
         };
-        let hash = hash_bytes(&bytes);
-        // Re-check under the lock before announcing. A save that landed while
-        // this was reading has already stamped its own result, and reporting
-        // the editor's own write as an external change is worse than missing
-        // one — the next event catches a real change anyway.
-        {
-            let mut inner = self.0.inner.lock().unwrap();
-            match inner.files.get(&path) {
-                Some(cur) if cur.hash == hash => continue,
-                Some(cur) if *cur != stamp => continue,
-                Some(_) => {}
-                None => continue,
+        for (path, stamp) in known {
+            let bytes = match look(&path, &stamp) {
+                Look::Unchanged | Look::Absent => continue,
+                // Nothing to tell the app, but the fresh stat is worth
+                // keeping: it is what lets the next check stop at the stat.
+                Look::Restat(fresh) => {
+                    let mut inner = self.0.inner.lock().unwrap();
+                    if let Some(cur) = inner.files.get_mut(&path) {
+                        // Only if nothing re-stamped it while this was reading.
+                        if *cur == stamp {
+                            *cur = fresh;
+                        }
+                    }
+                    continue;
+                }
+                Look::Changed(bytes) => bytes,
+            };
+            let hash = hash_bytes(&bytes);
+            // Re-check under the lock before announcing. A save that landed while
+            // this was reading has already stamped its own result, and reporting
+            // the editor's own write as an external change is worse than missing
+            // one — the next event catches a real change anyway.
+            {
+                let mut inner = self.0.inner.lock().unwrap();
+                match inner.files.get(&path) {
+                    Some(cur) if cur.hash == hash => continue,
+                    Some(cur) if *cur != stamp => continue,
+                    Some(_) => {}
+                    None => continue,
+                }
+                // One question per divergence, however many events carried it.
+                if inner.announced.insert(path.clone(), hash) == Some(hash) {
+                    continue;
+                }
             }
-            // One question per divergence, however many events carried it.
-            if inner.announced.insert(path.clone(), hash) == Some(hash) {
-                continue;
-            }
+            (self.0.on_change)(path);
         }
-        (self.0.on_change)(path);
     }
-}
 }
 
 /// A three-way merge of the editor's text against the file's, using the last

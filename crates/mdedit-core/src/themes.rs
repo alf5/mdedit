@@ -152,10 +152,7 @@ const GITHUB_ALERTS: [&str; 5] = ["#0969da", "#1a7f37", "#8250df", "#9a6700", "#
 
 fn palette_from(decls: &HashMap<&str, &str>, base: Option<&Palette>) -> Option<Palette> {
     let get = |name: &str, fallback: Option<Rgba>| {
-        decls
-            .get(name)
-            .and_then(|v| parse_hex(v))
-            .or(fallback)
+        decls.get(name).and_then(|v| parse_hex(v)).or(fallback)
     };
     let alerts = GITHUB_ALERTS.map(|h| parse_hex(h).unwrap());
     let dark = match decls.get("color-scheme") {

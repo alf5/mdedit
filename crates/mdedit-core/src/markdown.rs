@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::iter::Peekable;
 
-use pulldown_cmark::{html, CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd, html};
 
 /// Render GitHub-flavored markdown to HTML, for export. (The app draws
 /// documents itself; this is what a standalone `.html` contains.)

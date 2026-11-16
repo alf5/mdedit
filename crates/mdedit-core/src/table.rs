@@ -172,11 +172,7 @@ pub fn sort_order(values: &[String], descending: bool) -> Vec<usize> {
         } else {
             x.to_lowercase().cmp(&y.to_lowercase())
         };
-        if descending {
-            ord.reverse()
-        } else {
-            ord
-        }
+        if descending { ord.reverse() } else { ord }
     });
     order
 }

@@ -1,0 +1,320 @@
+//! One open document: a tab's content, whatever kind of file it is.
+//!
+//! What a file *is* decides what it gets: markdown and text get an editor,
+//! images are shown, binaries get the hex editor, and a file past its size
+//! limit says so rather than pretending to be empty. Markdown is edited as
+//! source for now; the live-preview editor replaces that in M3.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use gpui_kit::component::ActiveTheme;
+use gpui_kit::component::input::{Editor, EditorState, InputEvent};
+use gpui_kit::*;
+use mdedit_core::project::{self, AnyFile, Content};
+
+use crate::hex_view::{HexEvent, HexView};
+use crate::theme::{MONO_FONT, UI_FONT};
+
+pub enum Body {
+    Text {
+        editor: Entity<EditorState>,
+        markdown: bool,
+        /// The text as last loaded or saved, which is what "modified" means.
+        saved: SharedString,
+    },
+    Image {
+        image: Option<Arc<Image>>,
+        size: u64,
+    },
+    Hex(Entity<HexView>),
+    Oversized {
+        size: u64,
+    },
+}
+
+/// Something about the tab changed: modified state, name, or content.
+pub enum DocEvent {
+    Changed,
+}
+
+pub struct DocView {
+    pub path: Option<PathBuf>,
+    /// "Untitled 2" is number 2.
+    untitled: usize,
+    pub body: Body,
+    dirty: bool,
+    words: usize,
+    chars: usize,
+    focus: FocusHandle,
+    _subs: Vec<Subscription>,
+}
+
+impl EventEmitter<DocEvent> for DocView {}
+
+impl Focusable for DocView {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        match &self.body {
+            Body::Text { editor, .. } => editor.focus_handle(cx),
+            Body::Hex(hex) => hex.focus_handle(cx),
+            _ => self.focus.clone(),
+        }
+    }
+}
+
+/// Syntax highlighting is chosen by extension; anything unknown is plain.
+fn language_for(path: Option<&Path>, markdown: bool) -> String {
+    if markdown {
+        return "markdown".into();
+    }
+    path.and_then(|p| p.extension())
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_else(|| "text".into())
+}
+
+fn image_format(mime: &str) -> Option<ImageFormat> {
+    Some(match mime {
+        "image/png" => ImageFormat::Png,
+        "image/jpeg" => ImageFormat::Jpeg,
+        "image/gif" => ImageFormat::Gif,
+        "image/webp" => ImageFormat::Webp,
+        "image/bmp" => ImageFormat::Bmp,
+        "image/x-icon" => ImageFormat::Ico,
+        "image/svg+xml" => ImageFormat::Svg,
+        _ => return None,
+    })
+}
+
+impl DocView {
+    /// A new, empty markdown document.
+    pub fn untitled(number: usize, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut doc = Self::blank(None, cx);
+        doc.untitled = number;
+        doc.body = doc.text_body(String::new(), true, window, cx);
+        doc
+    }
+
+    pub fn from_file(file: AnyFile, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut doc = Self::blank(Some(file.path.clone()), cx);
+        doc.body = match file.content {
+            Content::Markdown(text) => doc.text_body(text, true, window, cx),
+            Content::Text(text) => doc.text_body(text, false, window, cx),
+            Content::Image { bytes, mime } => Body::Image {
+                image: image_format(mime).map(|f| Arc::new(Image::from_bytes(f, bytes))),
+                size: file.size,
+            },
+            Content::Binary(bytes) => {
+                let hex = cx.new(|cx| HexView::new(bytes, cx));
+                doc._subs
+                    .push(cx.subscribe(&hex, |this, hex, _: &HexEvent, cx| {
+                        this.dirty = hex.read(cx).is_dirty();
+                        cx.emit(DocEvent::Changed);
+                        cx.notify();
+                    }));
+                Body::Hex(hex)
+            }
+            Content::Oversized => Body::Oversized { size: file.size },
+        };
+        doc
+    }
+
+    fn blank(path: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
+        DocView {
+            path,
+            untitled: 0,
+            body: Body::Oversized { size: 0 },
+            dirty: false,
+            words: 0,
+            chars: 0,
+            focus: cx.focus_handle(),
+            _subs: Vec::new(),
+        }
+    }
+
+    fn text_body(
+        &mut self,
+        text: String,
+        markdown: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Body {
+        let language = language_for(self.path.as_deref(), markdown);
+        let plain = markdown || language == "txt" || language == "text";
+        let saved: SharedString = text.into();
+        let editor = cx.new(|cx| {
+            EditorState::new(window, cx)
+                .language(language)
+                .line_number(!plain)
+                .soft_wrap(plain)
+                .folding(!plain)
+                .default_value(saved.clone())
+        });
+        self._subs
+            .push(cx.subscribe(&editor, |this, editor, ev: &InputEvent, cx| {
+                if let InputEvent::Change = ev {
+                    this.text_changed(&editor, cx);
+                }
+            }));
+        self.count(&saved);
+        Body::Text {
+            editor,
+            markdown,
+            saved,
+        }
+    }
+
+    fn text_changed(&mut self, editor: &Entity<EditorState>, cx: &mut Context<Self>) {
+        let value = editor.read(cx).value();
+        if let Body::Text { saved, .. } = &self.body {
+            self.dirty = value != *saved;
+        }
+        self.count(&value);
+        cx.emit(DocEvent::Changed);
+        cx.notify();
+    }
+
+    fn count(&mut self, text: &str) {
+        self.words = text.split_whitespace().count();
+        self.chars = text.chars().count();
+    }
+
+    pub fn name(&self) -> String {
+        match &self.path {
+            Some(p) => project::file_name_of(p),
+            None if self.untitled > 1 => format!("Untitled {}", self.untitled),
+            None => "Untitled".into(),
+        }
+    }
+
+    pub fn untitled_number(&self) -> usize {
+        self.untitled
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Text can be saved anywhere; a binary only back where it came from.
+    pub fn can_save_as(&self) -> bool {
+        matches!(self.body, Body::Text { .. })
+    }
+
+    pub fn can_save(&self) -> bool {
+        matches!(self.body, Body::Text { .. } | Body::Hex(_))
+    }
+
+    /// Write the document to `path`, which becomes its path.
+    pub fn write_to(&mut self, path: &Path, cx: &mut Context<Self>) -> Result<(), String> {
+        match &mut self.body {
+            Body::Text { editor, saved, .. } => {
+                let text = editor.read(cx).value();
+                std::fs::write(path, text.as_bytes()).map_err(|e| e.to_string())?;
+                *saved = text;
+            }
+            Body::Hex(hex) => {
+                let bytes = hex.read(cx).doc.bytes().to_vec();
+                std::fs::write(path, &bytes).map_err(|e| e.to_string())?;
+                hex.update(cx, |h, _| h.mark_saved());
+            }
+            _ => return Err("This tab has nothing to save.".into()),
+        }
+        self.path = Some(project::canonical(path));
+        self.dirty = false;
+        cx.emit(DocEvent::Changed);
+        cx.notify();
+        Ok(())
+    }
+
+    /// The status bar's facts about this document, left to right.
+    pub fn status(&self, cx: &App) -> Vec<SharedString> {
+        match &self.body {
+            Body::Text { markdown, .. } => vec![
+                format!("{} words", self.words).into(),
+                format!("{} characters", self.chars).into(),
+                if *markdown { "Markdown" } else { "Text" }.into(),
+            ],
+            Body::Image { size, .. } => vec![project::human_size(*size).into()],
+            Body::Hex(hex) => {
+                let hex = hex.read(cx);
+                vec![
+                    project::human_size(hex.doc.len() as u64).into(),
+                    format!("0x{:08x}", hex.cursor()).into(),
+                ]
+            }
+            Body::Oversized { size } => vec![project::human_size(*size).into()],
+        }
+    }
+
+    pub fn hex(&self) -> Option<&Entity<HexView>> {
+        match &self.body {
+            Body::Hex(hex) => Some(hex),
+            _ => None,
+        }
+    }
+}
+
+impl Render for DocView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let page = div().size_full().track_focus(&self.focus);
+        match &self.body {
+            Body::Text {
+                editor,
+                markdown: true,
+                ..
+            } => page.flex().justify_center().child(
+                div().size_full().max_w(px(860.)).px(px(24.)).child(
+                    Editor::new(editor)
+                        .bordered(false)
+                        .size_full()
+                        .font_family(MONO_FONT)
+                        .text_size(px(14.)),
+                ),
+            ),
+            Body::Text { editor, .. } => page.child(
+                Editor::new(editor)
+                    .bordered(false)
+                    .size_full()
+                    .font_family(MONO_FONT)
+                    .text_size(px(13.)),
+            ),
+            Body::Image {
+                image: Some(image), ..
+            } => page
+                .flex()
+                .items_center()
+                .justify_center()
+                .p(px(24.))
+                .child(
+                    img(image.clone())
+                        .max_w_full()
+                        .max_h_full()
+                        .object_fit(ObjectFit::ScaleDown),
+                ),
+            Body::Image { image: None, .. } => page
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(muted)
+                .child("mdedit can't display this kind of image."),
+            Body::Hex(hex) => page.child(hex.clone()),
+            Body::Oversized { size } => {
+                page.flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(6.))
+                    .font_family(UI_FONT)
+                    .child(div().text_lg().child(format!(
+                        "This file is too large to open ({}).",
+                        project::human_size(*size)
+                    )))
+                    .child(div().text_color(muted).child(
+                        "mdedit opens text and binaries up to 1 MB, and images up to 16 MB.",
+                    ))
+            }
+        }
+    }
+}

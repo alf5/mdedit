@@ -702,3 +702,44 @@ fn inline_formulas_are_pictures_until_the_caret_goes_in(cx: &mut TestAppContext)
     assert_eq!(ed.read_with(cx, |e, _| e.selection().head), end - 1);
     assert_eq!(text(cx, &ed), doc);
 }
+
+#[gpui_kit::test]
+fn a_table_cells_formulas_are_pictures_too(cx: &mut TestAppContext) {
+    let doc =
+        "Before\n\n| Law | Formula |\n| --- | --- |\n| Euler | $e^{i\\pi} + 1 = 0$ |\n\nAfter\n";
+    let (h, ed) = open(cx, doc, Mode::Rendered);
+    let cell = |cx: &mut TestAppContext| {
+        ed.read_with(cx, |e, _| {
+            let (_, _, l) = e
+                .geometry
+                .lines
+                .iter()
+                .find(|(_, _, l)| l.grid.is_some())
+                .cloned()
+                .expect("the table's on screen");
+            let g = l.grid.as_ref().unwrap();
+            let c = g.cells.last().unwrap();
+            (
+                c.display.text.clone(),
+                c.maths.len(),
+                g.pictures(gpui_kit::point(gpui_kit::px(0.), gpui_kit::px(0.)))
+                    .len(),
+            )
+        })
+    };
+    let (shown, maths, placed) = cell(cx);
+    assert!(!shown.contains('$'), "{shown:?}");
+    assert_eq!((maths, placed), (1, 1));
+    // Right from just before it: its source opens.
+    let at = doc.find('$').unwrap();
+    caret(cx, &ed, at);
+    keys(cx, h, &["right"]);
+    assert_eq!(ed.read_with(cx, |e, _| e.selection().head), at + 1);
+    let (shown, maths, _) = cell(cx);
+    assert_eq!((shown.as_str(), maths), ("$e^{i\\pi} + 1 = 0$", 0));
+    // Out the other side: a picture again.
+    let end = doc.rfind('$').unwrap() + 1;
+    caret(cx, &ed, end);
+    assert_eq!(cell(cx).1, 1);
+    assert_eq!(text(cx, &ed), doc);
+}

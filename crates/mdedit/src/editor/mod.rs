@@ -873,6 +873,36 @@ impl MarkdownEditor {
         out
     }
 
+    /// The inline formulas in source range `src` that are drawn, at text
+    /// size `size`: each one's room and picture. The one the caret's in
+    /// isn't, nor one that can't be drawn.
+    pub(crate) fn formulas_in(
+        &mut self,
+        src: Range<usize>,
+        size: f32,
+        window: &mut Window,
+    ) -> HashMap<Range<usize>, (String, InlinePicture)> {
+        // They're in source order.
+        let from = self.syntax.maths.partition_point(|f| f.start < src.start);
+        let formulas: Vec<Range<usize>> = self.syntax.maths[from..]
+            .iter()
+            .take_while(|f| f.start < src.end)
+            .filter(|f| f.end <= src.end)
+            .filter(|f| Some(*f) != self.math_open.as_ref())
+            .cloned()
+            .collect();
+        let mut drawn = HashMap::new();
+        for f in formulas {
+            let body = self.text[f.clone()].trim_matches('$').to_string();
+            let picture = self.inline_picture(&body, size);
+            if let Ok((_, s, _)) = &picture {
+                let room = self.room(s.width, px(size), window);
+                drawn.insert(f, (room, picture));
+            }
+        }
+        drawn
+    }
+
     /// How many `$`s open (and close) the formula at `f`.
     fn math_delims(&self, f: &Range<usize>) -> usize {
         self.text[f.clone()]
@@ -886,7 +916,9 @@ impl MarkdownEditor {
     fn formula_at(&self, ix: usize, layout: &LineLayout, p: Point<Pixels>) -> Option<Range<usize>> {
         let (_, origin, _) = self.geometry.lines.iter().find(|(i, ..)| *i == ix)?;
         let width = self.content_w? - layout.indent;
-        layout.maths.iter().find_map(|(range, ..)| {
+        let cells = layout.grid.iter().flat_map(|g| &g.cells);
+        let maths = layout.maths.iter().chain(cells.flat_map(|c| &c.maths));
+        maths.into_iter().find_map(|(range, ..)| {
             let r = layout
                 .rects(*origin, range.start, range.end, false, width)
                 .into_iter()
@@ -1013,27 +1045,12 @@ impl MarkdownEditor {
         }
         // Inline formulas: pictures, each in room held by spaces (the one
         // the caret's in shows its source).
-        let mut drawn: HashMap<Range<usize>, (String, InlinePicture)> = HashMap::new();
-        if self.rich() && self.reveal_of(ix) == Reveal::Hide {
-            let src = self.row_range(ix);
+        let drawn = if self.rich() && self.reveal_of(ix) == Reveal::Hide {
             let (size, _) = self.style.metrics(line.kind, self.mode);
-            let formulas: Vec<Range<usize>> = self
-                .syntax
-                .maths
-                .iter()
-                .filter(|f| src.start <= f.start && f.end <= src.end)
-                .filter(|f| Some(*f) != self.math_open.as_ref())
-                .cloned()
-                .collect();
-            for f in formulas {
-                let body = self.text[f.clone()].trim_matches('$').to_string();
-                let picture = self.inline_picture(&body, size);
-                if let Ok((_, s, _)) = &picture {
-                    let room = self.room(s.width, px(size), window);
-                    drawn.insert(f, (room, picture));
-                }
-            }
-        }
+            self.formulas_in(self.row_range(ix), size, window)
+        } else {
+            HashMap::new()
+        };
         let hook = |f: Range<usize>| drawn.get(&f).map(|(room, _)| room.clone());
         let display = display::display_row_with(
             &self.text,
@@ -1163,6 +1180,14 @@ impl MarkdownEditor {
                 pad_bottom = px(CARD_PAD_Y);
             }
         }
+        // Room for formulas taller than the line.
+        let (above, below) = grid::overflow(
+            &shaped,
+            lh,
+            maths.iter().map(|(r, _, s, base)| (r.start, *s, *base)),
+        );
+        pad_top += above;
+        pad_bottom += below;
         let text_h = shaped.size(lh).height;
         let height = match line.kind {
             LineKind::FenceOpen if header => lh,
@@ -1335,6 +1360,11 @@ impl MarkdownEditor {
                     || (r.role == Role::Markup && !source && !heading)
                 {
                     f.style = FontStyle::Italic;
+                }
+                if r.role == Role::Math {
+                    // A formula's room is measured upright and regular.
+                    f.weight = FontWeight::NORMAL;
+                    f.style = FontStyle::Normal;
                 }
                 let link = display::has(r.style, display::LINK | display::IMAGE);
                 let color = match r.role {

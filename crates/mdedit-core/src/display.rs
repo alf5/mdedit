@@ -558,6 +558,12 @@ pub fn display_row_with(
 /// in the document. A cell holds only inline markdown, so anything that
 /// would read as a block on its own (`# x`, `- x`) is shown as it is.
 pub fn fragment(text: &str, at: usize, reveal: Reveal) -> DisplayLine {
+    fragment_with(text, at, reveal, None)
+}
+
+/// [`fragment`], with inline formulas drawn as `math` says (it's given
+/// their ranges in the document).
+pub fn fragment_with(text: &str, at: usize, reveal: Reveal, math: Option<MathHook>) -> DisplayLine {
     // Rendered, a `<br>` breaks the line; each stretch between is drawn on
     // its own.
     let breaks = if reveal == Reveal::Hide {
@@ -566,7 +572,7 @@ pub fn fragment(text: &str, at: usize, reveal: Reveal) -> DisplayLine {
         Vec::new()
     };
     if breaks.is_empty() {
-        return fragment_piece(text, at, reveal);
+        return fragment_piece(text, at, reveal, math);
     }
     let mut out = DisplayLine {
         source: at..at + text.len(),
@@ -576,12 +582,15 @@ pub fn fragment(text: &str, at: usize, reveal: Reveal) -> DisplayLine {
     for br in breaks {
         append(
             &mut out,
-            fragment_piece(&text[start..br.start], at + start, reveal),
+            fragment_piece(&text[start..br.start], at + start, reveal, math),
         );
         out.push("\n", at + br.start..at + br.end, false, 0, Role::Break);
         start = br.end;
     }
-    append(&mut out, fragment_piece(&text[start..], at + start, reveal));
+    append(
+        &mut out,
+        fragment_piece(&text[start..], at + start, reveal, math),
+    );
     out
 }
 
@@ -630,7 +639,7 @@ fn append(out: &mut DisplayLine, piece: DisplayLine) {
     }
 }
 
-fn fragment_piece(text: &str, at: usize, reveal: Reveal) -> DisplayLine {
+fn fragment_piece(text: &str, at: usize, reveal: Reveal, math: Option<MathHook>) -> DisplayLine {
     let plain = |text: &str| {
         let mut out = DisplayLine {
             source: at..at + text.len(),
@@ -650,7 +659,10 @@ fn fragment_piece(text: &str, at: usize, reveal: Reveal) -> DisplayLine {
     if s.lines.len() != 1 || s.lines[0].kind != LineKind::Paragraph {
         return plain(text);
     }
-    let mut out = display_row(text, &s, 0..1, reveal);
+    // The piece is parsed on its own: its formulas are where it is.
+    let shifted = math.map(|hook| move |f: Range<usize>| hook(f.start + at..f.end + at));
+    let local = shifted.as_ref().map(|h| h as MathHook);
+    let mut out = display_row_with(text, &s, 0..1, reveal, local);
     for seg in &mut out.segs {
         seg.source = seg.source.start + at..seg.source.end + at;
     }
@@ -791,6 +803,32 @@ mod tests {
         assert_eq!(show(t, Reveal::Hide), ["Inline: e^x done"]);
         // A paragraph that's only a formula is a display one, not inline.
         assert!(parse("$$x$$").maths.is_empty());
+    }
+
+    #[test]
+    fn a_table_cell_draws_its_formulas_too() {
+        // The cell `a $x^2$ b<br>$y$` starts at 100 in the document; the
+        // hook is asked about formulas where they are there.
+        let cell = "a $x^2$ b<br>$y$";
+        let asked = std::cell::RefCell::new(Vec::new());
+        let room = |f: Range<usize>| {
+            asked.borrow_mut().push(f.clone());
+            (f.start == 102).then(|| "··".to_string())
+        };
+        let d = fragment_with(cell, 100, Reveal::Hide, Some(&room));
+        {
+            let asked = asked.borrow();
+            assert!(asked.contains(&(102..107)) && asked.contains(&(113..116)));
+            assert!(asked.iter().all(|f| *f == (102..107) || *f == (113..116)));
+        }
+        // `$x^2$` drawn; `$y$` (the hook said no) shown as written.
+        assert_eq!(d.text, "a ·· b\n$y$");
+        assert_eq!(d.role_at(2), Role::Math);
+        assert_eq!(d.source_at(2), Some(102..107));
+        assert_eq!(d.to_source(2 + "··".len()), 107);
+        // Shown, nothing's drawn.
+        let d = fragment_with(cell, 100, Reveal::Show, Some(&room));
+        assert_eq!(d.text, cell);
     }
 
     #[test]

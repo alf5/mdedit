@@ -4,6 +4,7 @@
 //! grid is a cell's start (`base`) plus an offset in that cell's text; one
 //! extra between cells keeps every offset in exactly one cell.
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 use gpui_kit::*;
@@ -12,7 +13,7 @@ use mdedit_core::prefs::Mode;
 use mdedit_core::syntax::LineKind;
 use mdedit_core::table::{Align, TableModel};
 
-use super::MarkdownEditor;
+use super::{InlineMath, MarkdownEditor};
 
 /// Room above a table for its column grips, and below it for the add-row
 /// rail.
@@ -44,6 +45,9 @@ pub(crate) struct GridCell {
     /// Where the cell's text starts, relative to the row's box.
     pub origin: Point<Pixels>,
     pub wrap: Pixels,
+    /// Its inline formulas, where each is in the grid's display text, and
+    /// its picture.
+    pub maths: Vec<InlineMath>,
 }
 
 impl GridCell {
@@ -326,6 +330,29 @@ impl Grid {
         self.index_in(k, point(cell.origin.x + x, y))
     }
 
+    /// Where each inline formula's picture goes, the grid drawn at
+    /// `origin`: on its line's baseline, in the middle of its room.
+    pub fn pictures(&self, origin: Point<Pixels>) -> Vec<(Point<Pixels>, &InlineMath)> {
+        let lh = self.line_height;
+        let mut out = Vec::new();
+        for cell in &self.cells {
+            for m in &cell.maths {
+                let (range, _, s, base) = m;
+                let local = range.start - cell.base;
+                let Some(line) = cell.lines.get(cell.line_of(local)) else {
+                    continue;
+                };
+                let (a, b) = (cell.pos(local, lh), cell.pos(range.end - cell.base, lh));
+                let metrics = &line.shaped.unwrapped_layout;
+                let baseline = a.y + (lh - metrics.ascent - metrics.descent) / 2. + metrics.ascent;
+                let room = if b.y == a.y { b.x - a.x } else { s.width };
+                let x = a.x + (room - s.width) / 2.;
+                out.push((origin + cell.origin + point(x, baseline - *base), m));
+            }
+        }
+        out
+    }
+
     /// Rectangles covering display range `a..b`, cell by cell.
     pub fn rects(&self, origin: Point<Pixels>, a: usize, b: usize) -> Vec<Bounds<Pixels>> {
         let mut out = Vec::new();
@@ -343,6 +370,35 @@ impl Grid {
         }
         out
     }
+}
+
+/// How far inline formulas' pictures reach above a (possibly wrapped)
+/// line's first row and below its last, sat on its baseline: the room to
+/// leave round it, as a browser grows a line for what's in it. Each
+/// formula is its offset in the line, its picture's size and how far down
+/// the picture its baseline is.
+pub(crate) fn overflow(
+    shaped: &WrappedLine,
+    lh: Pixels,
+    maths: impl IntoIterator<Item = (usize, Size<Pixels>, Pixels)>,
+) -> (Pixels, Pixels) {
+    // Clear of the line next to it by a pixel.
+    const GAP: f32 = 1.;
+    let m = &shaped.unwrapped_layout;
+    let baseline = (lh - m.ascent - m.descent) / 2. + m.ascent;
+    let last = shaped.size(lh).height - lh;
+    let (mut above, mut below) = (px(0.), px(0.));
+    for (at, s, base) in maths {
+        let row = shaped.position_for_index(at, lh).map_or(px(0.), |p| p.y);
+        let top = baseline - base;
+        if row <= px(0.) {
+            above = super::max(above, px(GAP) - top);
+        }
+        if row >= last {
+            below = super::max(below, top + s.height + px(GAP) - lh);
+        }
+    }
+    (above, below)
 }
 
 /// Rectangles covering `a..b` of a (possibly wrapped) line drawn at
@@ -428,7 +484,7 @@ impl MarkdownEditor {
 
     /// Lay out table `w` as a grid `width` wide at most.
     pub(crate) fn layout_grid(
-        &self,
+        &mut self,
         w: usize,
         width: Pixels,
         caret: Option<usize>,
@@ -450,14 +506,37 @@ impl MarkdownEditor {
         for (r, row) in model.cells.iter().enumerate() {
             let mut out = Vec::with_capacity(row.len());
             for (c, range) in row.iter().enumerate().take(cols) {
-                let text = &self.text[range.clone()];
                 let here = caret.is_some_and(|p| range.start <= p && p <= range.end);
                 let reveal = if live && here {
                     Reveal::Show
                 } else {
                     Reveal::Hide
                 };
-                let d = display::fragment(text, range.start, reveal);
+                // Its formulas as pictures, each in room held by spaces
+                // (the one the caret's in shows its source).
+                let drawn = if reveal == Reveal::Hide {
+                    self.formulas_in(range.clone(), f32::from(size), window)
+                } else {
+                    HashMap::new()
+                };
+                let hook = |f: Range<usize>| drawn.get(&f).map(|(room, _)| room.clone());
+                let text = &self.text[range.clone()];
+                let d = display::fragment_with(
+                    text,
+                    range.start,
+                    reveal,
+                    (reveal == Reveal::Hide).then_some(&hook as display::MathHook),
+                );
+                let maths: Vec<InlineMath> = d
+                    .segs
+                    .iter()
+                    .filter(|seg| !seg.copy)
+                    .filter_map(|seg| {
+                        let (_, picture) = drawn.get(&seg.source)?;
+                        let (image, s, base) = picture.as_ref().ok()?;
+                        Some((seg.display.clone(), image.clone(), *s, *base))
+                    })
+                    .collect();
                 let mut runs = self.text_runs(&d, LineKind::Paragraph, 0, (None, false), false);
                 if sans {
                     for (run, src) in runs.iter_mut().zip(&d.runs) {
@@ -470,8 +549,11 @@ impl MarkdownEditor {
                     }
                 }
                 if r == 0 {
-                    for run in &mut runs {
-                        run.font.weight = FontWeight::SEMIBOLD;
+                    for (run, src) in runs.iter_mut().zip(&d.runs) {
+                        // A formula's room is measured upright and regular.
+                        if src.role != Role::Math {
+                            run.font.weight = FontWeight::SEMIBOLD;
+                        }
                     }
                 }
                 let widest = window
@@ -486,7 +568,7 @@ impl MarkdownEditor {
                     .unwrap_or(0.);
                 let wide = widest.ceil() + PAD_X * 2. + 2.;
                 natural[c] = natural[c].max(wide);
-                out.push((range.clone(), d, runs));
+                out.push((range.clone(), d, runs, maths));
             }
             prepared.push(out);
         }
@@ -502,7 +584,7 @@ impl MarkdownEditor {
         for (r, row) in prepared.into_iter().enumerate() {
             let mut tallest = lh;
             let first = cells.len();
-            for (c, (_, d, runs)) in row.into_iter().enumerate() {
+            for (c, (_, d, runs, maths)) in row.into_iter().enumerate() {
                 let wrap = super::max(widths[c] - px(PAD_X * 2.), px(8.));
                 let shaped = window
                     .text_system()
@@ -515,7 +597,9 @@ impl MarkdownEditor {
                 let align = model.aligns.get(c).copied().unwrap_or(Align::None);
                 let mut y = px(0.);
                 let mut lines = Vec::with_capacity(shaped.len());
-                for (shaped, start) in shaped.into_iter().zip(starts) {
+                let mut ends: Vec<usize> = starts.iter().skip(1).map(|s| s - 1).collect();
+                ends.push(d.text.len());
+                for ((shaped, start), end) in shaped.into_iter().zip(starts).zip(ends) {
                     let spare = wrap - shaped.width();
                     let x = match align {
                         _ if spare <= px(0.) => px(0.),
@@ -524,12 +608,18 @@ impl MarkdownEditor {
                         _ => px(0.),
                     };
                     let h = shaped.size(lh).height;
+                    // Room for formulas taller than the line.
+                    let here = maths
+                        .iter()
+                        .filter(|(r, ..)| start <= r.start && r.start < end.max(start + 1))
+                        .map(|(r, _, s, b)| (r.start - start, *s, *b));
+                    let (above, below) = overflow(&shaped, lh, here);
                     lines.push(CellLine {
                         start,
-                        at: point(x, y),
+                        at: point(x, y + above),
                         shaped,
                     });
-                    y += super::max(h, lh);
+                    y += super::max(h, lh) + above + below;
                 }
                 let height = super::max(y, lh);
                 tallest = super::max(tallest, height);
@@ -543,6 +633,10 @@ impl MarkdownEditor {
                     base,
                     origin: point(col_x[c] + px(PAD_X), px(0.)),
                     wrap,
+                    maths: maths
+                        .into_iter()
+                        .map(|(r, image, s, b)| (r.start + base..r.end + base, image, s, b))
+                        .collect(),
                 });
                 base += len + 1;
             }

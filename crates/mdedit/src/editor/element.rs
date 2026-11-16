@@ -194,6 +194,15 @@ impl MarkdownEditor {
                     el.prepaint_at(at, window, cx);
                     widgets.push(el);
                 }
+                // And a table's, in its cells.
+                if let Some(g) = &layout.grid {
+                    for (at, (_, image, s, _)) in g.pictures(origin) {
+                        let mut el = img(image.clone()).w(s.width).h(s.height).into_any_element();
+                        el.layout_as_root(s.map(AvailableSpace::Definite), window, cx);
+                        el.prepaint_at(at, window, cx);
+                        widgets.push(el);
+                    }
+                }
                 lines.push((ix, origin, layout.clone()));
                 y += layout.height.get();
             } else {

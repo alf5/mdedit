@@ -62,7 +62,9 @@ nothing is converted back and forth behind your back.
   - A ```` ```mermaid ```` fence draws as a diagram, using
     [bezel-mermaid](https://crates.io/crates/bezel-mermaid), a pure-Rust port
     of [Pele](https://pele.run).
-  - `$…$` and `$$…$$` draw as formulas. A lone `$5` stays a price.
+  - `$…$` and `$$…$$` draw as formulas, `$…$` in table cells too. A lone
+    `$5` stays a price. A line grows to fit a tall formula, such as a
+    fraction.
   - Click a diagram or a display formula to edit its source with a live
     preview beneath it. An inline formula shows its source while the caret
     is in it: click it, or arrow into it.

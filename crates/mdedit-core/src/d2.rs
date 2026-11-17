@@ -39,10 +39,38 @@ pub fn draw(src: &str, dark: bool, opts: &DrawOptions) -> Result<Diagram, String
     })
 }
 
+/// `svg` with every `href` that isn't a web, mail, relative or `#` link
+/// emptied: a D2 `link` or `icon` of `javascript:` mustn't reach a page.
+fn safe_links(svg: &str) -> String {
+    let mut out = String::with_capacity(svg.len());
+    let mut rest = svg;
+    while let Some(i) = rest.find("href=\"") {
+        let (head, tail) = rest.split_at(i + 6);
+        out.push_str(head);
+        let end = tail.find('"').unwrap_or(tail.len());
+        let url = &tail[..end];
+        let lower = url.trim().to_ascii_lowercase();
+        let scheme = lower
+            .split_once(':')
+            .map(|(s, _)| s)
+            .filter(|s| !s.contains(['/', '?', '#']));
+        let ok = match scheme {
+            None => true,
+            Some(s) => matches!(s, "http" | "https" | "mailto"),
+        };
+        if ok {
+            out.push_str(url);
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// An exported page's drawing, with live text; a failure keeps the source.
 pub fn render_block(src: &str) -> String {
     let attr = crate::mermaid::escape_attr(src);
-    match render(src, false) {
+    match render(src, false).map(|svg| safe_links(&svg)) {
         Ok(svg) => format!("<div class=\"d2-diagram\" data-d2=\"{attr}\">\n{svg}\n</div>"),
         Err(e) => format!(
             "<div class=\"d2-diagram mermaid-error\" data-d2=\"{attr}\">\n<p class=\"mermaid-error-msg\">{}</p>\
@@ -64,5 +92,13 @@ mod tests {
         let err = render("a: {\n", false).unwrap_err();
         assert!(err.contains("line"), "{err}");
         assert!(render_block("x -> y").contains("data-d2=\"x -&gt; y\""));
+        assert_eq!(
+            safe_links(
+                r#"<a href="javascript:alert(1)"><image xlink:href="https://x.y/i.png"/><a href="notes/b.md#top">"#
+            ),
+            r#"<a href=""><image xlink:href="https://x.y/i.png"/><a href="notes/b.md#top">"#
+        );
+        let page = render_block("a: {link: \"javascript:alert(1)\"}");
+        assert!(!page.contains("href=\"javascript"), "{page}");
     }
 }

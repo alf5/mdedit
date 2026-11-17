@@ -500,8 +500,22 @@ pub fn rows(text: &str, syntax: &Syntax, rich: bool, open: Option<usize>) -> Vec
     out
 }
 
+/// `rows` without the rows folded away: those starting on a hidden line
+/// (`hidden` is sorted, as `fold::hidden` gives it).
+pub fn hide(rows: Vec<Row>, hidden: &[Range<usize>]) -> Vec<Row> {
+    if hidden.is_empty() {
+        return rows;
+    }
+    rows.into_iter()
+        .filter(|r| {
+            let i = hidden.partition_point(|h| h.end <= r.lines.start);
+            hidden.get(i).is_none_or(|h| !h.contains(&r.lines.start))
+        })
+        .collect()
+}
+
 /// Whether line `i` starts a list item (its marker is the first markup).
-fn starts_item(syntax: &Syntax, i: usize) -> bool {
+pub(crate) fn starts_item(syntax: &Syntax, i: usize) -> bool {
     let l = &syntax.lines[i];
     syntax.markup_in(l.range.clone()).any(|m| {
         matches!(m.kind, MarkupKind::Bullet | MarkupKind::Number) && m.range.start >= l.range.start

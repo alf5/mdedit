@@ -649,24 +649,8 @@ pub fn then_renumber(text: &str, change: Change) -> Change {
         map_pos(change.selection.head, &fix, true),
     );
     crate::buffer::apply(&mut after, &fix);
-    // The one edit that turns `text` into `after`.
-    let pre = text
-        .char_indices()
-        .zip(after.chars())
-        .find(|((_, a), b)| a != b)
-        .map_or(text.len().min(after.len()), |((i, _), _)| i);
-    let suf = text[pre..]
-        .chars()
-        .rev()
-        .zip(after[pre..].chars().rev())
-        .take_while(|(a, b)| a == b)
-        .map(|(a, _)| a.len_utf8())
-        .sum::<usize>();
     Change {
-        edits: vec![Edit::replace(
-            pre..text.len() - suf,
-            &after[pre..after.len() - suf],
-        )],
+        edits: vec![crate::buffer::diff(text, &after)],
         selection,
     }
 }

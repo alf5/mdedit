@@ -54,6 +54,15 @@ pub(crate) struct Frame {
     /// Pointer shapes over the table controls, and for a drag in progress.
     cursors: Vec<(Hitbox, CursorStyle)>,
     drag_cursor: Option<CursorStyle>,
+    /// Fold chevrons, and the `…` after a folded block's head.
+    folds: Vec<FoldMark>,
+}
+
+pub(crate) struct FoldMark {
+    bounds: Bounds<Pixels>,
+    hitbox: Hitbox,
+    folded: bool,
+    pill: Option<(Bounds<Pixels>, Hitbox)>,
 }
 
 impl IntoElement for EditorElement {
@@ -95,6 +104,53 @@ impl Task {
         if let Ok(path) = tick.build() {
             window.paint_path(path, self.page);
         }
+    }
+}
+
+impl MarkdownEditor {
+    /// The chevrons of the foldable rows on screen (a folded one always
+    /// shows; an open one when the pointer is on its row), and a folded
+    /// block's `…`. Both are remembered for the press that toggles them.
+    fn fold_marks(
+        &mut self,
+        lines: &[Placed],
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+    ) -> Vec<FoldMark> {
+        self.fold_buttons.clear();
+        let mut out = Vec::new();
+        for (ix, origin, l) in lines {
+            let Some((head, folded)) = self.fold_mark(*ix) else {
+                continue;
+            };
+            let side = px(14.);
+            let gutter = l.gutter.as_ref().map_or(px(0.), |g| g.width() + px(8.));
+            let x = max(
+                origin.x + l.indent - gutter - side - px(6.),
+                bounds.left() + px(2.),
+            );
+            let y = origin.y + l.pad_top + (l.line_height - side) / 2.;
+            let b = Bounds::new(point(x, y), size(side, side));
+            let hitbox = window.insert_hitbox(b, HitboxBehavior::Normal);
+            self.fold_buttons.push((b, head));
+            let pill = folded.then(|| {
+                let end = l.point(l.len());
+                let h = l.line_height * 0.6;
+                let pb = Bounds::new(
+                    *origin + end + point(px(6.), (l.line_height - h) / 2.),
+                    size(px(24.), h),
+                );
+                self.fold_buttons.push((pb, head));
+                (pb, window.insert_hitbox(pb, HitboxBehavior::Normal))
+            });
+            out.push(FoldMark {
+                bounds: b,
+                hitbox,
+                folded,
+                pill,
+            });
+        }
+        out
     }
 }
 
@@ -776,6 +832,7 @@ impl Element for EditorElement {
                 bounds,
                 lines: lines.clone(),
             };
+            let folds = ed.fold_marks(&lines, bounds, window);
             let (deco, tasks, copy, langs) = if ed.mode == Mode::Source {
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new())
             } else {
@@ -802,6 +859,7 @@ impl Element for EditorElement {
                 over,
                 cursors,
                 drag_cursor,
+                folds,
             }
         })
     }
@@ -859,10 +917,13 @@ impl Element for EditorElement {
                 }
             });
             let editor = self.editor.clone();
-            window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+            let hitbox = frame.hitbox.clone();
+            window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
                 if !phase.bubble() {
                     return;
                 }
+                let over = hitbox.is_hovered(window).then_some(e.position);
+                editor.update(cx, |ed, cx| ed.hover_fold(over, cx));
                 if editor.read(cx).is_selecting() {
                     if e.pressed_button == Some(MouseButton::Left) {
                         editor.update(cx, |ed, cx| ed.mouse_drag(e.position, cx));
@@ -902,6 +963,12 @@ impl Element for EditorElement {
         // A press on a code block's copy button copies the block.
         for (_, hitbox, _) in frame.copy.iter().chain(&frame.langs) {
             window.set_cursor_style(CursorStyle::PointingHand, hitbox);
+        }
+        for f in &frame.folds {
+            window.set_cursor_style(CursorStyle::PointingHand, &f.hitbox);
+            if let Some((_, h)) = &f.pill {
+                window.set_cursor_style(CursorStyle::PointingHand, h);
+            }
         }
         // A press on a code block's language: the menu of languages.
         if !frame.langs.is_empty() {
@@ -965,6 +1032,48 @@ impl Element for EditorElement {
             }
             for t in &frame.tasks {
                 t.paint(window);
+            }
+            // Fold chevrons: pointing down when open, right when folded;
+            // and the `…` a folded block leaves.
+            for f in &frame.folds {
+                let b = f.bounds;
+                if f.hitbox.is_hovered(window) {
+                    window
+                        .paint_quad(fill(b.dilate(px(2.)), frame.copy_hover).corner_radii(px(4.)));
+                }
+                let at = |x: f32, y: f32| b.origin + point(px(x), px(y));
+                let mut chevron = PathBuilder::stroke(px(1.5));
+                if f.folded {
+                    chevron.move_to(at(5., 3.));
+                    chevron.line_to(at(9., 7.));
+                    chevron.line_to(at(5., 11.));
+                } else {
+                    chevron.move_to(at(3., 5.));
+                    chevron.line_to(at(7., 9.));
+                    chevron.line_to(at(11., 5.));
+                }
+                if let Ok(path) = chevron.build() {
+                    window.paint_path(path, frame.copy_ink);
+                }
+                if let Some((pb, h)) = &f.pill {
+                    let bg = if h.is_hovered(window) {
+                        frame.copy_hover
+                    } else {
+                        frame.copy_hover.opacity(0.6)
+                    };
+                    window.paint_quad(fill(*pb, bg).corner_radii(pb.size.height / 2.));
+                    let d = px(3.);
+                    for k in [-1.0f32, 0., 1.] {
+                        let c = pb.center() + point(px(6.) * k, px(0.));
+                        window.paint_quad(
+                            fill(
+                                Bounds::new(c - point(d / 2., d / 2.), size(d, d)),
+                                frame.copy_ink,
+                            )
+                            .corner_radii(d / 2.),
+                        );
+                    }
+                }
             }
             // Code blocks' language buttons: a chevron after the label.
             for (b, hitbox, _) in &frame.langs {

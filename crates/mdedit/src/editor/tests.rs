@@ -903,3 +903,92 @@ fn pasting_an_address_over_a_selection_links_it(cx: &mut TestAppContext) {
     keys(cx, h, &["ctrl-v"]);
     assert_eq!(text(cx, &ed), "see the [docs](https://x.y/z)");
 }
+
+fn visible_lines(cx: &mut TestAppContext, ed: &Entity<MarkdownEditor>) -> Vec<usize> {
+    ed.read_with(cx, |e, _| e.rows.iter().map(|r| r.lines.start).collect())
+}
+
+#[gpui_kit::test]
+fn sections_fold_by_key_and_open_for_the_caret(cx: &mut TestAppContext) {
+    let doc = "# A\ntext\nmore\n\n# B\nend";
+    let (h, ed) = open(cx, doc, Mode::Rendered);
+    caret(cx, &ed, 1);
+    keys(cx, h, &["ctrl-shift-["]);
+    assert_eq!(
+        visible_lines(cx, &ed),
+        vec![0, 3, 4, 5],
+        "lines 1 and 2 are folded"
+    );
+    assert_eq!(text(cx, &ed), doc);
+    // Down steps over the fold.
+    keys(cx, h, &["down"]);
+    assert!(head(cx, &ed) >= 14, "the caret lands below the fold");
+    // Backspace at the row after a fold opens it rather than eat it.
+    keys(cx, h, &["ctrl-shift-[", "up"]);
+    caret(cx, &ed, 1);
+    keys(cx, h, &["ctrl-shift-["]);
+    caret(cx, &ed, 14);
+    keys(cx, h, &["backspace"]);
+    assert_eq!(text(cx, &ed), doc);
+    assert_eq!(
+        visible_lines(cx, &ed),
+        vec![0, 1, 3, 4, 5],
+        "Backspace unfolded it"
+    );
+    // The caret moving into a fold opens it (as Find or the outline do).
+    caret(cx, &ed, 1);
+    keys(cx, h, &["ctrl-shift-["]);
+    caret(cx, &ed, 6);
+    assert_eq!(visible_lines(cx, &ed), vec![0, 1, 3, 4, 5]);
+    // Fold All, then Unfold All.
+    ed.update(cx, |e, cx| e.set_selection(Selection::caret(doc.len()), cx));
+    cx.update_window(h, |_, window, cx| {
+        window.dispatch_action(Box::new(crate::actions::FoldAll), cx);
+    })
+    .unwrap();
+    assert_eq!(
+        visible_lines(cx, &ed),
+        vec![0, 3, 4, 5],
+        "B holds the caret, so it stays open"
+    );
+    cx.update_window(h, |_, window, cx| {
+        window.dispatch_action(Box::new(crate::actions::UnfoldAll), cx);
+    })
+    .unwrap();
+    assert_eq!(visible_lines(cx, &ed), vec![0, 1, 3, 4, 5]);
+}
+
+#[gpui_kit::test]
+fn a_chevron_folds_and_the_dots_unfold(cx: &mut TestAppContext) {
+    let (h, ed) = open(cx, "- a\n  - b\n  - c\n- d", Mode::Rendered);
+    caret(cx, &ed, 19);
+    // The chevron shows when the pointer is on the row.
+    let row = ed.read_with(cx, |e, _| {
+        let (_, origin, l) = e.geometry.lines[0].clone();
+        origin + gpui_kit::point(l.indent + px(20.), l.pad_top + l.line_height / 2.)
+    });
+    let click = |cx: &mut TestAppContext, at| {
+        cx.update_window(h, |_, window, cx| {
+            window.render_frame(cx);
+            window.pointer_down(at, gpui_kit::MouseButton::Left, cx);
+            window.pointer_up(at, gpui_kit::MouseButton::Left, cx);
+            window.render_frame(cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+    cx.update_window(h, |_, window, cx| {
+        window.pointer_move(row, None, cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    let chevron = ed.read_with(cx, |e, _| e.fold_buttons.first().map(|(b, _)| b.center()));
+    let chevron = chevron.expect("a chevron on the hovered item");
+    click(cx, chevron);
+    assert_eq!(visible_lines(cx, &ed), vec![0, 3]);
+    // The `…` after the folded item opens it again.
+    let dots = ed.read_with(cx, |e, _| e.fold_buttons.get(1).map(|(b, _)| b.center()));
+    click(cx, dots.expect("the dots after a folded item"));
+    assert_eq!(visible_lines(cx, &ed), vec![0, 1, 2, 3]);
+    assert_eq!(text(cx, &ed), "- a\n  - b\n  - c\n- d");
+}

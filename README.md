@@ -101,6 +101,11 @@ nothing is converted back and forth behind your back.
 - **The look** follows ZenNotes' editor: code, formulas, callouts and the
   frontmatter on rounded cards, inline code in chips, and markup shown at
   the caret in a soft accent.
+- **Folding**: a heading folds its section, a list item its nested items,
+  and a callout everything under its title. Click the chevron that shows
+  beside the line (or press `Ctrl/Cmd+Shift+[`); a folded block leaves a `…`
+  that opens it again, as does `Ctrl/Cmd+Shift+]`, or the caret moving into
+  it. **Fold All** and **Unfold All** are in the command palette.
 - **Find and replace** (`Ctrl/Cmd+F`, `Ctrl+H` or `Cmd+Alt+F`), with a match
   count, case matching, and replace one or all.
 - **Smart paste.**
@@ -203,6 +208,7 @@ same on every system.
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab |
 | `Ctrl/Cmd+PageDown` / `PageUp` | Next / previous tab |
 | `Ctrl/Cmd+Shift+M` | Toggle Markdown source |
+| `Ctrl/Cmd+Shift+[` / `]` | Fold / unfold at the caret |
 | `Ctrl/Cmd+B` / `I` | Bold / italic |
 | `Ctrl/Cmd+Shift+X` | Strikethrough |
 | `Ctrl/Cmd+E` | Inline code |

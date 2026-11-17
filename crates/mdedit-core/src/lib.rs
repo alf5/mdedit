@@ -11,6 +11,7 @@ pub mod docx;
 pub mod edit;
 pub mod export;
 pub mod find;
+pub mod fold;
 pub mod hex;
 pub mod history;
 pub mod html_import;

@@ -21,7 +21,7 @@ pub(crate) mod table;
 pub(crate) mod widgets;
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -35,7 +35,7 @@ use mdedit_core::display::{self, DisplayLine, Gutter, Reveal, Role, Row, RowWidg
 use mdedit_core::history::{History, Kind};
 use mdedit_core::prefs::Mode;
 use mdedit_core::syntax::{self, LineKind, Syntax, WidgetKind};
-use mdedit_core::{edit, find, os};
+use mdedit_core::{edit, find, fold, os};
 
 use self::element::EditorElement;
 use self::style::DocStyle;
@@ -308,6 +308,15 @@ pub struct MarkdownEditor {
     /// The pointer's over a link with Ctrl/Cmd held: a click follows it,
     /// and the pointer's a hand.
     link_hover: bool,
+    /// Folding: the blocks that can fold, the folded ones (by their head
+    /// line's first byte, so edits carry them along), the lines that hides,
+    /// the head under the pointer (its chevron shows), and last frame's
+    /// chevrons and `…` pills with the head each toggles.
+    foldable: Vec<fold::Fold>,
+    folded: BTreeSet<usize>,
+    hidden: Vec<Range<usize>>,
+    fold_hover: Option<usize>,
+    pub(crate) fold_buttons: Vec<(Bounds<Pixels>, usize)>,
     /// Drawn diagrams and formulas, by source and look.
     pictures: HashMap<u64, widgets::Picture>,
     /// Highlighted code blocks, by content and language.
@@ -393,6 +402,11 @@ impl MarkdownEditor {
             wiki_index: None,
             wiki_found: HashMap::new(),
             link_hover: false,
+            foldable: Vec::new(),
+            folded: BTreeSet::new(),
+            hidden: Vec::new(),
+            fold_hover: None,
+            fold_buttons: Vec::new(),
             pictures: HashMap::new(),
             code_colors: HashMap::new(),
             code_theme,
@@ -417,6 +431,7 @@ impl MarkdownEditor {
             menu: None,
             copied: None,
         };
+        this.refresh_folds();
         this.rebuild_slots();
         this.recount();
         this.update_reveal();
@@ -506,7 +521,10 @@ impl MarkdownEditor {
     fn rebuild_slots(&mut self) {
         let old = std::mem::take(&mut self.slots);
         let caret_line = self.syntax.line_at(self.sel.head.min(self.text.len()));
-        self.rows = display::rows(&self.text, &self.syntax, self.rich(), Some(caret_line));
+        self.rows = display::hide(
+            display::rows(&self.text, &self.syntax, self.rich(), Some(caret_line)),
+            &self.hidden,
+        );
         self.slots = self
             .rows
             .iter()
@@ -538,6 +556,195 @@ impl MarkdownEditor {
             .min(self.rows.len().saturating_sub(1))
     }
 
+    // ---------- folding ----------
+
+    /// After a parse: what can fold now, which folds still stand (a head
+    /// that stopped being one unfolds), and the lines they hide.
+    fn refresh_folds(&mut self) {
+        self.foldable = fold::folds(&self.syntax);
+        let keep: BTreeSet<usize> = self
+            .folded
+            .iter()
+            .copied()
+            .filter(|&p| {
+                let l = self.syntax.line_at(p.min(self.text.len()));
+                self.syntax.lines[l].range.start == p && self.foldable.iter().any(|f| f.head == l)
+            })
+            .collect();
+        self.folded = keep;
+        self.rehide();
+    }
+
+    fn rehide(&mut self) {
+        let heads: Vec<usize> = self
+            .folded
+            .iter()
+            .map(|&p| self.syntax.line_at(p.min(self.text.len())))
+            .collect();
+        self.hidden = fold::hidden(&self.foldable, heads);
+    }
+
+    /// Carry the folds' head positions through `edits`, made to the text as
+    /// it is now.
+    fn carry_folds(&mut self, edits: &[Edit]) {
+        if !self.folded.is_empty() {
+            self.folded = self
+                .folded
+                .iter()
+                .map(|&p| buffer::map_pos(p, edits, false))
+                .collect();
+        }
+    }
+
+    fn is_folded(&self, line: usize) -> bool {
+        self.syntax
+            .lines
+            .get(line)
+            .is_some_and(|l| self.folded.contains(&l.range.start))
+    }
+
+    pub(crate) fn can_fold(&self, line: usize) -> bool {
+        self.foldable.iter().any(|f| f.head == line)
+    }
+
+    /// Unfold whatever hides `pos`'s line. Whether anything did.
+    fn unfold_at(&mut self, pos: usize) -> bool {
+        let line = self.syntax.line_at(pos.min(self.text.len()));
+        if !self.hidden.iter().any(|h| h.contains(&line)) {
+            return false;
+        }
+        let lines = &self.syntax.lines;
+        let covering: Vec<usize> = self
+            .foldable
+            .iter()
+            .filter(|f| f.body.contains(&line))
+            .map(|f| lines[f.head].range.start)
+            .collect();
+        for p in covering {
+            self.folded.remove(&p);
+        }
+        self.rehide();
+        true
+    }
+
+    /// Fold or unfold the block headed by `head`. A caret folded away
+    /// moves to the end of the head's row.
+    pub(crate) fn set_fold(&mut self, head: usize, on: bool, cx: &mut Context<Self>) {
+        let Some(f) = self.foldable.iter().find(|f| f.head == head).cloned() else {
+            return;
+        };
+        let at = self.syntax.lines[head].range.start;
+        if on {
+            self.folded.insert(at);
+        } else {
+            self.folded.remove(&at);
+        }
+        self.rehide();
+        let line = self.syntax.line_at(self.sel.head);
+        if self.hidden.iter().any(|h| h.contains(&line)) {
+            let end = self.syntax.lines[f.body.start - 1].range.end;
+            self.sel = Selection::caret(end);
+        }
+        self.rebuild_slots();
+        self.update_reveal();
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_fold(&mut self, head: usize, cx: &mut Context<Self>) {
+        let on = !self.is_folded(head);
+        self.set_fold(head, on, cx);
+    }
+
+    /// The innermost block the caret's line heads or sits in.
+    fn fold_around_caret(&self) -> Option<usize> {
+        let line = self.syntax.line_at(self.sel.head);
+        self.foldable
+            .iter()
+            .filter(|f| f.head <= line && line < f.body.end)
+            .map(|f| f.head)
+            .max()
+    }
+
+    fn fold_at_caret(&mut self, _: &FoldAtCaret, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(head) = self.fold_around_caret() {
+            self.set_fold(head, true, cx);
+        }
+    }
+
+    fn unfold_at_caret(&mut self, _: &UnfoldAtCaret, _: &mut Window, cx: &mut Context<Self>) {
+        let line = self.syntax.line_at(self.sel.head);
+        let head = self
+            .foldable
+            .iter()
+            .filter(|f| f.head <= line && line < f.body.start && self.is_folded(f.head))
+            .map(|f| f.head)
+            .max();
+        if let Some(head) = head {
+            self.set_fold(head, false, cx);
+        }
+    }
+
+    fn fold_all(&mut self, _: &FoldAll, _: &mut Window, cx: &mut Context<Self>) {
+        let lines = &self.syntax.lines;
+        self.folded = self
+            .foldable
+            .iter()
+            .map(|f| lines[f.head].range.start)
+            .collect();
+        self.rehide();
+        // The caret's own block stays open rather than lose it.
+        self.unfold_at(self.sel.head);
+        self.rebuild_slots();
+        self.update_reveal();
+        cx.notify();
+    }
+
+    fn unfold_all(&mut self, _: &UnfoldAll, _: &mut Window, cx: &mut Context<Self>) {
+        self.folded.clear();
+        self.rehide();
+        self.rebuild_slots();
+        self.update_reveal();
+        cx.notify();
+    }
+
+    /// The pointer over a foldable row shows its chevron.
+    pub(crate) fn hover_fold(&mut self, p: Option<Point<Pixels>>, cx: &mut Context<Self>) {
+        let head = p
+            .and_then(|p| {
+                self.geometry.lines.iter().find(|(ix, origin, _)| {
+                    let h = self.slots.get(*ix).map_or(px(0.), |s| s.height);
+                    p.y >= origin.y && p.y < origin.y + h
+                })
+            })
+            .map(|(ix, ..)| self.rows[*ix].lines.start)
+            .filter(|&l| self.can_fold(l));
+        if head != self.fold_hover {
+            self.fold_hover = head;
+            cx.notify();
+        }
+    }
+
+    /// Which head's chevron shows: a folded one always, an open one under
+    /// the pointer.
+    pub(crate) fn fold_mark(&self, ix: usize) -> Option<(usize, bool)> {
+        let head = self.rows.get(ix)?.lines.start;
+        if !self.can_fold(head) {
+            return None;
+        }
+        let folded = self.is_folded(head);
+        (folded || self.fold_hover == Some(head)).then_some((head, folded))
+    }
+
+    /// Lines between row `ix` and the next drawn one that folding hides.
+    fn folded_after(&self, ix: usize) -> Option<usize> {
+        let end = self.rows.get(ix)?.lines.end;
+        let next = self
+            .rows
+            .get(ix + 1)
+            .map_or(self.syntax.lines.len(), |r| r.lines.start);
+        (next > end).then_some(end)
+    }
+
     /// The source a row covers, without its final newline.
     fn row_range(&self, ix: usize) -> Range<usize> {
         let r = &self.rows[ix].lines;
@@ -556,6 +763,7 @@ impl MarkdownEditor {
             return;
         }
         let before = self.sel;
+        self.carry_folds(&change.edits);
         let inverse = buffer::apply(&mut self.text, &change.edits);
         self.history.record(
             change.edits,
@@ -571,6 +779,8 @@ impl MarkdownEditor {
 
     fn after_edit(&mut self, cx: &mut Context<Self>) {
         self.syntax = syntax::parse(&self.text);
+        self.refresh_folds();
+        self.unfold_at(self.sel.head);
         self.rebuild_slots();
         self.recount();
         self.update_reveal();
@@ -616,6 +826,9 @@ impl MarkdownEditor {
             }
             let was_in = self.widget_at(self.sel.head);
             self.sel = sel;
+            if self.unfold_at(sel.head) {
+                self.rebuild_slots();
+            }
             let now_in = self.widget_at(self.sel.head);
             if was_in != now_in && self.rich() {
                 // Leaving a table pads its source again (which re-lays the
@@ -955,7 +1168,8 @@ impl MarkdownEditor {
         let first = start == 0
             || self.card_of(start - 1) != Some(card)
             || kind(start) == Some(LineKind::FenceOpen);
-        let last = self.card_of(end) != Some(card)
+        let last = self.is_folded(start)
+            || self.card_of(end) != Some(card)
             || kind(end - 1) == Some(LineKind::FenceClose)
             || kind(end) == Some(LineKind::FenceOpen);
         Some(OnCard { card, first, last })
@@ -1764,6 +1978,15 @@ impl MarkdownEditor {
             if ix == 0 {
                 return;
             }
+            // Backspace after a folded block opens it rather than eat it.
+            if let Some(line) = self.folded_after(ix - 1) {
+                let at = self.syntax.lines[line].range.start;
+                if self.unfold_at(at) {
+                    self.rebuild_slots();
+                    cx.notify();
+                }
+                return;
+            }
             self.row_range(ix - 1).end..caret
         } else {
             let prev = layout.prev(d);
@@ -1795,6 +2018,15 @@ impl MarkdownEditor {
             }
         }
         let range = if d >= layout.len() {
+            // So does Delete before one.
+            if let Some(line) = self.folded_after(ix) {
+                let at = self.syntax.lines[line].range.start;
+                if self.unfold_at(at) {
+                    self.rebuild_slots();
+                    cx.notify();
+                }
+                return;
+            }
             let end = self.row_range(ix).end;
             caret..(end + 1).min(self.text.len()).max(caret)
         } else {
@@ -1907,14 +2139,22 @@ impl MarkdownEditor {
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        let before = (!self.folded.is_empty()).then(|| self.text.clone());
         if let Some(sel) = self.history.undo(&mut self.text) {
+            if let Some(before) = before {
+                self.carry_folds(&[buffer::diff(&before, &self.text)]);
+            }
             self.sel = sel.clamp(self.text.len());
             self.after_edit(cx);
         }
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        let before = (!self.folded.is_empty()).then(|| self.text.clone());
         if let Some(sel) = self.history.redo(&mut self.text) {
+            if let Some(before) = before {
+                self.carry_folds(&[buffer::diff(&before, &self.text)]);
+            }
             self.sel = sel.clamp(self.text.len());
             self.after_edit(cx);
         }
@@ -2292,6 +2532,14 @@ impl MarkdownEditor {
         cx: &mut Context<Self>,
     ) {
         self.focus.focus(window, cx);
+        // A fold chevron, or a folded block's `…`.
+        if let Some(&(_, head)) = self
+            .fold_buttons
+            .iter()
+            .find(|(b, _)| b.contains(&e.position))
+        {
+            return self.toggle_fold(head, cx);
+        }
         // A table's controls take the press before the text does.
         if self.table_press(e.position, cx) {
             return;
@@ -2600,6 +2848,10 @@ impl Render for MarkdownEditor {
             .on_action(cx.listener(Self::math))
             .on_action(cx.listener(Self::link))
             .on_action(cx.listener(Self::toggle_source))
+            .on_action(cx.listener(Self::fold_at_caret))
+            .on_action(cx.listener(Self::unfold_at_caret))
+            .on_action(cx.listener(Self::fold_all))
+            .on_action(cx.listener(Self::unfold_all))
             .on_action(cx.listener(Self::set_mode_action))
             .on_action(cx.listener(Self::cancel))
             .size_full()

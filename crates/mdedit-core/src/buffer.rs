@@ -136,6 +136,24 @@ pub fn map_pos(pos: usize, edits: &[Edit], after: bool) -> usize {
     (pos as isize + delta) as usize
 }
 
+/// The one edit that turns `old` into `new`: the stretch between their
+/// common start and common end.
+pub fn diff(old: &str, new: &str) -> Edit {
+    let pre = old
+        .char_indices()
+        .zip(new.chars())
+        .find(|((_, a), b)| a != b)
+        .map_or(old.len().min(new.len()), |((i, _), _)| i);
+    let suf = old[pre..]
+        .chars()
+        .rev()
+        .zip(new[pre..].chars().rev())
+        .take_while(|(a, b)| a == b)
+        .map(|(a, _)| a.len_utf8())
+        .sum::<usize>();
+    Edit::replace(pre..old.len() - suf, &new[pre..new.len() - suf])
+}
+
 /// The start of the line holding `pos`.
 pub fn line_start(text: &str, pos: usize) -> usize {
     text[..pos].rfind('\n').map_or(0, |i| i + 1)

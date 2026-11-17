@@ -137,7 +137,8 @@ struct Writer<'a> {
     /// Text gathered for a code block or an image's alt text.
     capture: Option<String>,
     code: Option<String>,
-    image: Option<String>,
+    /// An image's URL, and whether it was written `![[…]]`.
+    image: Option<(String, bool)>,
     table_cols: usize,
 }
 
@@ -198,9 +199,16 @@ impl Writer<'_> {
         ));
     }
 
-    fn image(&mut self, url: &str, alt: &str) {
-        let os::ImageRef::Local(path) = os::resolve_image(url, self.opts.base_dir.as_deref())
-        else {
+    fn image(&mut self, url: &str, alt: &str, wiki: bool) {
+        let (alt, size) = mdedit_core::syntax::image_size(alt, wiki);
+        let found = if wiki {
+            let dir = self.opts.base_dir.as_deref();
+            mdedit_core::wiki::resolve(url, dir, dir, None)
+                .map_or(os::ImageRef::Refused, os::ImageRef::Local)
+        } else {
+            os::resolve_image(url, self.opts.base_dir.as_deref())
+        };
+        let os::ImageRef::Local(path) = found else {
             self.out.push_str(&lit(alt));
             return;
         };
@@ -212,8 +220,26 @@ impl Writer<'_> {
         match (std::fs::read(&path), ext.as_str()) {
             (Ok(bytes), "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp") => {
                 let vpath = self.file(&ext, bytes);
+                // A size in pixels, as CSS measures them: 0.75pt each.
+                // No wider than the text column (A4 less its margins).
+                const COLUMN: f32 = 493.;
+                let dims = match size {
+                    Some((w, h)) => {
+                        let (w, h) = (w as f32 * 0.75, h.map(|h| h as f32 * 0.75));
+                        let scale = (COLUMN / w).min(1.);
+                        match h {
+                            Some(h) => format!(
+                                "width: {}pt, height: {}pt, fit: \"stretch\"",
+                                w * scale,
+                                h * scale
+                            ),
+                            None => format!("width: {}pt", w * scale),
+                        }
+                    }
+                    None => "width: auto".into(),
+                };
                 self.out
-                    .push_str(&format!("#box(image({}, width: auto));", string(&vpath)));
+                    .push_str(&format!("#box(image({}, {dims}));", string(&vpath)));
             }
             _ => self.out.push_str(&lit(alt)),
         }
@@ -336,8 +362,13 @@ impl Writer<'_> {
                     self.out.push_str("#[");
                 }
             }
-            Tag::Image { dest_url, .. } => {
-                self.image = Some(dest_url.to_string());
+            Tag::Image {
+                dest_url,
+                link_type,
+                ..
+            } => {
+                let wiki = matches!(link_type, pulldown_cmark::LinkType::WikiLink { .. });
+                self.image = Some((dest_url.to_string(), wiki));
                 self.capture = Some(String::new());
             }
             Tag::FootnoteDefinition(_) => {
@@ -371,8 +402,8 @@ impl Writer<'_> {
             }
             TagEnd::Image => {
                 let alt = self.capture.take().unwrap_or_default();
-                if let Some(url) = self.image.take() {
-                    self.image(&url, &alt);
+                if let Some((url, wiki)) = self.image.take() {
+                    self.image(&url, &alt, wiki);
                 }
             }
             TagEnd::FootnoteDefinition => {
@@ -611,5 +642,28 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert!(t.contains("#box(baseline:"), "{t}");
         assert!(t.contains("#align(center, image("), "{t}");
+    }
+
+    #[test]
+    fn images_keep_obsidian_sizes() {
+        let dir = std::env::temp_dir().join(format!("mdedit-pdf-img-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("p.png"), b"png").unwrap();
+        let o = Options {
+            base_dir: Some(dir.clone()),
+            ..opts()
+        };
+        let mut files = HashMap::new();
+        let t = to_typst(
+            "![[p.png|200]]\n\n![big|2000x1000](p.png)\n",
+            &o,
+            &mut files,
+        );
+        assert!(t.contains("width: 150pt));"), "{t}");
+        assert!(
+            t.contains("width: 493pt, height: 246.5pt, fit: \"stretch\""),
+            "{t}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -4,6 +4,7 @@
 //! The app crate (`crates/mdedit`) draws these with GPUI; nothing here knows
 //! GPUI exists.
 
+pub mod attach;
 pub mod buffer;
 pub mod detach;
 pub mod display;

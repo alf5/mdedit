@@ -22,9 +22,84 @@ pub fn to_html(md: &str) -> String {
     let md = &md[crate::syntax::frontmatter_end(md).unwrap_or(0)..];
     let parser = Parser::new_ext(md, opts);
     let mut out = String::new();
-    let events = TableWidths::new(MermaidFences::new(parser)).map(render_math);
+    let events = SizedImages::new(TableWidths::new(MermaidFences::new(parser))).map(render_math);
     html::push_html(&mut out, events);
     out
+}
+
+/// Writes each image as an `<img>` itself, so Obsidian's sizes
+/// (`![cat|300](a.png)`, `![[a.png|300x200]]`) become `width` and `height`,
+/// and a wiki embed's alt is its file's name.
+struct SizedImages<'a, I> {
+    inner: I,
+    _marker: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a, I> SizedImages<'a, I> {
+    fn new(inner: I) -> Self {
+        Self {
+            inner,
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+fn attr(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+impl<'a, I: Iterator<Item = Event<'a>>> Iterator for SizedImages<'a, I> {
+    type Item = Event<'a>;
+
+    fn next(&mut self) -> Option<Event<'a>> {
+        let ev = self.inner.next()?;
+        let Event::Start(Tag::Image {
+            link_type,
+            dest_url,
+            title,
+            ..
+        }) = ev
+        else {
+            return Some(ev);
+        };
+        let mut alt = String::new();
+        let mut depth = 0;
+        for e in self.inner.by_ref() {
+            match e {
+                Event::Start(Tag::Image { .. }) => depth += 1,
+                Event::End(TagEnd::Image) if depth == 0 => break,
+                Event::End(TagEnd::Image) => depth -= 1,
+                Event::Text(t) | Event::Code(t) => alt.push_str(&t),
+                _ => {}
+            }
+        }
+        let wiki = matches!(link_type, pulldown_cmark::LinkType::WikiLink { .. });
+        let (alt, size) = crate::syntax::image_size(&alt, wiki);
+        let alt = if wiki && alt.is_empty() {
+            &dest_url
+        } else {
+            alt
+        };
+        let mut tag = format!(
+            "<img src=\"{}\" alt=\"{}\"",
+            attr(&dest_url.replace(' ', "%20")),
+            attr(alt)
+        );
+        if !title.is_empty() {
+            tag.push_str(&format!(" title=\"{}\"", attr(&title)));
+        }
+        if let Some((w, h)) = size {
+            tag.push_str(&format!(" width=\"{w}\""));
+            if let Some(h) = h {
+                tag.push_str(&format!(" height=\"{h}\""));
+            }
+        }
+        tag.push_str(" />");
+        Some(Event::InlineHtml(CowStr::Boxed(tag.into_boxed_str())))
+    }
 }
 
 /// Is this fence's info string a mermaid one? GitHub matches the first word,
@@ -301,5 +376,22 @@ mod tests {
     #[test]
     fn a_table_at_the_end_of_the_file_survives() {
         assert!(to_html("| a |\n|---|\n| 1 |").ends_with("</table>\n"));
+    }
+
+    #[test]
+    fn images_carry_their_sizes() {
+        let html = to_html("![cat|200](<a b.png>) and ![[p.png|30x40]] and ![x](y.png \"T\")");
+        assert!(
+            html.contains(r#"<img src="a%20b.png" alt="cat" width="200" />"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<img src="p.png" alt="p.png" width="30" height="40" />"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<img src="y.png" alt="x" title="T" />"#),
+            "{html}"
+        );
     }
 }

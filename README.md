@@ -79,6 +79,15 @@ nothing is converted back and forth behind your back.
     is in it: click it, or arrow into it.
   - A diagram that doesn't parse shows the error and its line.
 - **Images** load from the document's folder.
+  - **Paste an image** (a screenshot, or one copied in a browser), or drop
+    image files on the text, and it goes in where you are: a pasted one is
+    saved as `assets/pasted-….png` beside the document, and a dropped one
+    from outside the document's folder is copied into `assets/`. Other
+    dropped files open in tabs.
+  - **Obsidian's embeds and sizes**: `![[photo.png]]` finds the picture by
+    name as a wiki link finds its note, and `![[photo.png|300]]`,
+    `![caption|300](photo.png)` or `|300x200` set its size, in the editor
+    and in HTML and PDF exports.
   - **Web images** wait for a click, because fetching one tells its server
     the document was opened. **Settings** can allow them always.
   - **Network shares and other schemes** are never loaded.

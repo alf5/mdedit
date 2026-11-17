@@ -49,6 +49,11 @@ pub enum EditorEvent {
     /// A `[[wiki link]]` was followed: the file its note is in, or `None`
     /// when no note has that name.
     FollowWiki { note: String, path: Option<PathBuf> },
+    /// Files dropped on the text that it doesn't take in (not images):
+    /// open them.
+    Open(Vec<PathBuf>),
+    /// Something to tell the user.
+    Notice(String),
 }
 
 /// A block drawn on a card, a rounded box behind its rows, in the rendered
@@ -2187,6 +2192,30 @@ impl MarkdownEditor {
     /// Smart paste: rich content (a web page, Word, Google Docs) arrives as
     /// HTML and goes in as markdown. Ctrl/Cmd+Shift+V pastes plain text.
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+        // An image (a screenshot, one copied in a browser) is saved beside
+        // the document; copied image files are brought in as a drop is.
+        if let Some(item) = cx.read_from_clipboard() {
+            for entry in item.entries() {
+                match entry {
+                    ClipboardEntry::Image(image) => {
+                        let image = image.clone();
+                        return self.paste_image(&image, cx);
+                    }
+                    ClipboardEntry::ExternalPaths(paths) => {
+                        let images: Vec<PathBuf> = paths
+                            .paths()
+                            .iter()
+                            .filter(|p| mdedit_core::project::image_mime(p).is_some())
+                            .cloned()
+                            .collect();
+                        if !images.is_empty() {
+                            return self.insert_images(&images, cx);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         // A web address pasted over a selection links it.
         if !self.sel.is_empty()
             && !self.text[self.sel.range()].contains('\n')
@@ -2204,6 +2233,84 @@ impl MarkdownEditor {
         match md {
             Some(md) => self.replace_selection(&md, Kind::Other, cx),
             None => self.paste_text(cx),
+        }
+    }
+
+    fn paste_image(&mut self, image: &Image, cx: &mut Context<Self>) {
+        let Some(dir) = self.base_dir.clone() else {
+            cx.emit(EditorEvent::Notice(
+                "Save the document first: pasted images are stored beside it.".into(),
+            ));
+            return;
+        };
+        let ext = match image.format {
+            ImageFormat::Png => "png",
+            ImageFormat::Jpeg => "jpg",
+            ImageFormat::Webp => "webp",
+            ImageFormat::Gif => "gif",
+            ImageFormat::Svg => "svg",
+            ImageFormat::Bmp => "bmp",
+            ImageFormat::Tiff => "tiff",
+            ImageFormat::Ico => "ico",
+            ImageFormat::Pnm => "pnm",
+        };
+        let stem = mdedit_core::attach::pasted_stem(std::time::SystemTime::now());
+        match mdedit_core::attach::store(&dir, &stem, ext, &image.bytes) {
+            Ok(file) => self.link_images(&dir, &[file], cx),
+            Err(e) => cx.emit(EditorEvent::Notice(format!("Couldn't save the image: {e}"))),
+        }
+    }
+
+    /// Link image files at the caret, copying in those from outside the
+    /// document's folder.
+    pub(crate) fn insert_images(&mut self, files: &[PathBuf], cx: &mut Context<Self>) {
+        let Some(dir) = self.base_dir.clone() else {
+            cx.emit(EditorEvent::Notice(
+                "Save the document first: images are linked from where it is.".into(),
+            ));
+            return;
+        };
+        let mut brought = Vec::new();
+        for f in files {
+            match mdedit_core::attach::bring_in(&dir, f) {
+                Ok(p) => brought.push(p),
+                Err(e) => cx.emit(EditorEvent::Notice(format!(
+                    "Couldn't copy in {}: {e}",
+                    f.display()
+                ))),
+            }
+        }
+        self.link_images(&dir, &brought, cx);
+    }
+
+    fn link_images(&mut self, dir: &std::path::Path, files: &[PathBuf], cx: &mut Context<Self>) {
+        if files.is_empty() || self.blocked_in_table(true) {
+            return;
+        }
+        let links: Vec<String> = files
+            .iter()
+            .map(|f| format!("![]({})", mdedit_core::attach::link(dir, f)))
+            .collect();
+        self.replace_selection(&links.join("\n"), Kind::Other, cx);
+    }
+
+    /// Files dropped on the text: images go in where they land; anything
+    /// else opens as usual.
+    fn drop_files(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
+        let (images, others): (Vec<PathBuf>, Vec<PathBuf>) = paths
+            .paths()
+            .iter()
+            .cloned()
+            .partition(|p| mdedit_core::project::image_mime(p).is_some());
+        if !images.is_empty() {
+            if let Some((_, d, layout)) = self.hit(window.mouse_position()) {
+                let pos = layout.to_source(d);
+                self.set_selection(Selection::caret(pos), cx);
+            }
+            self.insert_images(&images, cx);
+        }
+        if !others.is_empty() {
+            cx.emit(EditorEvent::Open(others));
         }
     }
 
@@ -2857,6 +2964,11 @@ impl Render for MarkdownEditor {
             .on_action(cx.listener(Self::diagram))
             .on_action(cx.listener(Self::math))
             .on_action(cx.listener(Self::link))
+            .on_drop(
+                cx.listener(|ed, paths: &ExternalPaths, window, cx| {
+                    ed.drop_files(paths, window, cx)
+                }),
+            )
             .on_action(cx.listener(Self::toggle_source))
             .on_action(cx.listener(Self::fold_at_caret))
             .on_action(cx.listener(Self::unfold_at_caret))

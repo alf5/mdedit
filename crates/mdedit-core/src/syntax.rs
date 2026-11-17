@@ -135,8 +135,15 @@ pub enum WidgetKind {
     Diagram { body: Range<usize> },
     /// A paragraph that is only `$$…$$`; `body` is the formula.
     Math { body: Range<usize> },
-    /// A paragraph that is only an image.
-    Image { url: String, alt: String },
+    /// A paragraph that is only an image: `![alt](url)`, or Obsidian's
+    /// `![[url]]` (`wiki`), which is found by name like a wiki link. `size`
+    /// is a width and maybe a height in pixels, from `|300` or `|300x200`.
+    Image {
+        url: String,
+        alt: String,
+        wiki: bool,
+        size: Option<(u32, Option<u32>)>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -253,8 +260,10 @@ struct Open {
     paragraph: bool,
     /// Direct children seen, and the image if the only one was an image.
     kids: u32,
-    image: Option<(String, String)>,
+    image: Option<(String, String, bool)>,
     alt: String,
+    /// An image written `![[…]]`.
+    wiki: bool,
 }
 
 impl Syntax {
@@ -427,6 +436,7 @@ pub fn parse(text: &str) -> Syntax {
                     kids: 0,
                     image: None,
                     alt: String::new(),
+                    wiki: false,
                 };
                 let (first, last) = (
                     line_at(r.start, &lines),
@@ -639,10 +649,15 @@ pub fn parse(text: &str) -> Syntax {
                         open.autolink = matches!(link_type, LinkType::Autolink | LinkType::Email);
                         open.url = Some(dest_url.to_string());
                     }
-                    Tag::Image { dest_url, .. } => {
+                    Tag::Image {
+                        dest_url,
+                        link_type,
+                        ..
+                    } => {
                         open.style = style::IMAGE;
                         open.delimited = true;
                         open.url = Some(dest_url.to_string());
+                        open.wiki = matches!(link_type, LinkType::WikiLink { .. });
                     }
                     _ => {}
                 }
@@ -654,12 +669,24 @@ pub fn parse(text: &str) -> Syntax {
                 if matches!(tag, TagEnd::Image)
                     && let Some(parent) = stack.last_mut()
                 {
-                    parent.image = Some((open.url.clone().unwrap_or_default(), open.alt.clone()));
+                    parent.image = Some((
+                        open.url.clone().unwrap_or_default(),
+                        open.alt.clone(),
+                        open.wiki,
+                    ));
                 }
                 if open.paragraph
                     && open.kids == 1
-                    && let Some((url, alt)) = open.image.clone()
+                    && let Some((url, alt, wiki)) = open.image.clone()
+                    // `![[Note]]` embeds a note, not a picture.
+                    && (!wiki || crate::project::image_mime(std::path::Path::new(&url)).is_some())
                 {
+                    let (alt, size) = image_size(&alt, wiki);
+                    let alt = if wiki && (alt.is_empty() || alt == url) {
+                        String::new()
+                    } else {
+                        alt.to_string()
+                    };
                     let first = line_at(open.range.start, &lines);
                     let last = line_at(
                         open.range.end.saturating_sub(1).max(open.range.start),
@@ -667,7 +694,12 @@ pub fn parse(text: &str) -> Syntax {
                     );
                     widgets.push(Widget {
                         lines: first..last + 1,
-                        kind: WidgetKind::Image { url, alt },
+                        kind: WidgetKind::Image {
+                            url,
+                            alt,
+                            wiki,
+                            size,
+                        },
                     });
                 }
                 if matches!(tag, TagEnd::Heading(_))
@@ -936,6 +968,33 @@ fn trim_newline(text: &str, floor: usize, end: usize) -> usize {
     e
 }
 
+/// An image's size in Obsidian's way: `|300` or `|300x200` after its alt
+/// text (`![cat|300](a.png)`), or a wiki embed's whole alt
+/// (`![[a.png|300]]`). The alt without it, and width and height in pixels.
+pub fn image_size(alt: &str, wiki: bool) -> (&str, Option<(u32, Option<u32>)>) {
+    let parse = |s: &str| {
+        let (w, h) = match s.split_once('x') {
+            Some((w, h)) => (w, Some(h)),
+            None => (s, None),
+        };
+        let w = w.trim().parse::<u32>().ok().filter(|w| *w > 0)?;
+        let h = match h {
+            Some(h) => Some(h.trim().parse::<u32>().ok().filter(|h| *h > 0)?),
+            None => None,
+        };
+        Some((w, h))
+    };
+    if let Some((rest, tail)) = alt.rsplit_once('|')
+        && let Some(size) = parse(tail)
+    {
+        return (rest.trim_end(), Some(size));
+    }
+    if wiki && let Some(size) = parse(alt) {
+        return ("", Some(size));
+    }
+    (alt, None)
+}
+
 /// The `#tags` in `text[r]`, as ZenNotes finds them: a `#` at the start or
 /// after a space, then a letter, then letters, digits, `_`, `-` or `/`.
 pub fn hashtags(text: &str, r: Range<usize>) -> Vec<Range<usize>> {
@@ -1159,7 +1218,9 @@ mod tests {
             kinds[3].1,
             &WidgetKind::Image {
                 url: "cat.png".into(),
-                alt: "a cat".into()
+                alt: "a cat".into(),
+                wiki: false,
+                size: None,
             }
         );
         let alert_line = s.lines.iter().position(|l| l.alert.is_some()).unwrap();
@@ -1189,5 +1250,41 @@ mod tests {
         assert_eq!(s.lines[4].kind, LineKind::Table);
         assert_eq!(s.line_at(0), 0);
         assert_eq!(s.line_at(text.len()), s.lines.len() - 1);
+    }
+
+    #[test]
+    fn images_take_obsidian_sizes_and_embeds() {
+        let image = |t: &str| match &parse(t).widgets.first().map(|w| w.kind.clone()) {
+            Some(WidgetKind::Image {
+                url,
+                alt,
+                wiki,
+                size,
+            }) => Some((url.clone(), alt.clone(), *wiki, *size)),
+            _ => None,
+        };
+        assert_eq!(
+            image("![[photo.png|300]]"),
+            Some(("photo.png".into(), "".into(), true, Some((300, None))))
+        );
+        assert_eq!(
+            image("![[My pic.png|a view|300x200]]"),
+            Some((
+                "My pic.png".into(),
+                "a view".into(),
+                true,
+                Some((300, Some(200)))
+            ))
+        );
+        assert_eq!(
+            image("![cat|200](a.png)"),
+            Some(("a.png".into(), "cat".into(), false, Some((200, None))))
+        );
+        assert_eq!(
+            image("![2024](a.png)").unwrap().3,
+            None,
+            "a number alone is alt text"
+        );
+        assert_eq!(image("![[Note]]"), None, "a note embed is no picture");
     }
 }

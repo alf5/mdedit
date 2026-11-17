@@ -1069,3 +1069,57 @@ fn a_hash_offers_the_tags_in_use(cx: &mut TestAppContext) {
     typed(cx, h, " a#");
     assert!(popup(cx, &ed).is_empty());
 }
+
+#[gpui_kit::test]
+fn a_pasted_image_is_saved_beside_the_document(cx: &mut TestAppContext) {
+    use super::EditorEvent;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    let dir = std::env::temp_dir().join(format!("mdedit-paste-img-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let image = gpui_kit::Image::from_bytes(gpui_kit::ImageFormat::Png, b"PNGDATA".to_vec());
+
+    // Untitled: nowhere to put it, so it says so.
+    let (h, ed) = open(cx, "", Mode::Rendered);
+    let notices: Rc<RefCell<Vec<String>>> = Rc::default();
+    let log = notices.clone();
+    cx.update(|cx| {
+        cx.subscribe(&ed, move |_, ev: &EditorEvent, _| {
+            if let EditorEvent::Notice(m) = ev {
+                log.borrow_mut().push(m.clone());
+            }
+        })
+        .detach()
+    });
+    cx.update(|cx| cx.write_to_clipboard(gpui_kit::ClipboardItem::new_image(&image)));
+    keys(cx, h, &["ctrl-v"]);
+    assert_eq!(text(cx, &ed), "");
+    assert_eq!(notices.borrow().len(), 1);
+
+    let (h, ed) = open(cx, "Look:\n\n", Mode::Rendered);
+    let d = dir.clone();
+    ed.update(cx, |e, cx| e.set_base_dir(Some(d), cx));
+    caret(cx, &ed, 7);
+    cx.update(|cx| cx.write_to_clipboard(gpui_kit::ClipboardItem::new_image(&image)));
+    keys(cx, h, &["ctrl-v"]);
+    let t = text(cx, &ed);
+    assert!(
+        t.starts_with("Look:\n\n![](assets/pasted-") && t.ends_with(".png)"),
+        "{t}"
+    );
+    let name = &t["Look:\n\n![](".len()..t.len() - 1];
+    assert_eq!(std::fs::read(dir.join(name)).unwrap(), b"PNGDATA");
+
+    // Image files (dropped, or copied in a file manager) are linked, and
+    // copied in when they live elsewhere.
+    let away = std::env::temp_dir().join(format!("mdedit-away-{}.gif", std::process::id()));
+    std::fs::write(&away, b"GIF").unwrap();
+    keys(cx, h, &["enter"]);
+    ed.update(cx, |e, cx| e.insert_images(std::slice::from_ref(&away), cx));
+    let name = away.file_name().unwrap().to_string_lossy().to_string();
+    assert!(text(cx, &ed).ends_with(&format!("![](assets/{name})")));
+    assert!(dir.join("assets").join(&name).exists());
+    std::fs::remove_file(&away).ok();
+    std::fs::remove_dir_all(&dir).ok();
+}

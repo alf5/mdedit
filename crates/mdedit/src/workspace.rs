@@ -255,6 +255,10 @@ impl Workspace {
                         Notification::warning(format!("There's no note called “{note}” here.")),
                         cx,
                     ),
+                    DocEvent::Open(paths) => this.open_paths(paths.clone(), window, cx),
+                    DocEvent::Notice(m) => {
+                        window.push_notification(Notification::warning(m.clone()), cx)
+                    }
                     DocEvent::Changed => {}
                 }
                 cx.notify();

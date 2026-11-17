@@ -56,6 +56,10 @@ pub enum DocEvent {
         note: String,
         path: Option<PathBuf>,
     },
+    /// Files to open (dropped on the text).
+    Open(Vec<PathBuf>),
+    /// A message for the user.
+    Notice(String),
 }
 
 /// What to do about a file that changed underneath its tab.
@@ -210,12 +214,16 @@ impl DocView {
         });
         self._subs
             .push(cx.subscribe(&editor, |this, editor, ev: &EditorEvent, cx| {
-                if let EditorEvent::FollowWiki { note, path } = ev {
-                    cx.emit(DocEvent::FollowWiki {
-                        note: note.clone(),
-                        path: path.clone(),
-                    });
-                    return;
+                match ev {
+                    EditorEvent::FollowWiki { note, path } => {
+                        return cx.emit(DocEvent::FollowWiki {
+                            note: note.clone(),
+                            path: path.clone(),
+                        });
+                    }
+                    EditorEvent::Open(paths) => return cx.emit(DocEvent::Open(paths.clone())),
+                    EditorEvent::Notice(m) => return cx.emit(DocEvent::Notice(m.clone())),
+                    _ => {}
                 }
                 // Escape in the text closes the search too.
                 if editor.read(cx).find.is_none() {

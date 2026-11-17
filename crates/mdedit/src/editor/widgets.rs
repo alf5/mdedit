@@ -8,6 +8,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mdedit_core::mermaid::{self, Colors, DrawOptions, fontdb};
 use mdedit_core::syntax::WidgetKind;
@@ -229,27 +230,38 @@ impl MarkdownEditor {
                         .into_any_element(),
                 }
             }
-            WidgetKind::Image { url, alt } => {
+            WidgetKind::Image {
+                url,
+                alt,
+                wiki,
+                size,
+            } => {
                 let remote_waiting;
-                let source: Option<ImageSource> =
-                    match os::resolve_image(&url, self.base_dir.as_deref()) {
-                        os::ImageRef::Local(path) => {
-                            remote_waiting = false;
-                            Some(path.into())
-                        }
-                        os::ImageRef::Remote(u) if self.allow_remote => {
-                            remote_waiting = false;
-                            Some(SharedUri::from(u).into())
-                        }
-                        os::ImageRef::Remote(_) => {
-                            remote_waiting = true;
-                            None
-                        }
-                        os::ImageRef::Refused => {
-                            remote_waiting = false;
-                            None
-                        }
-                    };
+                // `![[name]]` is found as a wiki link's note is.
+                let found = if wiki {
+                    self.wiki_note(&url)
+                        .map_or(os::ImageRef::Refused, os::ImageRef::Local)
+                } else {
+                    os::resolve_image(&url, self.base_dir.as_deref())
+                };
+                let source: Option<ImageSource> = match found {
+                    os::ImageRef::Local(path) => {
+                        remote_waiting = false;
+                        Some(path.into())
+                    }
+                    os::ImageRef::Remote(u) if self.allow_remote => {
+                        remote_waiting = false;
+                        Some(SharedUri::from(u).into())
+                    }
+                    os::ImageRef::Remote(_) => {
+                        remote_waiting = true;
+                        None
+                    }
+                    os::ImageRef::Refused => {
+                        remote_waiting = false;
+                        None
+                    }
+                };
                 let line = self.syntax.widgets[w].lines.start;
                 let start = self.syntax.lines[line].range.start;
                 let editor = cx.entity().downgrade();
@@ -306,9 +318,23 @@ impl MarkdownEditor {
                             .child(
                                 img(s)
                                     .max_w(width - px(2.))
-                                    .max_h(px(560.))
+                                    .when_some(size, |i, (w, h)| {
+                                        // A size asked for: that width (no
+                                        // wider than the column), its own
+                                        // shape unless a height is given too.
+                                        let i = i.w(px(w as f32).min(width - px(2.)));
+                                        match h {
+                                            Some(h) => i.h(px(h as f32)),
+                                            None => i,
+                                        }
+                                    })
+                                    .when(size.is_none(), |i| i.max_h(px(560.)))
                                     .rounded(px(13.))
-                                    .object_fit(ObjectFit::ScaleDown)
+                                    .object_fit(if size.is_some_and(|(_, h)| h.is_some()) {
+                                        ObjectFit::Fill
+                                    } else {
+                                        ObjectFit::ScaleDown
+                                    })
                                     .with_fallback(placeholder),
                             )
                             .into_any_element(),

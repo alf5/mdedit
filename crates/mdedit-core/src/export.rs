@@ -63,7 +63,13 @@ body {
 /// The exportable body of a markdown document. pulldown-cmark already writes
 /// task checkboxes `disabled`, which is right for a record.
 pub fn body_from_markdown(md: &str) -> String {
-    crate::markdown::to_html(md)
+    body_from_markdown_with(md, None)
+}
+
+/// [`body_from_markdown`], with `![[Note]]` embeds filled in from `embed`.
+/// Both exports come through here, so whatever the body gets, embeds get.
+pub fn body_from_markdown_with(md: &str, embed: Option<crate::markdown::EmbedSource>) -> String {
+    crate::markdown::to_html_with(md, embed)
 }
 
 /// A whole standalone page for `md`.
@@ -81,7 +87,7 @@ pub fn export_html_with(
 ) -> String {
     build_document(
         title,
-        &crate::markdown::to_html_with(md, Some(embed)),
+        &body_from_markdown_with(md, Some(embed)),
         extra_class,
         theme,
     )

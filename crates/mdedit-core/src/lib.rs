@@ -6,6 +6,7 @@
 
 pub mod attach;
 pub mod buffer;
+pub mod d2;
 pub mod detach;
 pub mod display;
 pub mod docx;
@@ -20,6 +21,7 @@ pub mod markdown;
 pub mod math;
 pub mod mermaid;
 pub mod os;
+pub mod plot;
 pub mod prefs;
 pub mod project;
 pub mod scan;

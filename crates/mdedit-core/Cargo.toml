@@ -25,6 +25,8 @@ roxmltree = "0.20"
 dirs = "6"
 htmd = "0.5"
 harper-core = { version = "3.2", default-features = false }
+d2-render = { version = "0.1", default-features = false, features = ["native"] }
+exmex = "0.21"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

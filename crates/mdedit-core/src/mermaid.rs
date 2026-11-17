@@ -69,7 +69,11 @@ pub fn draw(src: &str, opts: &DrawOptions) -> Result<Diagram, String> {
 }
 
 /// Resolve every `<text>` against `fontdb` and write it back as paths.
-fn outline_text(svg: &str, family: &str, fontdb: &Arc<fontdb::Database>) -> Result<String, String> {
+pub(crate) fn outline_text(
+    svg: &str,
+    family: &str,
+    fontdb: &Arc<fontdb::Database>,
+) -> Result<String, String> {
     let options = usvg::Options {
         fontdb: fontdb.clone(),
         font_family: family.to_string(),

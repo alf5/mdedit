@@ -24,7 +24,8 @@ nothing is converted back and forth behind your back.
   - **Selecting text** brings up a small bar with bold, italic, strike, code,
     link, heading, quote and list buttons.
   - **Typing `/`** at the start of an empty line opens a menu of blocks:
-    headings, lists, tasks, quote, code, table, diagram, math and divider.
+    headings, lists, tasks, quote, code, table, diagrams (Mermaid or D2),
+    plot, math and divider.
     Type to filter it; `h2` finds Heading 2.
   - **The command palette** (`Ctrl/Cmd+Shift+P`) has every command and its
     shortcut.
@@ -71,6 +72,14 @@ nothing is converted back and forth behind your back.
   - A ```` ```mermaid ```` fence draws as a diagram, using
     [bezel-mermaid](https://crates.io/crates/bezel-mermaid), a pure-Rust port
     of [Pele](https://pele.run).
+  - A ```` ```d2 ```` fence draws a [D2](https://d2lang.com) diagram, using
+    [d2-render](https://crates.io/crates/d2-render)'s pure-Rust layout: most
+    shapes, styles and themes, though not sequence diagrams, classes or
+    tables, nor layouts other than the layered one.
+  - A ```` ```function-plot ```` fence plots functions from function-plot's
+    JSON, as ZenNotes does: `fn` (`"x^2"`, `"sin(x)"`, with `pi`, `e`, `log`),
+    `points`, `polyline` and `parametric` series, `xAxis`/`yAxis` domains and
+    labels, a `title` and a `grid`. Curves break at asymptotes.
   - `$…$` and `$$…$$` draw as formulas, `$…$` in table cells too. A lone
     `$5` stays a price. A line grows to fit a tall formula, such as a
     fraction.

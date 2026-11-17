@@ -24,8 +24,14 @@ fn converter() -> HtmlToMarkdown {
     HtmlToMarkdown::builder()
         .skip_tags(vec!["script", "style", "head", "noscript", "template"])
         .add_handler(vec!["div", "figure"], |h: &dyn Handlers, el: Element| {
-            if let Some(src) = attr(&el, "data-mermaid") {
-                return Some(format!("\n\n```mermaid\n{}\n```\n\n", src.trim_end()).into());
+            for (data, lang) in [
+                ("data-mermaid", "mermaid"),
+                ("data-d2", "d2"),
+                ("data-function-plot", "function-plot"),
+            ] {
+                if let Some(src) = attr(&el, data) {
+                    return Some(format!("\n\n```{lang}\n{}\n```\n\n", src.trim_end()).into());
+                }
             }
             h.fallback(el)
         })

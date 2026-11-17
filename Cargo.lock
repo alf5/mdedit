@@ -2587,6 +2587,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "d2-render"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "916799563cb7e1393117c6b9d5c110e635df44431fc18a6ed883185ba89ac447"
+dependencies = [
+ "sha2 0.10.9",
+ "tempfile",
+]
+
+[[package]]
 name = "darling"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3279,6 +3289,16 @@ checksum = "8be9f3dfaaffdae2972880079a491a1a8bb7cbed0b8dd7a347f668b4150a3b93"
 dependencies = [
  "event-listener",
  "pin-project-lite",
+]
+
+[[package]]
+name = "exmex"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9a53dccfc387af263e69c1eb53d13a4e9b26a7134ffdd38398a208374cbf851"
+dependencies = [
+ "regex",
+ "smallvec",
 ]
 
 [[package]]
@@ -6957,8 +6977,10 @@ name = "mdedit-core"
 version = "2.0.0"
 dependencies = [
  "bezel-mermaid",
+ "d2-render",
  "diffy",
  "dirs 6.0.0",
+ "exmex",
  "harper-core",
  "htmd",
  "latex-rust",

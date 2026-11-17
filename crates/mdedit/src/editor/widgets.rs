@@ -11,7 +11,7 @@ use std::sync::{Arc, OnceLock};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mdedit_core::mermaid::{self, Colors, DrawOptions, fontdb};
-use mdedit_core::syntax::WidgetKind;
+use mdedit_core::syntax::{DiagramKind, WidgetKind};
 use mdedit_core::{math, os};
 
 use super::MarkdownEditor;
@@ -91,20 +91,20 @@ impl MarkdownEditor {
             .position(|w| w.lines.contains(&line))
     }
 
-    fn picture(&mut self, body: &str, diagram: bool) -> Picture {
+    /// A diagram's picture (drawn by `kind`), or a formula's (`None`).
+    fn picture(&mut self, body: &str, kind: Option<DiagramKind>) -> Picture {
         let key = hash_of(&[
             &|h| body.hash(h),
-            &|h| diagram.hash(h),
+            &|h| kind.hash(h),
             &|h| format!("{:?}", self.style.palette).hash(h),
             &|h| self.style.size.to_bits().hash(h),
         ]);
         if let Some(p) = self.pictures.get(&key) {
             return p.clone();
         }
-        let p = if diagram {
-            self.draw_diagram(body)
-        } else {
-            self.draw_math(body)
+        let p = match kind {
+            Some(kind) => self.draw_diagram(body, kind),
+            None => self.draw_math(body),
         };
         if self.pictures.len() > 200 {
             self.pictures.clear();
@@ -113,14 +113,37 @@ impl MarkdownEditor {
         p
     }
 
-    fn draw_diagram(&self, body: &str) -> Picture {
+    fn draw_diagram(&self, body: &str, kind: DiagramKind) -> Picture {
+        let p = &self.style.palette;
         let opts = DrawOptions {
-            colors: diagram_colors(&self.style.palette),
+            colors: diagram_colors(p),
             font_family: UI_FONT.into(),
             font_family_mono: MONO_FONT.into(),
             fontdb: fonts(),
         };
-        let d = mermaid::draw(body, &opts)?;
+        let d = match kind {
+            DiagramKind::Mermaid => mermaid::draw(body, &opts)?,
+            DiagramKind::D2 => mdedit_core::d2::draw(body, p.dark, &opts)?,
+            DiagramKind::Plot => {
+                let hex = |c: [u8; 4]| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
+                let colors = mdedit_core::plot::PlotColors {
+                    text: hex(p.text),
+                    muted: hex(p.text_muted),
+                    grid: hex(p.border),
+                    series: [
+                        p.accent,
+                        p.alert_caution,
+                        p.alert_tip,
+                        p.alert_important,
+                        p.alert_warning,
+                        p.aqua,
+                    ]
+                    .map(hex)
+                    .to_vec(),
+                };
+                mdedit_core::plot::draw(body, &colors, &opts)?
+            }
+        };
         Ok((
             Arc::new(Image::from_bytes(ImageFormat::Svg, d.svg.into_bytes())),
             d.width as f32,
@@ -162,8 +185,13 @@ impl MarkdownEditor {
                 .text_color(c.muted)
                 .child("This table couldn't be read.")
                 .into_any_element(),
-            WidgetKind::Diagram { body } | WidgetKind::Math { body } => {
-                let diagram = matches!(self.syntax.widgets[w].kind, WidgetKind::Diagram { .. });
+            WidgetKind::Diagram { ref body, .. } | WidgetKind::Math { ref body } => {
+                let drawn_by = match kind {
+                    WidgetKind::Diagram { kind, .. } => Some(kind),
+                    _ => None,
+                };
+                let diagram = drawn_by.is_some();
+                let body = body.clone();
                 let src = self.text[body.clone()].to_string();
                 let start = body.start;
                 let editor = cx.entity().downgrade();
@@ -172,7 +200,7 @@ impl MarkdownEditor {
                         .update(cx, |e, cx| e.reveal_offset(start, window, cx))
                         .ok();
                 };
-                match self.picture(&src, diagram) {
+                match self.picture(&src, drawn_by) {
                     Ok((image, w_px, h_px)) if diagram => {
                         let scale = (f32::from(width) / w_px).min(1.0);
                         div()

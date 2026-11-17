@@ -171,10 +171,29 @@ impl Writer<'_> {
     }
 
     fn code_block(&mut self, lang: &str, code: &str) {
-        if lang.eq_ignore_ascii_case("mermaid")
-            && let Some(d) = &self.opts.diagrams
-            && let Ok(drawing) = mermaid::draw(code, d)
-        {
+        let drawn = match (
+            mdedit_core::syntax::DiagramKind::of(lang),
+            &self.opts.diagrams,
+        ) {
+            (Some(kind), Some(d)) => match kind {
+                mdedit_core::syntax::DiagramKind::Mermaid => mermaid::draw(code, d).ok(),
+                // On paper: light colours.
+                mdedit_core::syntax::DiagramKind::D2 => mdedit_core::d2::draw(code, false, d).ok(),
+                mdedit_core::syntax::DiagramKind::Plot => {
+                    let colors = mdedit_core::plot::PlotColors {
+                        text: "#1f2328".into(),
+                        muted: "#59636e".into(),
+                        grid: "#d1d9e0".into(),
+                        series: ["#0969da", "#cf222e", "#1a7f37", "#8250df", "#bc4c00"]
+                            .map(String::from)
+                            .to_vec(),
+                    };
+                    mdedit_core::plot::draw(code, &colors, d).ok()
+                }
+            },
+            _ => None,
+        };
+        if let Some(drawing) = drawn {
             let path = self.file("svg", drawing.svg.into_bytes());
             let w = drawing.width * 0.75;
             let width = if w > 480. {

@@ -47,6 +47,16 @@ pub(crate) const SLASH_ITEMS: &[(&str, &str, Slash)] = &[
         "A Mermaid flowchart",
         Slash::Insert(edit::MERMAID_MD, 11),
     ),
+    (
+        "D2 diagram",
+        "Boxes and arrows, in D2",
+        Slash::Insert(edit::D2_MD, 6),
+    ),
+    (
+        "Plot",
+        "A graph of a function",
+        Slash::Insert(edit::PLOT_MD, 17),
+    ),
     ("Math", "A display formula", Slash::Insert(edit::MATH_MD, 3)),
     (
         "Divider",

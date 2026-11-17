@@ -2477,6 +2477,12 @@ impl MarkdownEditor {
     fn diagram(&mut self, _: &InsertDiagram, _: &mut Window, cx: &mut Context<Self>) {
         self.insert_block(edit::MERMAID_MD, 11, cx);
     }
+    fn d2(&mut self, _: &InsertD2, _: &mut Window, cx: &mut Context<Self>) {
+        self.insert_block(edit::D2_MD, 6, cx);
+    }
+    fn plot(&mut self, _: &InsertPlot, _: &mut Window, cx: &mut Context<Self>) {
+        self.insert_block(edit::PLOT_MD, 17, cx);
+    }
     fn math(&mut self, _: &InsertMath, _: &mut Window, cx: &mut Context<Self>) {
         self.insert_block(edit::MATH_MD, 3, cx);
     }
@@ -3073,6 +3079,8 @@ impl Render for MarkdownEditor {
             .on_action(cx.listener(Self::table))
             .on_action(cx.listener(Self::rule))
             .on_action(cx.listener(Self::diagram))
+            .on_action(cx.listener(Self::d2))
+            .on_action(cx.listener(Self::plot))
             .on_action(cx.listener(Self::math))
             .on_action(cx.listener(Self::link))
             .on_drop(

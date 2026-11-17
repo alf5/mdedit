@@ -100,6 +100,8 @@ gpui_kit::actions!(
         InsertTable,
         InsertRule,
         InsertDiagram,
+        InsertD2,
+        InsertPlot,
         InsertMath,
         ToggleSource,
         FoldAtCaret,

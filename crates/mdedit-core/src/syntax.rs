@@ -127,12 +127,43 @@ pub fn callout_marker(s: &str) -> Option<(usize, &str)> {
 }
 
 /// A block the rendered modes draw as something other than text.
+/// What draws a diagram fence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DiagramKind {
+    /// ```` ```mermaid ````
+    Mermaid,
+    /// ```` ```d2 ````
+    D2,
+    /// ```` ```function-plot ````: function-plot's JSON.
+    Plot,
+}
+
+impl DiagramKind {
+    /// The kind a fence's info string names (its first word, any case).
+    pub fn of(info: &str) -> Option<DiagramKind> {
+        match info
+            .split_whitespace()
+            .next()?
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "mermaid" => Some(DiagramKind::Mermaid),
+            "d2" => Some(DiagramKind::D2),
+            "function-plot" | "functionplot" => Some(DiagramKind::Plot),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WidgetKind {
     /// A pipe table (with its `zen:cols` comment, if one follows).
     Table,
     /// A ```` ```mermaid ```` fence; `body` is the diagram source.
-    Diagram { body: Range<usize> },
+    Diagram {
+        body: Range<usize>,
+        kind: DiagramKind,
+    },
     /// A paragraph that is only `$$…$$`; `body` is the formula.
     Math { body: Range<usize> },
     /// A paragraph that is only an image: `![alt](url)`, or Obsidian's
@@ -467,10 +498,7 @@ pub fn parse(text: &str) -> Syntax {
                             l.kind = LineKind::Code;
                         }
                         if let CodeBlockKind::Fenced(info) = &kind
-                            && info
-                                .split_whitespace()
-                                .next()
-                                .is_some_and(|w| w.eq_ignore_ascii_case("mermaid"))
+                            && let Some(diagram) = DiagramKind::of(info)
                         {
                             let body_start = (lines[first].range.end + 1).min(text.len());
                             let closed = last > first && {
@@ -486,6 +514,7 @@ pub fn parse(text: &str) -> Syntax {
                                 lines: first..last + 1,
                                 kind: WidgetKind::Diagram {
                                     body: body_start..body_end.max(body_start),
+                                    kind: diagram,
                                 },
                             });
                         }
@@ -1225,7 +1254,9 @@ mod tests {
         assert_eq!(kinds.len(), 4, "{kinds:?}");
         assert_eq!(kinds[0], (0..4, &WidgetKind::Table));
         match kinds[1].1 {
-            WidgetKind::Diagram { body } => assert_eq!(&text[body.clone()], "graph TD\n  A-->B\n"),
+            WidgetKind::Diagram { body, .. } => {
+                assert_eq!(&text[body.clone()], "graph TD\n  A-->B\n")
+            }
             k => panic!("{k:?}"),
         }
         match kinds[2].1 {

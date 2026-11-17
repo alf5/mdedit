@@ -10,6 +10,9 @@ use crate::buffer::{Change, Edit, Selection, line_end, line_start, map_pos};
 
 pub const TABLE_MD: &str = "| Column 1 | Column 2 | Column 3 |\n| -------- | -------- | -------- |\n|          |          |          |\n";
 pub const MERMAID_MD: &str = "```mermaid\ngraph TD\n  A[Start] --> B{Choice}\n  B -->|yes| C[Do it]\n  B -->|no| D[Stop]\n```\n";
+pub const D2_MD: &str = "```d2\nidea -> draft: write\ndraft -> done: edit\n```\n";
+pub const PLOT_MD: &str =
+    "```function-plot\n{\n  \"grid\": true,\n  \"data\": [{ \"fn\": \"x^2\" }]\n}\n```\n";
 pub const CODE_MD: &str = "```\n\n```\n";
 pub const MATH_MD: &str = "$$\n\n$$\n";
 pub const RULE_MD: &str = "---\n";

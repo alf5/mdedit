@@ -74,6 +74,8 @@ fn commands(markdown: bool) -> Groups {
                 entry("Code Block", CodeBlock),
                 entry("Table", InsertTable),
                 entry("Mermaid Diagram", InsertDiagram),
+                entry("D2 Diagram", InsertD2),
+                entry("Function Plot", InsertPlot),
                 entry("Math Block", InsertMath),
                 entry("Horizontal Rule", InsertRule),
             ],

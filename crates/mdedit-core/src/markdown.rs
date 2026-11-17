@@ -145,19 +145,14 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for SizedImages<'a, '_, I> {
     }
 }
 
-/// Is this fence's info string a mermaid one? GitHub matches the first word,
-/// case-insensitively, so ` ```Mermaid ` and ` ```mermaid title=x ` both count.
-fn is_mermaid(info: &str) -> bool {
-    info.split_whitespace()
-        .next()
-        .is_some_and(|w| w.eq_ignore_ascii_case("mermaid"))
-}
+use crate::syntax::DiagramKind;
 
-/// Swaps each mermaid code block in an event stream for the rendered diagram.
+/// Swaps each diagram fence (mermaid, d2, function-plot; the first word of
+/// the info string, any case) in an event stream for its drawing.
 struct MermaidFences<'a, I> {
     inner: I,
-    /// Fence body collected while inside a mermaid block.
-    buf: Option<String>,
+    /// The fence body collected while inside a diagram fence, and its kind.
+    buf: Option<(String, DiagramKind)>,
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
@@ -180,16 +175,22 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for MermaidFences<'a, I> {
             match (&mut self.buf, ev) {
                 // Entering a mermaid fence: swallow events until it closes.
                 (None, Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(info))))
-                    if is_mermaid(&info) =>
+                    if DiagramKind::of(&info).is_some() =>
                 {
-                    self.buf = Some(String::new());
+                    self.buf = DiagramKind::of(&info).map(|k| (String::new(), k));
                 }
-                (Some(buf), Event::Text(t)) => buf.push_str(&t),
+                (Some((buf, _)), Event::Text(t)) => buf.push_str(&t),
                 (Some(_), Event::End(TagEnd::CodeBlock)) => {
-                    let src = self.buf.take().unwrap_or_default();
-                    return Some(Event::Html(CowStr::Boxed(
-                        crate::mermaid::render_block(&src).into_boxed_str(),
-                    )));
+                    let (src, kind) = self
+                        .buf
+                        .take()
+                        .unwrap_or((String::new(), DiagramKind::Mermaid));
+                    let html = match kind {
+                        DiagramKind::Mermaid => crate::mermaid::render_block(&src),
+                        DiagramKind::D2 => crate::d2::render_block(&src),
+                        DiagramKind::Plot => crate::plot::render_block(&src),
+                    };
+                    return Some(Event::Html(CowStr::Boxed(html.into_boxed_str())));
                 }
                 // Anything else inside the fence (soft breaks, stray inlines)
                 // can't appear in a code block, but drop it rather than emit

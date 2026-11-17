@@ -343,6 +343,9 @@ pub struct MarkdownEditor {
     /// The `/` menu: where its slash is, and the highlighted entry.
     slash: Option<usize>,
     slash_ix: usize,
+    /// What it offers, and its entries for what's typed.
+    pop: overlays::PopKind,
+    pop_items: Vec<overlays::PopItem>,
     /// A table under the pointer, its controls showing.
     table_hover: Option<table::Hover>,
     /// A press on one of those controls, until the button comes up.
@@ -425,6 +428,8 @@ impl MarkdownEditor {
             find: None,
             slash: None,
             slash_ix: 0,
+            pop: overlays::PopKind::Slash,
+            pop_items: Vec::new(),
             table_hover: None,
             table_drag: None,
             table_resize: None,
@@ -785,7 +790,7 @@ impl MarkdownEditor {
         self.recount();
         self.update_reveal();
         self.refresh_find();
-        self.update_slash(None);
+        self.update_slash(None, cx);
         self.autoscroll = true;
         self.goal_x = None;
         cx.emit(EditorEvent::Edited);
@@ -845,7 +850,7 @@ impl MarkdownEditor {
                 self.rebuild_slots();
             }
             self.update_reveal();
-            self.update_slash(None);
+            self.update_slash(None, cx);
             self.autoscroll = true;
             cx.emit(EditorEvent::Moved);
         }
@@ -919,10 +924,9 @@ impl MarkdownEditor {
     /// The file a wiki link's note is in, if there's one: in the document's
     /// folder, or by name anywhere in the project. Remembered until the
     /// layout is next rebuilt.
-    pub(crate) fn wiki_note(&mut self, note: &str) -> Option<PathBuf> {
-        if let Some(found) = self.wiki_found.get(note) {
-            return found.clone();
-        }
+    /// The index of files wiki links are looked up in: the open folder's,
+    /// or the document's own folder's. Rebuilt when ten seconds old.
+    pub(crate) fn wiki_files(&mut self) -> Option<Rc<mdedit_core::wiki::Index>> {
         let base = self.root.clone().or_else(|| self.base_dir.clone());
         let stale = self.wiki_index.as_ref().is_none_or(|(at, ix)| {
             at.elapsed().as_secs() > 10 || Some(ix.root()) != base.as_deref()
@@ -931,6 +935,14 @@ impl MarkdownEditor {
             self.wiki_index =
                 base.map(|b| (Instant::now(), Rc::new(mdedit_core::wiki::Index::build(&b))));
         }
+        self.wiki_index.as_ref().map(|(_, ix)| ix.clone())
+    }
+
+    pub(crate) fn wiki_note(&mut self, note: &str) -> Option<PathBuf> {
+        if let Some(found) = self.wiki_found.get(note) {
+            return found.clone();
+        }
+        self.wiki_files();
         let found = mdedit_core::wiki::resolve(
             note,
             self.base_dir.as_deref(),
@@ -1804,7 +1816,7 @@ impl MarkdownEditor {
         if self.slash.is_none() {
             return false;
         }
-        let n = self.slash_matches().len().max(1) as isize;
+        let n = self.pop_items.len().max(1) as isize;
         self.slash_ix = (self.slash_ix as isize + delta).rem_euclid(n) as usize;
         cx.notify();
         true
@@ -1815,9 +1827,7 @@ impl MarkdownEditor {
         if self.slash.is_none() {
             return false;
         }
-        if let Some(item) = self.slash_matches().get(self.slash_ix).copied() {
-            self.apply_slash(item, cx);
-        }
+        self.apply_pop(self.slash_ix, cx);
         true
     }
 
@@ -2706,7 +2716,7 @@ impl EntityInputHandler for MarkdownEditor {
             && let Some(c) = self.auto_pair(text)
         {
             self.apply(c, Kind::Typing, cx);
-            self.update_slash(Some(text));
+            self.update_slash(Some(text), cx);
             cx.notify();
             return;
         }
@@ -2721,7 +2731,7 @@ impl EntityInputHandler for MarkdownEditor {
             Kind::Typing,
             cx,
         );
-        self.update_slash(Some(text));
+        self.update_slash(Some(text), cx);
         cx.notify();
     }
 

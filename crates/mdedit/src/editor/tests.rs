@@ -992,3 +992,80 @@ fn a_chevron_folds_and_the_dots_unfold(cx: &mut TestAppContext) {
     assert_eq!(visible_lines(cx, &ed), vec![0, 1, 2, 3]);
     assert_eq!(text(cx, &ed), "- a\n  - b\n  - c\n- d");
 }
+
+fn popup(cx: &mut TestAppContext, ed: &Entity<MarkdownEditor>) -> Vec<String> {
+    ed.read_with(cx, |e, _| {
+        if e.slash.is_some() {
+            e.pop_items.iter().map(|i| i.label.clone()).collect()
+        } else {
+            Vec::new()
+        }
+    })
+}
+
+#[gpui_kit::test]
+fn double_brackets_offer_notes_and_their_headings(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("mdedit-complete-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("deep")).unwrap();
+    std::fs::write(
+        dir.join("Garden plan.md"),
+        "# Plan\n\n## Beds\n\n## Watering\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("deep/Gardening tools.md"), "x").unwrap();
+    std::fs::write(dir.join("photo.png"), "x").unwrap();
+    let (h, ed) = open(cx, "", Mode::Rendered);
+    let d = dir.clone();
+    ed.update(cx, |e, cx| e.set_base_dir(Some(d), cx));
+    typed(cx, h, "See [");
+    typed(cx, h, "[");
+    assert_eq!(text(cx, &ed), "See [[]]", "brackets pair");
+    assert_eq!(popup(cx, &ed), vec!["Garden plan", "Gardening tools"]);
+    typed(cx, h, "tool");
+    assert_eq!(popup(cx, &ed), vec!["Gardening tools"]);
+    keys(cx, h, &["enter"]);
+    assert_eq!(text(cx, &ed), "See [[Gardening tools]]");
+    assert_eq!(
+        head(cx, &ed),
+        text(cx, &ed).len(),
+        "the caret is past the link"
+    );
+    // A heading of another note.
+    typed(cx, h, " and [");
+    typed(cx, h, "[");
+    typed(cx, h, "Garden plan");
+    typed(cx, h, "#");
+    assert_eq!(popup(cx, &ed), vec!["Beds", "Plan", "Watering"]);
+    typed(cx, h, "wat");
+    keys(cx, h, &["tab"]);
+    assert!(text(cx, &ed).ends_with("[[Garden plan#Watering]]"));
+    // Embeds offer other files too; Escape closes the popup.
+    typed(cx, h, " ![");
+    typed(cx, h, "[");
+    typed(cx, h, "pho");
+    assert_eq!(popup(cx, &ed), vec!["photo.png"]);
+    keys(cx, h, &["escape"]);
+    assert!(popup(cx, &ed).is_empty());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[gpui_kit::test]
+fn a_hash_offers_the_tags_in_use(cx: &mut TestAppContext) {
+    let (h, ed) = open(cx, "Notes on #rust and #research.\n\n", Mode::Rendered);
+    caret(cx, &ed, 31);
+    typed(cx, h, "#");
+    assert_eq!(popup(cx, &ed), vec!["rust", "research"]);
+    typed(cx, h, "rus");
+    keys(cx, h, &["enter"]);
+    assert_eq!(text(cx, &ed), "Notes on #rust and #research.\n\n#rust");
+    // A heading's `##` or `# ` offers nothing, and neither does a `#`
+    // mid-word.
+    let (h, ed) = open(cx, "#rust\n\n", Mode::Rendered);
+    caret(cx, &ed, 7);
+    typed(cx, h, "#");
+    assert_eq!(popup(cx, &ed), vec!["rust"]);
+    typed(cx, h, "#");
+    assert!(popup(cx, &ed).is_empty());
+    typed(cx, h, " a#");
+    assert!(popup(cx, &ed).is_empty());
+}

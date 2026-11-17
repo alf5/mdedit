@@ -520,6 +520,8 @@ impl DocView {
                 let text = editor.read(cx).text().to_string();
                 std::fs::write(path, text.as_bytes()).map_err(|e| e.to_string())?;
                 *saved = text;
+                // Its tags and links may have changed.
+                crate::scan::invalidate(cx);
             }
             Body::Text { editor, saved, .. } => {
                 let text = editor.read(cx).value();

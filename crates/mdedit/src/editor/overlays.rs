@@ -62,12 +62,83 @@ fn fuzzy(query: &str, label: &str) -> bool {
     query.chars().all(|q| chars.any(|c| c == q))
 }
 
+/// What the caret popup is offering.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PopKind {
+    /// Blocks, after a `/` starting a line.
+    Slash,
+    /// Notes, after `[[` (files of any kind after `![[`).
+    Note { embed: bool },
+    /// Headings, after `[[#` (this document's) or `[[Note#`.
+    Heading(String),
+    /// Tags, after a `#` starting a word.
+    Tag,
+}
+
+/// One entry of the caret popup.
+#[derive(Clone, Debug)]
+pub(crate) struct PopItem {
+    pub label: String,
+    pub hint: String,
+    pick: Pick,
+}
+
+#[derive(Clone, Debug)]
+enum Pick {
+    Slash(usize),
+    /// Replace the query with this; for links, close them with `]]`.
+    Text(String),
+}
+
+/// The most entries the popup lists.
+const MAX_ITEMS: usize = 8;
+
+/// How well `label` answers `query` (both lower-case): a start beats a
+/// word start beats anywhere beats letters in order; `None` is no match.
+fn rank(query: &str, label: &str) -> Option<u8> {
+    if query.is_empty() || label.starts_with(query) {
+        Some(0)
+    } else if label
+        .match_indices(query)
+        .any(|(i, _)| label[..i].ends_with([' ', '-', '_', '/']))
+    {
+        Some(1)
+    } else if label.contains(query) {
+        Some(2)
+    } else {
+        fuzzy(query, label).then_some(3)
+    }
+}
+
+/// The best of `labels` (with hints) for `query`, best first.
+fn ranked(query: &str, labels: impl IntoIterator<Item = (String, String)>) -> Vec<PopItem> {
+    let q = query.to_lowercase();
+    let mut hits: Vec<(u8, PopItem)> = labels
+        .into_iter()
+        .filter_map(|(label, hint)| {
+            let r = rank(&q, &label.to_lowercase())?;
+            Some((
+                r,
+                PopItem {
+                    pick: Pick::Text(label.clone()),
+                    label,
+                    hint,
+                },
+            ))
+        })
+        .collect();
+    hits.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(a.1.label.len().cmp(&b.1.label.len()))
+            .then_with(|| a.1.label.cmp(&b.1.label))
+    });
+    hits.dedup_by(|a, b| a.1.label == b.1.label);
+    hits.into_iter().take(MAX_ITEMS).map(|(_, i)| i).collect()
+}
+
 impl MarkdownEditor {
     /// The `/` menu's entries matching what's been typed after the slash.
-    pub(crate) fn slash_matches(&self) -> Vec<usize> {
-        let Some(at) = self.slash else {
-            return Vec::new();
-        };
+    fn slash_matches(&self, at: usize) -> Vec<PopItem> {
         let q = self.text[at + 1..self.sel.head.max(at + 1)].to_lowercase();
         SLASH_ITEMS
             .iter()
@@ -75,58 +146,229 @@ impl MarkdownEditor {
             .filter(|(_, (label, hint, _))| {
                 q.is_empty() || fuzzy(&q, &label.to_lowercase()) || hint.to_lowercase().contains(&q)
             })
-            .map(|(i, _)| i)
+            .map(|(i, (label, hint, _))| PopItem {
+                label: (*label).into(),
+                hint: (*hint).into(),
+                pick: Pick::Slash(i),
+            })
             .collect()
     }
 
-    /// After every edit or move: open the menu on a freshly typed `/` that
-    /// starts a line, keep it while a word follows it, close it otherwise.
-    pub(crate) fn update_slash(&mut self, typed: Option<&str>) {
-        // Blocks can't go in a table cell.
-        if !self.rich() || !self.sel.is_empty() || self.grid_widget(self.sel.head).is_some() {
+    /// The popup's entries for what's typed between its anchor and the
+    /// caret.
+    fn pop_matches(&mut self, at: usize, cx: &mut Context<Self>) -> Vec<PopItem> {
+        let query = self.text[at..self.sel.head.max(at)].to_string();
+        match self.pop.clone() {
+            PopKind::Slash => self.slash_matches(at),
+            PopKind::Note { embed } => {
+                let Some(index) = self.wiki_files() else {
+                    return Vec::new();
+                };
+                let root = index.root().to_path_buf();
+                let names = index.files().filter_map(|p| {
+                    let name = p.file_name()?.to_string_lossy().to_string();
+                    let md = name.ends_with(".md") || name.ends_with(".markdown");
+                    let label = if md {
+                        p.file_stem()?.to_string_lossy().to_string()
+                    } else if embed {
+                        name
+                    } else {
+                        return None;
+                    };
+                    let hint = p
+                        .parent()
+                        .and_then(|d| d.strip_prefix(&root).ok())
+                        .map(|d| d.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    Some((label, hint))
+                });
+                ranked(&query, names.collect::<Vec<_>>())
+            }
+            PopKind::Heading(note) => {
+                let headings: Vec<String> = if note.is_empty() {
+                    self.syntax
+                        .headings
+                        .iter()
+                        .map(|h| h.text.clone())
+                        .collect()
+                } else {
+                    self.wiki_note(&note)
+                        .and_then(|p| std::fs::read_to_string(p).ok())
+                        .map(|t| {
+                            mdedit_core::syntax::parse(&t)
+                                .headings
+                                .into_iter()
+                                .map(|h| h.text)
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                ranked(&query, headings.into_iter().map(|h| (h, String::new())))
+            }
+            PopKind::Tag => {
+                let mut tags: Vec<(String, String)> = self
+                    .syntax
+                    .tags(&self.text)
+                    .into_iter()
+                    .filter(|t| t.len() > query.len() || *t != query)
+                    .map(|t| (t.to_string(), String::new()))
+                    .collect();
+                if let Some(root) = self.root.clone()
+                    && let Some(scan) = crate::scan::get(&root, cx)
+                {
+                    tags.extend(scan.tags().into_iter().map(|(t, n)| {
+                        (
+                            t,
+                            if n == 1 {
+                                "1 note".into()
+                            } else {
+                                format!("{n} notes")
+                            },
+                        )
+                    }));
+                }
+                // The tag being typed isn't a suggestion for itself.
+                tags.retain(|(t, _)| *t != query);
+                ranked(&query, tags)
+            }
+        }
+    }
+
+    /// After every edit or move: open the popup on a freshly typed `/` at a
+    /// line's start, `[[`, `[[…#` or a word-starting `#`; keep it while the
+    /// query fits; close it otherwise.
+    pub(crate) fn update_slash(&mut self, typed: Option<&str>, cx: &mut Context<Self>) {
+        let in_code = matches!(
+            self.syntax.lines[self.syntax.line_at(self.sel.head)].kind,
+            mdedit_core::syntax::LineKind::Code | mdedit_core::syntax::LineKind::FenceOpen
+        );
+        if !self.rich() || !self.sel.is_empty() || in_code {
             self.slash = None;
             return;
         }
         let caret = self.sel.head;
-        if typed == Some("/") && caret > 0 {
-            let line_start = mdedit_core::buffer::line_start(&self.text, caret);
-            let (indent, _, len) = edit::line_prefix(&self.text[line_start..]);
-            if self.text[line_start + indent + len..caret] == *"/" {
-                self.slash = Some(caret - 1);
-                self.slash_ix = 0;
-                return;
+        let before = &self.text[..caret];
+        let line_start = mdedit_core::buffer::line_start(&self.text, caret);
+        let in_grid = self.grid_widget(caret).is_some();
+        let open = |kind: PopKind, at: usize| Some((kind, at));
+        let opened = match typed {
+            // Blocks can't go in a table cell.
+            Some("/") if !in_grid => {
+                let (indent, _, len) = edit::line_prefix(&self.text[line_start..]);
+                (self.text[line_start + indent + len..caret] == *"/")
+                    .then(|| open(PopKind::Slash, caret - 1))
+                    .flatten()
             }
+            Some("[") if before.ends_with("[[") => open(
+                PopKind::Note {
+                    embed: before[..caret - 2].ends_with('!'),
+                },
+                caret,
+            ),
+            Some("#") => {
+                // Inside an open `[[`: that note's headings.
+                let link = before[line_start..caret - 1]
+                    .rfind("[[")
+                    .map(|i| line_start + i + 2)
+                    .filter(|&i| !self.text[i..caret - 1].contains([']', '|', '#']));
+                match link {
+                    Some(i) => open(PopKind::Heading(self.text[i..caret - 1].to_string()), caret),
+                    None => {
+                        let word_start = before[..caret - 1]
+                            .chars()
+                            .next_back()
+                            .is_none_or(char::is_whitespace);
+                        word_start.then(|| open(PopKind::Tag, caret)).flatten()
+                    }
+                }
+            }
+            _ => None,
+        };
+        if let Some((kind, at)) = opened {
+            self.pop = kind;
+            self.slash = Some(at);
+            self.slash_ix = 0;
         }
-        if let Some(at) = self.slash {
-            let ok = caret > at
-                && self.text.get(at..at + 1) == Some("/")
-                && !self.text[at + 1..caret].contains(char::is_whitespace)
-                && caret - at <= 24
-                && !self.slash_matches().is_empty();
-            if !ok {
-                self.slash = None;
-            } else {
-                let n = self.slash_matches().len();
-                self.slash_ix = self.slash_ix.min(n.saturating_sub(1));
-            }
+        let Some(at) = self.slash else { return };
+        let query = self.text.get(at.min(caret)..caret).unwrap_or("");
+        let fits = caret >= at
+            && match &self.pop {
+                PopKind::Slash => {
+                    caret > at
+                        && self.text.get(at..at + 1) == Some("/")
+                        && !query[1..].contains(char::is_whitespace)
+                        && caret - at <= 24
+                }
+                PopKind::Note { .. } | PopKind::Heading(_) => {
+                    self.text[..at].ends_with(['[', '#'])
+                        && !query.contains(['\n', ']', '|', '#'])
+                        && query.len() <= 80
+                }
+                PopKind::Tag => {
+                    self.text[..at].ends_with('#')
+                        && query
+                            .chars()
+                            .all(|c| c.is_alphanumeric() || matches!(c, '_' | '-' | '/'))
+                        && query.len() <= 40
+                }
+            };
+        let items = if fits {
+            self.pop_matches(at, cx)
+        } else {
+            Vec::new()
+        };
+        if items.is_empty() {
+            self.slash = None;
+            self.pop_items.clear();
+        } else {
+            self.slash_ix = self.slash_ix.min(items.len() - 1);
+            self.pop_items = items;
         }
     }
 
-    /// Replace `/query` with the chosen block.
-    pub(crate) fn apply_slash(&mut self, item: usize, cx: &mut Context<Self>) {
+    /// The popup's entry `n` chosen: a block for `/query`, or the name
+    /// typed out (and a link closed with `]]`).
+    pub(crate) fn apply_pop(&mut self, n: usize, cx: &mut Context<Self>) {
         let Some(at) = self.slash.take() else { return };
-        let (_, _, what) = SLASH_ITEMS[item];
-        let remove = Change {
-            edits: vec![Edit::delete(at..self.sel.head)],
-            selection: Selection::caret(at),
+        let Some(item) = self.pop_items.get(n).cloned() else {
+            return;
         };
-        self.apply(remove, Kind::Other, cx);
-        let change = match what {
-            Slash::Heading(level) => edit::set_heading(&self.text, self.sel, level),
-            Slash::List(block) => edit::toggle_block(&self.text, self.sel, block),
-            Slash::Insert(block, caret) => edit::insert_block(&self.text, self.sel, block, caret),
-        };
-        self.apply(change, Kind::Other, cx);
+        self.pop_items.clear();
+        match item.pick {
+            Pick::Slash(i) => {
+                let (_, _, what) = SLASH_ITEMS[i];
+                let remove = Change {
+                    edits: vec![Edit::delete(at..self.sel.head)],
+                    selection: Selection::caret(at),
+                };
+                self.apply(remove, Kind::Other, cx);
+                let change = match what {
+                    Slash::Heading(level) => edit::set_heading(&self.text, self.sel, level),
+                    Slash::List(block) => edit::toggle_block(&self.text, self.sel, block),
+                    Slash::Insert(block, caret) => {
+                        edit::insert_block(&self.text, self.sel, block, caret)
+                    }
+                };
+                self.apply(change, Kind::Other, cx);
+            }
+            Pick::Text(name) => {
+                let caret = self.sel.head;
+                let (insert, end) = match self.pop {
+                    PopKind::Tag => (name, caret),
+                    _ if self.text[caret..].starts_with("]]") => (name, caret + 2),
+                    _ => (format!("{name}]]"), caret),
+                };
+                let after = at + insert.len() + (end - caret);
+                self.apply(
+                    Change {
+                        edits: vec![Edit::replace(at..caret, insert)],
+                        selection: Selection::caret(after),
+                    },
+                    Kind::Other,
+                    cx,
+                );
+            }
+        }
         self.slash = None;
     }
 
@@ -291,7 +533,7 @@ impl MarkdownEditor {
 
     fn render_slash(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let (caret, lh) = self.screen_point(self.sel.head)?;
-        let matches = self.slash_matches();
+        let matches = self.pop_items.clone();
         let theme = cx.theme();
         let (bg, border, fg, muted, active) = (
             theme.popover,
@@ -319,10 +561,10 @@ impl MarkdownEditor {
                             .border_color(border)
                             .shadow_lg()
                             .children(matches.into_iter().enumerate().map(|(n, item)| {
-                                let (label, hint, _) = SLASH_ITEMS[item];
+                                let PopItem { label, hint, .. } = item;
                                 let entity = entity.clone();
                                 div()
-                                    .id(("slash", item))
+                                    .id(("slash", n))
                                     .flex()
                                     .flex_col()
                                     .px(px(8.))
@@ -330,12 +572,20 @@ impl MarkdownEditor {
                                     .rounded(px(5.))
                                     .cursor_pointer()
                                     .when(n == selected, |d| d.bg(active))
-                                    .child(div().text_sm().text_color(fg).child(label))
-                                    .child(div().text_xs().text_color(muted).child(hint))
+                                    .child(div().text_sm().text_color(fg).truncate().child(label))
+                                    .when(!hint.is_empty(), |d| {
+                                        d.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(muted)
+                                                .truncate()
+                                                .child(hint),
+                                        )
+                                    })
                                     .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                                         cx.stop_propagation();
                                         window.prevent_default();
-                                        entity.update(cx, |e, cx| e.apply_slash(item, cx)).ok();
+                                        entity.update(cx, |e, cx| e.apply_pop(n, cx)).ok();
                                     })
                             })),
                     ),

@@ -82,6 +82,11 @@ impl Index {
     pub fn root(&self) -> &Path {
         &self.root
     }
+
+    /// Every file found, in no particular order.
+    pub fn files(&self) -> impl Iterator<Item = &Path> {
+        self.by_name.values().flatten().map(PathBuf::as_path)
+    }
 }
 
 /// The file a link's note is in: `dir/Note.md` when the document's folder

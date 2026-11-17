@@ -95,6 +95,11 @@ nothing is converted back and forth behind your back.
     note, found by name in the document's folder or anywhere in the open
     folder. `[[#Heading]]` goes to a heading in the document. A link to no
     note is drawn faintly.
+- **Completion as you type**: `[[` lists the notes in the open folder (or
+  the document's), `![[` other files too, and `[[Note#` or `[[#` that
+  note's headings. A `#` starting a word lists the tags this document and
+  the open folder use. `Up`/`Down` choose, `Enter` or `Tab` takes one,
+  `Esc` closes the list.
 - **Frontmatter**: a YAML block opening the document (between `---` lines)
   is drawn as a card of its keys and values. HTML and PDF exports leave it
   out.

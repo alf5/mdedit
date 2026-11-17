@@ -258,6 +258,15 @@ struct Open {
 }
 
 impl Syntax {
+    /// The `#tags` drawn as pills, without their `#`, in order.
+    pub fn tags<'a>(&self, text: &'a str) -> Vec<&'a str> {
+        self.spans
+            .iter()
+            .filter(|s| s.style & style::TAG != 0)
+            .map(|s| &text[s.range.start + 1..s.range.end])
+            .collect()
+    }
+
     /// The line holding byte `pos`.
     pub fn line_at(&self, pos: usize) -> usize {
         match self.lines.binary_search_by(|l| l.range.start.cmp(&pos)) {

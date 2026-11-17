@@ -12,6 +12,7 @@ mod editor;
 mod files;
 mod hex_view;
 mod palette;
+mod scan;
 mod settings;
 mod single;
 mod state;

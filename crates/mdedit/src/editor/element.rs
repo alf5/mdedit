@@ -56,6 +56,8 @@ pub(crate) struct Frame {
     drag_cursor: Option<CursorStyle>,
     /// Fold chevrons, and the `…` after a folded block's head.
     folds: Vec<FoldMark>,
+    /// Spelling and grammar: the words to underline, and in what colour.
+    squiggles: Vec<(Bounds<Pixels>, Hsla)>,
 }
 
 pub(crate) struct FoldMark {
@@ -848,6 +850,7 @@ impl Element for EditorElement {
                 lines: lines.clone(),
             };
             let folds = ed.fold_marks(&lines, bounds, window);
+            let squiggles = ed.squiggles(&lines, content_w);
             let (deco, tasks, copy, langs) = if ed.mode == Mode::Source {
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new())
             } else {
@@ -875,6 +878,7 @@ impl Element for EditorElement {
                 cursors,
                 drag_cursor,
                 folds,
+                squiggles,
             }
         })
     }
@@ -926,7 +930,10 @@ impl Element for EditorElement {
                 if phase.bubble()
                     && e.button == MouseButton::Right
                     && hitbox.is_hovered(window)
-                    && editor.update(cx, |ed, cx| ed.table_menu_at(e.position, window, cx))
+                    && editor.update(cx, |ed, cx| {
+                        ed.table_menu_at(e.position, window, cx)
+                            || ed.spell_menu_at(e.position, window, cx)
+                    })
                 {
                     cx.stop_propagation();
                 }
@@ -1048,6 +1055,23 @@ impl Element for EditorElement {
             }
             for t in &frame.tasks {
                 t.paint(window);
+            }
+            // A wavy line under each misspelt word (or doubtful phrase).
+            for (r, color) in &frame.squiggles {
+                let y = r.bottom() - px(2.5);
+                let (step, amp) = (px(2.), px(1.2));
+                let mut wave = PathBuilder::stroke(px(1.));
+                let mut x = r.left();
+                let mut up = true;
+                wave.move_to(point(x, y));
+                while x < r.right() {
+                    x += step;
+                    wave.line_to(point(x.min(r.right()), if up { y - amp } else { y + amp }));
+                    up = !up;
+                }
+                if let Ok(path) = wave.build() {
+                    window.paint_path(path, *color);
+                }
             }
             // Fold chevrons: pointing down when open, right when folded;
             // and the `…` a folded block leaves.

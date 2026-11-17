@@ -91,6 +91,12 @@ pub struct Prefs {
     pub sidebar_width: f32,
     /// Load documents' images from the web without asking.
     pub remote_images: bool,
+    /// Underline misspellings; and grammar too.
+    pub spell_check: bool,
+    pub grammar: bool,
+    /// The English spelling follows: american, british, canadian,
+    /// australian or indian.
+    pub dialect: String,
 }
 
 impl Default for Prefs {
@@ -106,6 +112,9 @@ impl Default for Prefs {
             sidebar_open: true,
             sidebar_width: 240.0,
             remote_images: false,
+            spell_check: false,
+            grammar: false,
+            dialect: "american".into(),
         }
     }
 }

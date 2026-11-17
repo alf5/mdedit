@@ -114,7 +114,7 @@ mod tests {
         let t = "# A\ntext\n\n## B\nmore\n\n# C\nend";
         assert_eq!(heads(t), vec![(0, 1..5), (3, 4..5), (6, 7..8)]);
         // An empty section has nothing to fold.
-        assert_eq!(heads("# A\n\n# B"), vec![]);
+        assert!(heads("# A\n\n# B").is_empty());
         // A setext heading keeps its underline.
         assert_eq!(heads("Title\n=====\nbody"), vec![(0, 2..3)]);
     }
@@ -139,6 +139,6 @@ mod tests {
         let f = folds(&parse("# A\n## B\nx\n## C\ny"));
         assert_eq!(hidden(&f, [1, 0]), vec![1..5]);
         assert_eq!(hidden(&f, [1, 3]), vec![2..3, 4..5]);
-        assert_eq!(hidden(&f, [7]), vec![]);
+        assert!(hidden(&f, [7]).is_empty());
     }
 }

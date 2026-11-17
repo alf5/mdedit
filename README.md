@@ -130,6 +130,13 @@ nothing is converted back and forth behind your back.
   beside the line (or press `Ctrl/Cmd+Shift+[`); a folded block leaves a `…`
   that opens it again, as does `Ctrl/Cmd+Shift+]`, or the caret moving into
   it. **Fold All** and **Unfold All** are in the command palette.
+- **Spell checking**, off until turned on in **Settings**: misspelt words
+  get a wavy red line, and with grammar on, doubtful phrases a blue one.
+  Right-click one for suggestions, to add the word to your dictionary
+  (`<config>/mdedit/dictionary.txt`) or to ignore it in this document.
+  Code, formulas, links' targets and tags are left alone. It's English
+  only (US, UK, Canadian, Australian or Indian spelling), by
+  [Harper](https://writewithharper.com), on this computer.
 - **Find and replace** (`Ctrl/Cmd+F`, `Ctrl+H` or `Cmd+Alt+F`), with a match
   count, case matching, and replace one or all.
 - **Smart paste.**

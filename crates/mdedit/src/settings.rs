@@ -3,7 +3,7 @@
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{ActiveTheme, Sizable as _};
+use gpui_kit::component::{ActiveTheme, Disableable as _, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use mdedit_core::prefs::{Mode, Prefs, Style};
@@ -344,6 +344,56 @@ impl Render for SettingsPage {
                                         change(w, cx, |p| p.remote_images = on)
                                     }),
                             )),
+                    )
+                    .child(
+                        Self::section("Spelling", "English only, checked on this computer.", cx)
+                            .child(Self::row(
+                                "Underline misspelt words",
+                                Switch::new("spell-check")
+                                    .checked(prefs.spell_check)
+                                    .on_click(|on, w, cx| {
+                                        let on = *on;
+                                        change(w, cx, |p| p.spell_check = on)
+                                    }),
+                            ))
+                            .child(Self::row(
+                                "Suggest grammar and style fixes too",
+                                Switch::new("grammar")
+                                    .checked(prefs.grammar)
+                                    .disabled(!prefs.spell_check)
+                                    .on_click(|on, w, cx| {
+                                        let on = *on;
+                                        change(w, cx, |p| p.grammar = on)
+                                    }),
+                            ))
+                            .child(Self::row(
+                                "Spelling",
+                                div().flex().gap(px(4.)).children(
+                                    [
+                                        ("american", "US"),
+                                        ("british", "UK"),
+                                        ("canadian", "Canada"),
+                                        ("australian", "Australia"),
+                                        ("indian", "India"),
+                                    ]
+                                    .map(|(id, label)| {
+                                        Button::new(id)
+                                            .small()
+                                            .label(label)
+                                            .disabled(!prefs.spell_check)
+                                            .map(|b| if prefs.dialect == id { b.primary() } else { b.outline() })
+                                            .on_click(move |_, w, cx| {
+                                                change(w, cx, |p| p.dialect = id.to_string())
+                                            })
+                                    }),
+                                ),
+                            ))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(muted)
+                                    .child("Right-click an underlined word for suggestions, or to add it to your dictionary."),
+                            ),
                     )
                     .child(
                         Self::section("About", "", cx).child(

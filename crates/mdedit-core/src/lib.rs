@@ -23,6 +23,7 @@ pub mod os;
 pub mod prefs;
 pub mod project;
 pub mod scan;
+pub mod spell;
 pub mod syntax;
 pub mod table;
 pub mod themes;

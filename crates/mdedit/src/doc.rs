@@ -425,7 +425,11 @@ impl DocView {
     pub fn restyle(&mut self, cx: &mut Context<Self>) {
         if let Body::Markdown { editor, .. } = &self.body {
             let style = DocStyle::new(AppState::prefs(cx), crate::theme::palette(cx));
-            editor.update(cx, |e, cx| e.set_style(style, cx));
+            editor.update(cx, |e, cx| {
+                e.set_style(style, cx);
+                // Spelling may have been turned on or off.
+                e.check_spelling(cx);
+            });
         }
     }
 

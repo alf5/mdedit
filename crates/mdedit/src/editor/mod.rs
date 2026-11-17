@@ -17,6 +17,7 @@ pub mod find_bar;
 mod grid;
 mod highlight;
 mod overlays;
+mod spelling;
 pub mod style;
 pub(crate) mod table;
 pub(crate) mod widgets;
@@ -337,6 +338,13 @@ pub struct MarkdownEditor {
     /// The note previewed under the pointer (Ctrl/Cmd held over its wiki
     /// link), and where; and one about to be.
     preview: Option<(String, Point<Pixels>)>,
+    /// Spelling and grammar issues (sorted), the check under way, words
+    /// ignored in this document, and a count of edits, so a check that
+    /// finishes after another edit is dropped.
+    issues: Vec<mdedit_core::spell::Issue>,
+    spell_task: Option<Task<()>>,
+    ignored_words: std::collections::HashSet<String>,
+    version: u64,
     preview_wait: Option<(String, Task<()>)>,
     max_scroll: Pixels,
     /// Drawn diagrams and formulas, by source and look.
@@ -437,6 +445,10 @@ impl MarkdownEditor {
             pdf_pages: HashMap::new(),
             content_h: px(0.),
             preview: None,
+            issues: Vec::new(),
+            spell_task: None,
+            ignored_words: std::collections::HashSet::new(),
+            version: 0,
             preview_wait: None,
             max_scroll: px(0.),
             pictures: HashMap::new(),
@@ -467,6 +479,7 @@ impl MarkdownEditor {
         };
         this.refresh_folds();
         this.rebuild_slots();
+        this.check_spelling(cx);
         this.recount();
         this.update_reveal();
         this
@@ -799,6 +812,7 @@ impl MarkdownEditor {
         }
         let before = self.sel;
         self.carry_folds(&change.edits);
+        self.carry_issues(&change.edits);
         let inverse = buffer::apply(&mut self.text, &change.edits);
         self.history.record(
             change.edits,
@@ -814,6 +828,8 @@ impl MarkdownEditor {
 
     fn after_edit(&mut self, cx: &mut Context<Self>) {
         self.syntax = syntax::parse(&self.text);
+        self.version += 1;
+        self.check_spelling(cx);
         self.refresh_folds();
         self.unfold_at(self.sel.head);
         self.rebuild_slots();
@@ -2200,10 +2216,13 @@ impl MarkdownEditor {
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
-        let before = (!self.folded.is_empty()).then(|| self.text.clone());
+        let before =
+            (!self.folded.is_empty() || !self.issues.is_empty()).then(|| self.text.clone());
         if let Some(sel) = self.history.undo(&mut self.text) {
             if let Some(before) = before {
-                self.carry_folds(&[buffer::diff(&before, &self.text)]);
+                let edit = [buffer::diff(&before, &self.text)];
+                self.carry_folds(&edit);
+                self.carry_issues(&edit);
             }
             self.sel = sel.clamp(self.text.len());
             self.after_edit(cx);
@@ -2211,10 +2230,13 @@ impl MarkdownEditor {
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
-        let before = (!self.folded.is_empty()).then(|| self.text.clone());
+        let before =
+            (!self.folded.is_empty() || !self.issues.is_empty()).then(|| self.text.clone());
         if let Some(sel) = self.history.redo(&mut self.text) {
             if let Some(before) = before {
-                self.carry_folds(&[buffer::diff(&before, &self.text)]);
+                let edit = [buffer::diff(&before, &self.text)];
+                self.carry_folds(&edit);
+                self.carry_issues(&edit);
             }
             self.sel = sel.clamp(self.text.len());
             self.after_edit(cx);

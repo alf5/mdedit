@@ -1233,3 +1233,44 @@ fn holding_ctrl_over_a_wiki_link_previews_its_note(cx: &mut TestAppContext) {
     assert!(ed.read_with(cx, |e, _| e.preview.is_none()));
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[gpui_kit::test]
+fn misspellings_are_underlined_only_when_asked(cx: &mut TestAppContext) {
+    cx.update(crate::state::AppState::init_ephemeral);
+    let (h, ed) = open(cx, "A wierd word.\n", Mode::Rendered);
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(500));
+    cx.run_until_parked();
+    assert!(
+        ed.read_with(cx, |e, _| e.issues.is_empty()),
+        "off by default"
+    );
+
+    cx.update(|cx| crate::state::AppState::update_prefs(cx, |p| p.spell_check = true));
+    ed.update(cx, |e, cx| e.check_spelling(cx));
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(500));
+    cx.run_until_parked();
+    let found = ed.read_with(cx, |e, _| {
+        e.issues
+            .iter()
+            .map(|i| e.text()[i.range.clone()].to_string())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(found, vec!["wierd"]);
+    // Typing elsewhere keeps the underline under its word.
+    caret(cx, &ed, 0);
+    typed(cx, h, "So: ");
+    let found = ed.read_with(cx, |e, _| {
+        e.issues
+            .iter()
+            .map(|i| e.text()[i.range.clone()].to_string())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(found, vec!["wierd"]);
+    // Ignored here: not drawn.
+    ed.update(cx, |e, _| {
+        e.ignored_words.insert("wierd".into());
+    });
+    assert_eq!(ed.read_with(cx, |e, _| e.shown_issues().count()), 0);
+}

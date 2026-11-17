@@ -320,7 +320,7 @@ cargo generate-rpm -p crates/mdedit            # Linux only
 ```
 
 CI builds the installers on every push for Linux, Windows and macOS.
-Tagging a release (`git tag v2.0.0 && git push --tags`) attaches them to a
+Tagging a release (`git tag v2.1.0 && git push --tags`) attaches them to a
 GitHub release.
 
 ## Licence

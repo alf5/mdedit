@@ -1,6 +1,6 @@
 pkgbase = mdedit
 	pkgdesc = A Markdown editor that shows your writing, not your markup
-	pkgver = 2.0.0
+	pkgver = 2.1.0
 	pkgrel = 1
 	url = https://github.com/alf5/mdedit
 	install = mdedit.install

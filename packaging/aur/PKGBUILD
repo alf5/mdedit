@@ -8,7 +8,7 @@
 #
 # Keep pkgver in sync with the workspace version in ../../Cargo.toml.
 pkgname=mdedit
-pkgver=2.0.0
+pkgver=2.1.0
 pkgrel=1
 pkgdesc="A Markdown editor that shows your writing, not your markup"
 arch=('x86_64' 'aarch64')

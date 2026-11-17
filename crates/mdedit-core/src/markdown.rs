@@ -10,6 +10,19 @@ use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd,
 /// and alerts (`> [!NOTE]` etc., via ENABLE_GFM). ```` ```mermaid ```` fences
 /// become inline SVG diagrams (see [`crate::mermaid`]).
 pub fn to_html(md: &str) -> String {
+    to_html_with(md, None)
+}
+
+/// What an export puts for `![[Note]]`: the Markdown it stands for.
+pub type EmbedSource<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+/// [`to_html`], with `![[Note]]` and `![[Note#Part]]` drawn in place from
+/// `embed` (two deep at most).
+pub fn to_html_with(md: &str, embed: Option<EmbedSource>) -> String {
+    to_html_at(md, embed, 0)
+}
+
+fn to_html_at(md: &str, embed: Option<EmbedSource>, depth: u8) -> String {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_FOOTNOTES);
@@ -22,7 +35,8 @@ pub fn to_html(md: &str) -> String {
     let md = &md[crate::syntax::frontmatter_end(md).unwrap_or(0)..];
     let parser = Parser::new_ext(md, opts);
     let mut out = String::new();
-    let events = SizedImages::new(TableWidths::new(MermaidFences::new(parser))).map(render_math);
+    let events = SizedImages::new(TableWidths::new(MermaidFences::new(parser)), embed, depth)
+        .map(render_math);
     html::push_html(&mut out, events);
     out
 }
@@ -30,15 +44,19 @@ pub fn to_html(md: &str) -> String {
 /// Writes each image as an `<img>` itself, so Obsidian's sizes
 /// (`![cat|300](a.png)`, `![[a.png|300x200]]`) become `width` and `height`,
 /// and a wiki embed's alt is its file's name.
-struct SizedImages<'a, I> {
+struct SizedImages<'a, 'e, I> {
     inner: I,
+    embed: Option<EmbedSource<'e>>,
+    depth: u8,
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
-impl<'a, I> SizedImages<'a, I> {
-    fn new(inner: I) -> Self {
+impl<'a, 'e, I> SizedImages<'a, 'e, I> {
+    fn new(inner: I, embed: Option<EmbedSource<'e>>, depth: u8) -> Self {
         Self {
             inner,
+            embed,
+            depth,
             _marker: std::marker::PhantomData,
         }
     }
@@ -51,7 +69,7 @@ fn attr(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-impl<'a, I: Iterator<Item = Event<'a>>> Iterator for SizedImages<'a, I> {
+impl<'a, I: Iterator<Item = Event<'a>>> Iterator for SizedImages<'a, '_, I> {
     type Item = Event<'a>;
 
     fn next(&mut self) -> Option<Event<'a>> {
@@ -77,6 +95,31 @@ impl<'a, I: Iterator<Item = Event<'a>>> Iterator for SizedImages<'a, I> {
             }
         }
         let wiki = matches!(link_type, pulldown_cmark::LinkType::WikiLink { .. });
+        let file = dest_url.split('#').next().unwrap_or("");
+        if wiki && crate::project::image_mime(std::path::Path::new(file)).is_none() {
+            // `![[Note]]`: the note itself, on a card; a PDF, a link to it.
+            let html = if file.to_ascii_lowercase().ends_with(".pdf") {
+                format!(
+                    "<a class=\"embed-file\" href=\"{}\">{}</a>",
+                    attr(&file.replace(' ', "%20")),
+                    attr(&dest_url)
+                )
+            } else {
+                match self
+                    .embed
+                    .filter(|_| self.depth < 2)
+                    .and_then(|f| f(&dest_url))
+                {
+                    Some(md) => format!(
+                        "<div class=\"embed\"><div class=\"embed-title\">{}</div>\n{}</div>",
+                        attr(&dest_url),
+                        to_html_at(&md, self.embed, self.depth + 1)
+                    ),
+                    None => format!("<span class=\"embed-missing\">{}</span>", attr(&dest_url)),
+                }
+            };
+            return Some(Event::Html(CowStr::Boxed(html.into_boxed_str())));
+        }
         let (alt, size) = crate::syntax::image_size(&alt, wiki);
         let alt = if wiki && alt.is_empty() {
             &dest_url
@@ -393,5 +436,28 @@ mod tests {
             html.contains(r#"<img src="y.png" alt="x" title="T" />"#),
             "{html}"
         );
+    }
+
+    #[test]
+    fn notes_embed_in_place() {
+        let embed = |t: &str| (t == "Other#Part").then(|| "## Part\n\n**hi**".to_string());
+        let html = to_html_with("![[Other#Part]]\n\n![[Gone]]\n\n![[a.pdf]]\n", Some(&embed));
+        assert!(
+            html.contains("<div class=\"embed\"><div class=\"embed-title\">Other#Part</div>"),
+            "{html}"
+        );
+        assert!(html.contains("<strong>hi</strong>"), "{html}");
+        assert!(
+            html.contains("<span class=\"embed-missing\">Gone</span>"),
+            "{html}"
+        );
+        assert!(
+            html.contains("<a class=\"embed-file\" href=\"a.pdf\">a.pdf</a>"),
+            "{html}"
+        );
+        // A note embedding itself stops two deep.
+        let me = |_: &str| Some("![[Me]]".to_string());
+        let html = to_html_with("![[Me]]", Some(&me));
+        assert_eq!(html.matches("class=\"embed\"").count(), 2, "{html}");
     }
 }

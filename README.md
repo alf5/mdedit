@@ -109,6 +109,16 @@ nothing is converted back and forth behind your back.
   note's headings. A `#` starting a word lists the tags this document and
   the open folder use. `Up`/`Down` choose, `Enter` or `Tab` takes one,
   `Esc` closes the list.
+- **Embeds**: `![[Note]]` draws that note in place, on a card, and
+  `![[Note#Heading]]` just that part of it. The card follows the note as it
+  changes; its title shows the embed's source, and **Open** opens the note.
+  `![[file.pdf]]` (or `#page=3`) draws a page of a PDF. HTML and PDF
+  exports include embedded notes.
+- **Previews**: hold `Ctrl/Cmd` over a wiki link for a moment to see its
+  note.
+- **Backlinks**: the sidebar's **Backlinks** tab lists the notes in the open
+  folder that link to the document, each with the line its link is on; a
+  click opens it there.
 - **Frontmatter**: a YAML block opening the document (between `---` lines)
   is drawn as a card of its keys and values. HTML and PDF exports leave it
   out.
@@ -141,11 +151,12 @@ nothing is converted back and forth behind your back.
     Folder.
 - **Side by side**: `Ctrl/Cmd+\` (or dragging a tab) splits the window. Each
   side has its own tabs, and every side can be edited.
-- **The sidebar** (`Ctrl/Cmd+Shift+L`) has two tabs:
+- **The sidebar** (`Ctrl/Cmd+Shift+L`) has three tabs:
   - **Outline** shows the document's headings, follows the caret, and jumps
     on a click.
   - **Files** shows the folder opened with `Ctrl/Cmd+Shift+K`. It reads each
     directory when you expand it.
+  - **Backlinks** lists what links to the document (see above).
 - **Quick Open** (`Ctrl/Cmd+P`) searches recent files and the open folder.
 - **Anything opens.**
   - **Markdown** gets the editor.

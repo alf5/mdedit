@@ -200,6 +200,10 @@ impl Writer<'_> {
     }
 
     fn image(&mut self, url: &str, alt: &str, wiki: bool) {
+        let file = url.split('#').next().unwrap_or("");
+        if wiki && mdedit_core::project::image_mime(std::path::Path::new(file)).is_none() {
+            return self.embed(url);
+        }
         let (alt, size) = mdedit_core::syntax::image_size(alt, wiki);
         let found = if wiki {
             let dir = self.opts.base_dir.as_deref();
@@ -243,6 +247,29 @@ impl Writer<'_> {
             }
             _ => self.out.push_str(&lit(alt)),
         }
+    }
+
+    /// `![[Note]]` or `![[Note#Part]]`: the note's text, set in place with
+    /// a rule down its side, two deep at most; anything else, its name.
+    fn embed(&mut self, target: &str) {
+        thread_local! {
+            static DEPTH: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+        }
+        let dir = self.opts.base_dir.as_deref();
+        let depth = DEPTH.with(|d| d.get());
+        let source = (depth < 2)
+            .then(|| mdedit_core::wiki::embed_source(target, dir, dir, None))
+            .flatten();
+        let Some(md) = source else {
+            self.out.push_str(&lit(target));
+            return;
+        };
+        DEPTH.with(|d| d.set(depth + 1));
+        let inner = to_typst(&md, self.opts, self.files);
+        DEPTH.with(|d| d.set(depth));
+        self.out.push_str(&format!(
+            "#block(width: 100%, inset: (left: 10pt, y: 4pt), stroke: (left: 2pt + luma(190)))[{inner}]"
+        ));
     }
 
     fn event(&mut self, event: Event) {
@@ -664,6 +691,27 @@ mod tests {
             t.contains("width: 493pt, height: 246.5pt, fit: \"stretch\""),
             "{t}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn notes_embed_in_place() {
+        let dir = std::env::temp_dir().join(format!("mdedit-pdf-embed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Other.md"), "# Other\n\n## Part\n\nInside text.\n").unwrap();
+        std::fs::write(dir.join("Me.md"), "![[Me]]\n").unwrap();
+        let o = Options {
+            base_dir: Some(dir.clone()),
+            ..opts()
+        };
+        let mut files = HashMap::new();
+        let t = to_typst("![[Other#Part]]\n\n![[Gone]]\n", &o, &mut files);
+        assert!(t.contains("#block(width: 100%"), "{t}");
+        assert!(t.contains("Inside text."), "{t}");
+        assert!(!t.contains("# Other"), "only the part: {t}");
+        assert!(t.contains("#\"Gone\";"), "{t}");
+        let t = to_typst("![[Me]]\n", &o, &mut files);
+        assert_eq!(t.matches("#block(width: 100%").count(), 2, "{t}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

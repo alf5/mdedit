@@ -28,6 +28,7 @@ syntect = { version = "5.3", default-features = false, features = ["parsing", "r
 two-face = { version = "0.4.5", default-features = false, features = ["syntect-fancy"] }
 tempfile = "3"
 arboard = { version = "3", default-features = false, features = ["wayland-data-control"] }
+hayro = "0.9"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

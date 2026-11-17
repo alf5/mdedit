@@ -215,6 +215,32 @@
   margin-bottom: 0;
 }
 
+/* Obsidian's `![[Note]]`: the note, on a card under its name. */
+.markdown-body .embed {
+  margin: 0 0 16px 0;
+  padding: 0 1em 0.5em;
+  border: 1px solid var(--border);
+  border-left: 0.25em solid var(--quote-border);
+  border-radius: 8px;
+  background: var(--code-bg);
+}
+
+.markdown-body .embed-title {
+  margin: 0 -1em 0.75em;
+  padding: 0.35em 1em;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 0.8em;
+}
+
+.markdown-body .embed > :last-child {
+  margin-bottom: 0;
+}
+
+.markdown-body .embed-missing {
+  color: var(--text-muted);
+}
+
 /* GFM alerts */
 .markdown-body blockquote[class*="markdown-alert-"] {
   color: var(--text);

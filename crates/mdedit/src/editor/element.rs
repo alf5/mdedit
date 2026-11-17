@@ -165,7 +165,7 @@ impl MarkdownEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Prepared {
-        let pad = px(PAD_X);
+        let pad = px(if self.is_embedded() { 12. } else { PAD_X });
         let avail = max(bounds.size.width - pad * 2., px(160.));
         let content_w = match self.style.width {
             Some(w) => min(px(w), avail),
@@ -177,7 +177,7 @@ impl MarkdownEditor {
         }
         let content_x = bounds.left() + (bounds.size.width - content_w) / 2.;
         let view_h = bounds.size.height;
-        let top = px(PAD_TOP);
+        let top = px(if self.is_embedded() { 10. } else { PAD_TOP });
 
         if self.autoscroll {
             self.autoscroll = false;
@@ -265,9 +265,20 @@ impl MarkdownEditor {
                 y += h;
             }
         }
-        // Room to scroll the last line up to the middle of the window.
-        let total = y + view_h * 0.4;
+        // Room to scroll the last line up to the middle of the window (an
+        // embed just ends).
+        let total = if self.is_embedded() {
+            y + px(10.)
+        } else {
+            y + view_h * 0.4
+        };
+        if self.is_embedded() && (total - self.content_h).abs() > px(0.5) {
+            self.content_h = total;
+            // The card holding it sizes to it.
+            cx.emit(super::EditorEvent::Moved);
+        }
         let max_scroll = max(total - view_h, px(0.));
+        self.max_scroll = max_scroll;
         if self.scroll_y > max_scroll {
             self.scroll_y = max_scroll;
         }
@@ -808,13 +819,17 @@ impl Element for EditorElement {
             }
 
             let caret_ix = ed.row_at(ed.sel.head);
-            let caret = lines
-                .iter()
-                .find(|(ix, ..)| *ix == caret_ix)
-                .map(|(_, origin, l)| {
-                    let p = l.point(l.to_display(ed.sel.head));
-                    Bounds::new(*origin + p, size(px(2.), l.line_height))
-                });
+            let caret = (!ed.is_embedded())
+                .then(|| {
+                    lines
+                        .iter()
+                        .find(|(ix, ..)| *ix == caret_ix)
+                        .map(|(_, origin, l)| {
+                            let p = l.point(l.to_display(ed.sel.head));
+                            Bounds::new(*origin + p, size(px(2.), l.line_height))
+                        })
+                })
+                .flatten();
 
             let view_h = bounds.size.height;
             let thumb = (total > view_h + px(1.)).then(|| {
@@ -954,8 +969,9 @@ impl Element for EditorElement {
             window.on_mouse_event(move |e: &ScrollEvent, phase, window, cx| {
                 if phase.bubble() && hitbox.should_handle_scroll(window) {
                     let dy = e.delta.pixel_delta(px(20.)).y;
-                    editor.update(cx, |ed, cx| ed.scroll(dy, cx));
-                    cx.stop_propagation();
+                    if editor.update(cx, |ed, cx| ed.scroll(dy, cx)) {
+                        cx.stop_propagation();
+                    }
                 }
             });
         }

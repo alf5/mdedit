@@ -144,6 +144,9 @@ pub enum WidgetKind {
         wiki: bool,
         size: Option<(u32, Option<u32>)>,
     },
+    /// A paragraph that is only Obsidian's `![[Note]]` or `![[Note#Part]]`
+    /// (or `![[file.pdf]]`): the note, or a part of it, drawn in place.
+    Embed { target: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -677,9 +680,24 @@ pub fn parse(text: &str) -> Syntax {
                 }
                 if open.paragraph
                     && open.kids == 1
-                    && let Some((url, alt, wiki)) = open.image.clone()
+                    && let Some((url, _, true)) = &open.image
+                    && crate::project::image_mime(std::path::Path::new(url)).is_none()
+                {
                     // `![[Note]]` embeds a note, not a picture.
-                    && (!wiki || crate::project::image_mime(std::path::Path::new(&url)).is_some())
+                    let first = line_at(open.range.start, &lines);
+                    let last = line_at(
+                        open.range.end.saturating_sub(1).max(open.range.start),
+                        &lines,
+                    );
+                    widgets.push(Widget {
+                        lines: first..last + 1,
+                        kind: WidgetKind::Embed {
+                            target: url.clone(),
+                        },
+                    });
+                } else if open.paragraph
+                    && open.kids == 1
+                    && let Some((url, alt, wiki)) = open.image.clone()
                 {
                     let (alt, size) = image_size(&alt, wiki);
                     let alt = if wiki && (alt.is_empty() || alt == url) {
@@ -1286,5 +1304,11 @@ mod tests {
             "a number alone is alt text"
         );
         assert_eq!(image("![[Note]]"), None, "a note embed is no picture");
+        assert_eq!(
+            parse("![[Note#Part]]").widgets[0].kind,
+            WidgetKind::Embed {
+                target: "Note#Part".into()
+            }
+        );
     }
 }

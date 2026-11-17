@@ -12,6 +12,7 @@
 
 mod code;
 mod element;
+mod embed;
 pub mod find_bar;
 mod grid;
 mod highlight;
@@ -41,6 +42,7 @@ use self::element::EditorElement;
 use self::style::DocStyle;
 use crate::actions::*;
 
+#[derive(Clone)]
 pub enum EditorEvent {
     /// The text changed.
     Edited,
@@ -322,6 +324,21 @@ pub struct MarkdownEditor {
     hidden: Vec<Range<usize>>,
     fold_hover: Option<usize>,
     pub(crate) fold_buttons: Vec<(Bounds<Pixels>, usize)>,
+    /// How deep in embeds this editor is (0: a tab's own); one inside is
+    /// read-only. The notes it embeds, by target, and the height its
+    /// content took last frame.
+    pub(crate) embedded: u8,
+    embeds: HashMap<String, embed::Embedded>,
+    /// PDF pages drawn for `![[file.pdf]]`, by file, page, width and the
+    /// file's modified time.
+    #[allow(clippy::type_complexity)]
+    pdf_pages: HashMap<(PathBuf, usize, u32, Option<std::time::SystemTime>), embed::PdfPage>,
+    content_h: Pixels,
+    /// The note previewed under the pointer (Ctrl/Cmd held over its wiki
+    /// link), and where; and one about to be.
+    preview: Option<(String, Point<Pixels>)>,
+    preview_wait: Option<(String, Task<()>)>,
+    max_scroll: Pixels,
     /// Drawn diagrams and formulas, by source and look.
     pictures: HashMap<u64, widgets::Picture>,
     /// Highlighted code blocks, by content and language.
@@ -415,6 +432,13 @@ impl MarkdownEditor {
             hidden: Vec::new(),
             fold_hover: None,
             fold_buttons: Vec::new(),
+            embedded: 0,
+            embeds: HashMap::new(),
+            pdf_pages: HashMap::new(),
+            content_h: px(0.),
+            preview: None,
+            preview_wait: None,
+            max_scroll: px(0.),
             pictures: HashMap::new(),
             code_colors: HashMap::new(),
             code_theme,
@@ -768,7 +792,8 @@ impl MarkdownEditor {
 
     /// Apply a change as one undo step of `kind`.
     pub fn apply(&mut self, change: Change, kind: Kind, cx: &mut Context<Self>) {
-        if change.edits.is_empty() {
+        // An embed shows its note; it can't change it.
+        if change.edits.is_empty() || self.is_embedded() {
             self.set_selection(change.selection, cx);
             return;
         }
@@ -800,6 +825,27 @@ impl MarkdownEditor {
         self.goal_x = None;
         cx.emit(EditorEvent::Edited);
         cx.notify();
+    }
+
+    /// An embed's text, read again from its note.
+    pub(crate) fn load(&mut self, text: String, cx: &mut Context<Self>) {
+        self.text = text;
+        self.sel = Selection::caret(0);
+        self.history = History::default();
+        self.after_edit(cx);
+    }
+
+    /// The height the content took when last drawn (an estimate before
+    /// that), padding included.
+    pub(crate) fn content_height(&self) -> Pixels {
+        if self.content_h > px(0.) {
+            self.content_h
+        } else {
+            self.slots
+                .iter()
+                .map(|s| s.height)
+                .fold(px(24.), |a, b| a + b)
+        }
     }
 
     /// Replace the whole text (a reload from disk), keeping the caret as
@@ -926,9 +972,6 @@ impl MarkdownEditor {
         }
     }
 
-    /// The file a wiki link's note is in, if there's one: in the document's
-    /// folder, or by name anywhere in the project. Remembered until the
-    /// layout is next rebuilt.
     /// The index of files wiki links are looked up in: the open folder's,
     /// or the document's own folder's. Rebuilt when ten seconds old.
     pub(crate) fn wiki_files(&mut self) -> Option<Rc<mdedit_core::wiki::Index>> {
@@ -943,6 +986,9 @@ impl MarkdownEditor {
         self.wiki_index.as_ref().map(|(_, ix)| ix.clone())
     }
 
+    /// The file a wiki link's note is in, if there's one: in the document's
+    /// folder, or by name anywhere in the project. Remembered until the
+    /// layout is next rebuilt.
     pub(crate) fn wiki_note(&mut self, note: &str) -> Option<PathBuf> {
         if let Some(found) = self.wiki_found.get(note) {
             return found.clone();
@@ -2608,13 +2654,43 @@ impl MarkdownEditor {
         modifiers: Modifiers,
         cx: &mut Context<Self>,
     ) {
-        let on = modifiers.secondary(cx)
-            && !modifiers.shift
-            && !self.is_selecting()
-            && self.link_under(p).is_some();
+        let held = modifiers.secondary(cx) && !modifiers.shift && !self.is_selecting();
+        let link = held.then(|| self.link_under(p)).flatten();
+        let on = link.is_some();
         if on != self.link_hover {
             self.link_hover = on;
             cx.notify();
+        }
+        // Held over a wiki link for a moment: a preview of its note.
+        let note = link.filter(|l| l.wiki).map(|l| l.url);
+        let shown = self.preview.as_ref().map(|(t, _)| t.clone());
+        let waiting = self.preview_wait.as_ref().map(|(t, _)| t.clone());
+        let Some(target) = note else {
+            self.preview_wait = None;
+            if self.preview.take().is_some() {
+                cx.notify();
+            }
+            return;
+        };
+        if Some(&target) != shown.as_ref() && Some(&target) != waiting.as_ref() {
+            self.preview = None;
+            let wait = cx.spawn({
+                let target = target.clone();
+                async move |this, cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(500))
+                        .await;
+                    this.update(cx, |e, cx| {
+                        if e.preview_wait.as_ref().is_some_and(|(t, _)| *t == target) {
+                            e.preview_wait = None;
+                            e.preview = Some((target, p));
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                }
+            });
+            self.preview_wait = Some((target, wait));
         }
     }
 
@@ -2761,10 +2837,22 @@ impl MarkdownEditor {
         self.selecting.is_some()
     }
 
-    pub(crate) fn scroll(&mut self, dy: Pixels, cx: &mut Context<Self>) {
-        self.scroll_y = max(self.scroll_y - dy, px(0.));
+    /// Scroll by `dy`. Whether it moved (an embed at its end lets the
+    /// document around it scroll instead).
+    pub(crate) fn scroll(&mut self, dy: Pixels, cx: &mut Context<Self>) -> bool {
+        let to = min(max(self.scroll_y - dy, px(0.)), self.max_scroll);
+        let moved = to != self.scroll_y;
+        if self.is_embedded() && !moved {
+            return false;
+        }
+        self.scroll_y = if self.is_embedded() {
+            to
+        } else {
+            max(self.scroll_y - dy, px(0.))
+        };
         self.autoscroll = false;
         cx.notify();
+        true
     }
 }
 
@@ -2901,6 +2989,7 @@ impl EntityInputHandler for MarkdownEditor {
 impl Render for MarkdownEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let overlay = self.render_overlays(window, cx);
+        let preview = self.render_preview(cx);
         div()
             .key_context("MdEditor")
             .track_focus(&self.focus)
@@ -2980,6 +3069,7 @@ impl Render for MarkdownEditor {
             .cursor(CursorStyle::IBeam)
             .child(EditorElement::new(cx.entity()))
             .children(overlay)
+            .children(preview)
             .children(self.menu.as_ref().map(|(menu, at, _)| {
                 deferred(
                     anchored()

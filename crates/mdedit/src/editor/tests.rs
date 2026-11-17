@@ -1123,3 +1123,113 @@ fn a_pasted_image_is_saved_beside_the_document(cx: &mut TestAppContext) {
     std::fs::remove_file(&away).ok();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[gpui_kit::test]
+fn an_embed_shows_its_note_and_cannot_change_it(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("mdedit-embed-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("Other.md"),
+        "# Other\n\n## Part\nhello\n## Next\nbye\n",
+    )
+    .unwrap();
+    let (h, ed) = open(
+        cx,
+        "Before\n\n![[Other#Part]]\n\n![[Missing]]\n\nafter\n",
+        Mode::Rendered,
+    );
+    let d = dir.clone();
+    ed.update(cx, |e, cx| e.set_base_dir(Some(d), cx));
+    cx.update_window(h, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+    let inner = ed.read_with(cx, |e, _| {
+        assert_eq!(e.embeds.len(), 1, "only the note that exists is embedded");
+        e.embeds["Other#Part"].editor.clone()
+    });
+    assert_eq!(
+        inner.read_with(cx, |e, _| e.text().to_string()),
+        "## Part\nhello"
+    );
+    assert!(inner.read_with(cx, |e, _| e.content_height()) > px(20.));
+    // Read-only: typing into it changes nothing.
+    inner.update(cx, |e, cx| {
+        e.replace_selection("x", mdedit_core::history::Kind::Typing, cx)
+    });
+    assert_eq!(
+        inner.read_with(cx, |e, _| e.text().to_string()),
+        "## Part\nhello"
+    );
+    // The note changing on disk shows.
+    std::fs::write(dir.join("Other.md"), "# Other\n\n## Part\nhello again\n").unwrap();
+    // A different modified time, even on a coarse clock.
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+    std::fs::File::options()
+        .write(true)
+        .open(dir.join("Other.md"))
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+    ed.update(cx, |_, cx| cx.notify());
+    cx.update_window(h, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    assert_eq!(
+        inner.read_with(cx, |e, _| e.text().to_string()),
+        "## Part\nhello again"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[gpui_kit::test]
+fn holding_ctrl_over_a_wiki_link_previews_its_note(cx: &mut TestAppContext) {
+    use gpui_kit::{InputEvent as _, Modifiers, MouseMoveEvent, Pixels};
+    let dir = std::env::temp_dir().join(format!("mdedit-preview-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Note.md"), "# Note\n\nIts text.\n").unwrap();
+    let doc = "See [[Note]] here.\n";
+    let (h, ed) = open(cx, doc, Mode::Rendered);
+    let d = dir.clone();
+    ed.update(cx, |e, cx| e.set_base_dir(Some(d), cx));
+    cx.update_window(h, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    let at: Point<Pixels> = ed.read_with(cx, |e, _| {
+        let (_, origin, l) = e.geometry.lines[0].clone();
+        let d = l.to_display(doc.find("Note").unwrap());
+        l.rects(origin, d, l.next(d), false, px(800.))[0].center()
+    });
+    let ctrl = cx.update(|cx| Modifiers::secondary_key(cx));
+    let send = |cx: &mut TestAppContext, modifiers: Modifiers| {
+        cx.update_window(h, |_, window, cx| {
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: at,
+                    pressed_button: None,
+                    modifiers,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.render_frame(cx);
+        })
+        .unwrap();
+    };
+    send(cx, ctrl);
+    assert!(ed.read_with(cx, |e, _| e.preview.is_none()), "not at once");
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(600));
+    cx.run_until_parked();
+    assert_eq!(
+        ed.read_with(cx, |e, _| e.preview.as_ref().map(|(t, _)| t.clone())),
+        Some("Note".into())
+    );
+    cx.update_window(h, |_, window, cx| window.render_frame(cx))
+        .unwrap();
+    assert!(
+        ed.read_with(cx, |e, _| e.embeds.contains_key("Note")),
+        "drawn"
+    );
+    // Letting go of Ctrl takes it away.
+    send(cx, Modifiers::default());
+    assert!(ed.read_with(cx, |e, _| e.preview.is_none()));
+    std::fs::remove_dir_all(&dir).ok();
+}

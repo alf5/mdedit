@@ -49,6 +49,7 @@ impl Pane {
 enum SidebarTab {
     Files,
     Outline,
+    Backlinks,
 }
 
 /// A question about unsaved changes that is waiting for its answer.
@@ -102,6 +103,9 @@ pub struct Workspace {
     files: Entity<FilesPanel>,
     sidebar_open: bool,
     sidebar_tab: SidebarTab,
+    /// A file being opened at a line (a backlink followed): where to put
+    /// the caret once its tab is up.
+    reveal_pending: Option<(PathBuf, usize)>,
     pending: Option<Pending>,
     /// Modified tabs the user chose not to save during this quit.
     quit_discarded: HashSet<EntityId>,
@@ -195,6 +199,7 @@ impl Workspace {
             // With no folder open, Files has nothing to show; the outline
             // does.
             sidebar_tab: SidebarTab::Outline,
+            reveal_pending: None,
             pending: None,
             quit_discarded: HashSet::new(),
             watch,
@@ -239,7 +244,35 @@ impl Workspace {
             self.panes[p].active = t;
             doc.focus_handle(cx).focus(window, cx);
             self.sync_files(cx);
+            self.reveal_if_pending(doc, window, cx);
             cx.notify();
+        }
+    }
+
+    /// Open `path` with the caret at the start of `line` (from 0).
+    fn open_at(&mut self, path: PathBuf, line: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.reveal_pending = Some((project::canonical(&path), line));
+        self.open_paths(vec![path], window, cx);
+    }
+
+    fn reveal_if_pending(
+        &mut self,
+        doc: &Entity<DocView>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((path, line)) = self.reveal_pending.clone() else {
+            return;
+        };
+        if doc.read(cx).path.as_deref() != Some(path.as_path()) {
+            return;
+        }
+        self.reveal_pending = None;
+        if let Some(editor) = doc.read(cx).markdown().cloned() {
+            editor.update(cx, |e, cx| {
+                let at = e.syntax().lines.get(line).map_or(0, |l| l.range.start);
+                e.reveal_offset(at, window, cx);
+            });
         }
     }
 
@@ -538,9 +571,24 @@ impl Workspace {
     }
 
     fn export_html(&mut self, _: &ExportHtml, window: &mut Window, cx: &mut Context<Self>) {
+        let root = self.files.read(cx).root().map(Path::to_path_buf);
         self.export(
             "html",
-            |name, md, _, cx| {
+            move |name, md, path, cx| {
+                // `![[Note]]` is found as the editor finds it.
+                let dir = path.and_then(Path::parent).map(Path::to_path_buf);
+                let index = root
+                    .as_deref()
+                    .or(dir.as_deref())
+                    .map(mdedit_core::wiki::Index::build);
+                let embed = |target: &str| {
+                    mdedit_core::wiki::embed_source(
+                        target,
+                        dir.as_deref(),
+                        root.as_deref(),
+                        index.as_ref(),
+                    )
+                };
                 let p = AppState::prefs(cx);
                 let mut class = p.style.css_class().to_string();
                 if p.numbered {
@@ -550,8 +598,14 @@ impl Workspace {
                     class.push_str(" md-full-width");
                 }
                 Ok(
-                    mdedit_core::export::export_html(name, md, class.trim(), p.theme())
-                        .into_bytes(),
+                    mdedit_core::export::export_html_with(
+                        name,
+                        md,
+                        class.trim(),
+                        p.theme(),
+                        &embed,
+                    )
+                    .into_bytes(),
                 )
             },
             window,
@@ -1963,6 +2017,13 @@ impl Workspace {
                 current,
                 cx,
             ))
+            .child(tab(
+                "tab-backlinks",
+                "Backlinks",
+                SidebarTab::Backlinks,
+                current,
+                cx,
+            ))
     }
 
     /// The active document's headings; the one the caret is under is
@@ -2054,6 +2115,100 @@ impl Workspace {
                         .collect()
                 })
                 .size_full(),
+            )
+            .into_any_element()
+    }
+}
+
+impl Workspace {
+    /// The notes in the open folder that link to the active document, each
+    /// link with its line; a click opens the note there.
+    fn render_backlinks(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (muted, fg, hover) = (
+            theme.muted_foreground,
+            theme.foreground,
+            theme.sidebar_accent,
+        );
+        let note = |msg: &'static str| {
+            div()
+                .p(px(14.))
+                .text_xs()
+                .text_color(muted)
+                .child(msg)
+                .into_any_element()
+        };
+        let Some(root) = self.files.read(cx).root().map(Path::to_path_buf) else {
+            return note("Open a folder to see which notes in it link here.");
+        };
+        let doc = self.active_doc().map(|d| d.read(cx));
+        let Some(doc) = doc.filter(|d| d.markdown().is_some()) else {
+            return note("Open a Markdown document to see what links to it.");
+        };
+        let Some(path) = doc.path.clone() else {
+            return note("Save the document to see what links to it.");
+        };
+        let Some(scan) = crate::scan::get(&root, cx) else {
+            return note("Looking through the folder…");
+        };
+        let links: Vec<(PathBuf, String, usize, String)> = scan
+            .backlinks(&path)
+            .into_iter()
+            .map(|(n, l)| {
+                let name = n
+                    .path
+                    .file_stem()
+                    .map_or(String::new(), |s| s.to_string_lossy().to_string());
+                (n.path.clone(), name, l.line, l.text.clone())
+            })
+            .collect();
+        if links.is_empty() {
+            return note("No notes in the folder link here yet.");
+        }
+        let count = links.len();
+        div()
+            .id("backlinks")
+            .size_full()
+            .overflow_y_scroll()
+            .py(px(6.))
+            .child(
+                div()
+                    .px(px(16.))
+                    .pb(px(4.))
+                    .text_xs()
+                    .text_color(muted)
+                    .child(if count == 1 {
+                        "1 link to this note".to_string()
+                    } else {
+                        format!("{count} links to this note")
+                    }),
+            )
+            .children(
+                links
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (path, name, line, text))| {
+                        div()
+                            .id(("backlink", i))
+                            .mx(px(6.))
+                            .px(px(10.))
+                            .py(px(5.))
+                            .rounded(px(5.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(hover))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(fg)
+                                    .truncate()
+                                    .child(name),
+                            )
+                            .child(div().text_xs().text_color(muted).line_clamp(2).child(text))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_at(path.clone(), line, window, cx);
+                            }))
+                    }),
             )
             .into_any_element()
     }
@@ -2185,6 +2340,9 @@ impl Render for Workspace {
                                     SidebarTab::Files => self.files.clone().into_any_element(),
                                     SidebarTab::Outline => {
                                         self.render_outline(cx).into_any_element()
+                                    }
+                                    SidebarTab::Backlinks => {
+                                        self.render_backlinks(cx).into_any_element()
                                     }
                                 })),
                         )
@@ -2451,6 +2609,46 @@ mod tests {
         });
         assert_eq!(text, "**word**");
         assert_eq!(tabs(cx, &ws)[0].len(), 1);
+    }
+
+    #[gpui_kit::test]
+    fn backlinks_list_and_follow_the_notes_linking_here(cx: &mut TestAppContext) {
+        let (h, ws) = setup(cx);
+        let dir = scratch("backlinks");
+        std::fs::write(dir.join("Target.md"), "# Target\n").unwrap();
+        std::fs::write(dir.join("one.md"), "intro\n\nsee [[Target]] here\n").unwrap();
+        std::fs::write(dir.join("two.md"), "nothing\n").unwrap();
+        let (d, target) = (dir.clone(), dir.join("Target.md"));
+        cx.update_window(h, |_, window, cx| {
+            ws.update(cx, |ws, cx| {
+                ws.set_folder(Some(d), cx);
+                ws.open_paths(vec![target], window, cx);
+            })
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let root = mdedit_core::project::canonical(&dir);
+        cx.update(|cx| crate::scan::get(&root, cx));
+        cx.run_until_parked();
+        let scan = cx
+            .update(|cx| crate::scan::get(&root, cx))
+            .expect("scanned");
+        let found = scan.backlinks(&mdedit_core::project::canonical(&dir.join("Target.md")));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].1.line, 2);
+        // Following one opens its note with the caret on the link's line.
+        let one = dir.join("one.md");
+        cx.update_window(h, |_, window, cx| {
+            ws.update(cx, |ws, cx| ws.open_at(one, 2, window, cx))
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let doc = ws.read_with(cx, |ws, _| ws.active_doc().cloned().unwrap());
+        assert!(doc.read_with(cx, |d, _| {
+            d.path.as_ref().is_some_and(|p| p.ends_with("one.md"))
+        }));
+        let editor = doc.read_with(cx, |d, _| d.markdown().cloned().unwrap());
+        assert_eq!(editor.read_with(cx, |e, _| e.selection().head), 7);
     }
 
     #[gpui_kit::test]

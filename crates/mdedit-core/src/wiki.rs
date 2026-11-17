@@ -138,6 +138,42 @@ pub fn resolve(
     None
 }
 
+/// What `![[target]]` stands for in an export: the note's text, or the
+/// part of it `#Part` names. `None` when there's no such note or part.
+pub fn embed_source(
+    target: &str,
+    dir: Option<&Path>,
+    root: Option<&Path>,
+    index: Option<&Index>,
+) -> Option<String> {
+    let (note, part) = split(target);
+    let path = resolve(note, dir, root, index)?;
+    let text = std::fs::read_to_string(path).ok()?;
+    section(&text, part).map(str::to_string)
+}
+
+/// The part of a note `part` names: the heading of that name (whatever its
+/// case) and everything under it, up to the next heading of its level or
+/// above. The whole note when `part` is `None`; `None` when no heading has
+/// that name.
+pub fn section<'a>(text: &'a str, part: Option<&str>) -> Option<&'a str> {
+    let Some(part) = part else {
+        return Some(text);
+    };
+    let s = crate::syntax::parse(text);
+    let (n, h) = s
+        .headings
+        .iter()
+        .enumerate()
+        .find(|(_, h)| h.text.eq_ignore_ascii_case(part.trim()))?;
+    let start = s.lines[h.line].range.start;
+    let end = s.headings[n + 1..]
+        .iter()
+        .find(|o| o.level <= h.level)
+        .map_or(text.len(), |o| s.lines[o.line].range.start);
+    Some(text[start..end].trim_end())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +222,14 @@ mod tests {
         assert_eq!(find("Missing"), None);
         assert_eq!(find(""), None);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sections_run_to_the_next_heading_of_their_level() {
+        let t = "# A\nintro\n## B\nbee\n### C\nsea\n## D\ndee\n";
+        assert_eq!(section(t, Some("b")), Some("## B\nbee\n### C\nsea"));
+        assert_eq!(section(t, Some("D")), Some("## D\ndee"));
+        assert_eq!(section(t, None), Some(t));
+        assert_eq!(section(t, Some("nope")), None);
     }
 }

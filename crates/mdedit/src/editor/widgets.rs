@@ -230,6 +230,11 @@ impl MarkdownEditor {
                         .into_any_element(),
                 }
             }
+            WidgetKind::Embed { target } => {
+                let line = self.syntax.widgets[w].lines.start;
+                let start = self.syntax.lines[line].range.start;
+                self.embed_element(&target, Some(start), width, cx)
+            }
             WidgetKind::Image {
                 url,
                 alt,

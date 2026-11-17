@@ -71,6 +71,22 @@ pub fn export_html(title: &str, md: &str, extra_class: &str, theme: &str) -> Str
     build_document(title, &body_from_markdown(md), extra_class, theme)
 }
 
+/// [`export_html`], with `![[Note]]` embeds filled in from `embed`.
+pub fn export_html_with(
+    title: &str,
+    md: &str,
+    extra_class: &str,
+    theme: &str,
+    embed: crate::markdown::EmbedSource,
+) -> String {
+    build_document(
+        title,
+        &crate::markdown::to_html_with(md, Some(embed)),
+        extra_class,
+        theme,
+    )
+}
+
 /// Wrap a cleaned body in the standalone page. `extra_class` is appended to
 /// `markdown-body` so an export keeps the editor's style and full-width
 /// setting; pass `""` for the default sheet.

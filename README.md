@@ -66,7 +66,7 @@ nothing is converted back and forth behind your back.
     - copy the table as Markdown
     - duplicate or delete the table
     - delete a row or column
-  - **Columns line up in the source:** the table is padded when you leave
+  - **Columns line up in the source:** a table you edited is padded when you leave
     it.
 - **Diagrams and formulas.**
   - A ```` ```mermaid ```` fence draws as a diagram, using

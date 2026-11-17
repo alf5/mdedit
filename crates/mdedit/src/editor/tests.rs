@@ -1293,3 +1293,39 @@ fn line_spacing_scales_every_mode() {
         assert!((b / a - 1.15).abs() < 0.001, "{mode:?}: {a} → {b}");
     }
 }
+
+#[gpui_kit::test]
+fn leaving_a_table_changes_it_only_if_it_was_edited(cx: &mut TestAppContext) {
+    let doc = "| a | b |\n| - | - |\n| 1 | 2 |\n\nafter\n";
+    let (h, ed) = open(cx, doc, Mode::Rendered);
+    caret(cx, &ed, doc.find("2 |").unwrap());
+    keys(cx, h, &["down"]);
+    assert_eq!(text(cx, &ed), doc, "just passing through");
+    // Typed in: padded on the way out.
+    caret(cx, &ed, doc.find("2 |").unwrap() + 1);
+    typed(cx, h, "2");
+    keys(cx, h, &["down"]);
+    assert_eq!(
+        text(cx, &ed),
+        "| a   | b   |\n| --- | --- |\n| 1   | 22  |\n\nafter\n"
+    );
+}
+
+#[gpui_kit::test]
+fn a_code_block_keeps_its_colours_when_text_above_it_changes(cx: &mut TestAppContext) {
+    let doc = "Intro\n\n```rust\nfn main() {}\n```\n";
+    let (h, ed) = open(cx, doc, Mode::Rendered);
+    let spans = |cx: &mut TestAppContext| {
+        ed.update(cx, |e, _| {
+            let body = e.text().find("fn main").unwrap();
+            let s = e.code_spans(3).unwrap();
+            (body, s.iter().map(|s| s.range.start).min().unwrap())
+        })
+    };
+    let (body, first) = spans(cx);
+    assert_eq!(first, body);
+    caret(cx, &ed, 0);
+    typed(cx, h, "More ");
+    let (body, first) = spans(cx);
+    assert_eq!(first, body, "the colours moved with the block");
+}

@@ -335,6 +335,8 @@ pub struct MarkdownEditor {
     #[allow(clippy::type_complexity)]
     pdf_pages: HashMap<(PathBuf, usize, u32, Option<std::time::SystemTime>), embed::PdfPage>,
     content_h: Pixels,
+    /// The table the caret is in was edited, so leaving it pads it.
+    table_edited: bool,
     /// The note previewed under the pointer (Ctrl/Cmd held over its wiki
     /// link), and where; and one about to be.
     preview: Option<(String, Point<Pixels>)>,
@@ -444,6 +446,7 @@ impl MarkdownEditor {
             embeds: HashMap::new(),
             pdf_pages: HashMap::new(),
             content_h: px(0.),
+            table_edited: false,
             preview: None,
             issues: Vec::new(),
             spell_task: None,
@@ -811,6 +814,9 @@ impl MarkdownEditor {
             return;
         }
         let before = self.sel;
+        if self.table_at(self.sel.head) {
+            self.table_edited = true;
+        }
         self.carry_folds(&change.edits);
         self.carry_issues(&change.edits);
         let inverse = buffer::apply(&mut self.text, &change.edits);
@@ -911,7 +917,12 @@ impl MarkdownEditor {
                         .get(*w)
                         .is_some_and(|w| w.kind == mdedit_core::syntax::WidgetKind::Table)
                 });
-                if let Some(w) = left_table {
+                // Only a table that was edited: moving through one
+                // mustn't change the file.
+                let edited = std::mem::take(&mut self.table_edited);
+                if let Some(w) = left_table
+                    && edited
+                {
                     self.tidy_table(w, cx);
                 }
                 self.rebuild_slots();
@@ -986,6 +997,16 @@ impl MarkdownEditor {
             self.invalidate();
             cx.notify();
         }
+    }
+
+    /// Whether `pos` is in a table.
+    fn table_at(&self, pos: usize) -> bool {
+        self.widget_at(pos).is_some_and(|w| {
+            self.syntax
+                .widgets
+                .get(w)
+                .is_some_and(|w| w.kind == WidgetKind::Table)
+        })
     }
 
     /// The index of files wiki links are looked up in: the open folder's,
@@ -1573,7 +1594,9 @@ impl MarkdownEditor {
         };
         let body = &self.text[body_start..body_end.max(body_start)];
         let mut h = std::collections::hash_map::DefaultHasher::new();
-        std::hash::Hash::hash(&(body, &lang), &mut h);
+        // Where it starts too: the spans are in document offsets, so a
+        // block moved by an edit above it is coloured again.
+        std::hash::Hash::hash(&(body, &lang, body_start), &mut h);
         let key = std::hash::Hasher::finish(&h);
         if let Some(s) = self.code_colors.get(&key) {
             return Some(s.clone());

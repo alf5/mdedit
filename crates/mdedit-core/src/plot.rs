@@ -148,6 +148,13 @@ fn label(v: f64) -> String {
     if s == "-0" { "0".into() } else { s.into() }
 }
 
+fn is_color(c: &str) -> bool {
+    match c.strip_prefix('#') {
+        Some(h) => matches!(h.len(), 3 | 6 | 8) && h.chars().all(|ch| ch.is_ascii_hexdigit()),
+        None => !c.is_empty() && c.len() <= 24 && c.chars().all(|ch| ch.is_ascii_alphabetic()),
+    }
+}
+
 fn esc(s: &str) -> String {
     crate::mermaid::escape_text(s).replace('"', "&quot;")
 }
@@ -170,9 +177,13 @@ fn svg(src: &str, colors: &PlotColors) -> Result<(String, f64, f64), String> {
     const SAMPLES: usize = 600;
     let mut series: Vec<Drawn> = Vec::new();
     for (i, s) in cfg.data.iter().enumerate() {
+        // Only a colour goes into the SVG: `#rgb`, `#rrggbb`, `#rrggbbaa`
+        // or a name like `teal`; anything else takes the palette's.
         let color = s
             .color
-            .clone()
+            .as_deref()
+            .filter(|c| is_color(c))
+            .map(String::from)
             .unwrap_or_else(|| colors.series[i % colors.series.len().max(1)].clone());
         let kind = s.kind.as_deref().unwrap_or("linear");
         let scatter = s.graph.as_deref() == Some("scatter") || kind == "points";
@@ -457,6 +468,12 @@ mod tests {
             "{s}"
         );
         assert!(svg("{}", &colors()).unwrap_err().contains("no data"));
+        // A colour that isn't one never reaches the SVG.
+        let (s, ..) = svg(r##"{"data":[{"fn":"x","color":"red\"/><script>x</script>"},{"fn":"x","color":"#0a0"}]}"##, &colors()).unwrap();
+        assert!(
+            !s.contains("script") && s.contains("stroke=\"#00f\"") && s.contains("stroke=\"#0a0\""),
+            "{s}"
+        );
         assert!(
             svg(r#"{"data":[{"fn":"x +"}]}"#, &colors())
                 .unwrap_err()

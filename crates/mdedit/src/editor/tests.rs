@@ -863,3 +863,43 @@ fn ctrl_over_a_link_makes_the_pointer_a_hand(cx: &mut TestAppContext) {
     send(cx, p, ctrl);
     assert!(!hand(cx), "source mode");
 }
+
+#[gpui_kit::test]
+fn brackets_pair_in_prose_but_not_in_source(cx: &mut TestAppContext) {
+    let (h, ed) = open(cx, "", Mode::Rendered);
+    typed(cx, h, "f(");
+    assert_eq!(text(cx, &ed), "f()");
+    assert_eq!(head(cx, &ed), 2);
+    typed(cx, h, "x)");
+    assert_eq!(text(cx, &ed), "f(x)", "the closer steps over");
+    keys(cx, h, &["end"]);
+    typed(cx, h, " [");
+    keys(cx, h, &["backspace"]);
+    assert_eq!(text(cx, &ed), "f(x) ", "Backspace takes an empty pair out");
+
+    let (h, ed) = open(cx, "", Mode::Source);
+    typed(cx, h, "f(");
+    assert_eq!(text(cx, &ed), "f(");
+}
+
+#[gpui_kit::test]
+fn enter_renumbers_a_list_in_one_undo(cx: &mut TestAppContext) {
+    let (h, ed) = open(cx, "1. a\n2. b\n3. c", Mode::Rendered);
+    caret(cx, &ed, 4);
+    keys(cx, h, &["enter"]);
+    typed(cx, h, "new");
+    assert_eq!(text(cx, &ed), "1. a\n2. new\n3. b\n4. c");
+    keys(cx, h, &["ctrl-z", "ctrl-z"]);
+    assert_eq!(text(cx, &ed), "1. a\n2. b\n3. c");
+}
+
+#[gpui_kit::test]
+fn pasting_an_address_over_a_selection_links_it(cx: &mut TestAppContext) {
+    let (h, ed) = open(cx, "see the docs", Mode::Rendered);
+    ed.update(cx, |e, cx| e.set_selection(Selection::new(8, 12), cx));
+    cx.update(|cx| {
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string("https://x.y/z".into()))
+    });
+    keys(cx, h, &["ctrl-v"]);
+    assert_eq!(text(cx, &ed), "see the [docs](https://x.y/z)");
+}

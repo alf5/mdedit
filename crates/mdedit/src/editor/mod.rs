@@ -1743,7 +1743,14 @@ impl MarkdownEditor {
             && self.grid_widget(self.sel.head).is_none()
             && let Some(c) = edit::backspace_prefix(&self.text, self.sel)
         {
+            let c = edit::then_renumber(&self.text, c);
             return self.apply(c, Kind::Other, cx);
+        }
+        if self.rich()
+            && !matches!(self.caret_kind(), LineKind::Code | LineKind::FenceOpen)
+            && let Some(c) = edit::unpair(&self.text, self.sel)
+        {
+            return self.apply(c, Kind::Typing, cx);
         }
         let caret = self.sel.head;
         let (ix, d, layout) = self.caret_display(window);
@@ -1829,6 +1836,19 @@ impl MarkdownEditor {
         self.delete_range(r, cx);
     }
 
+    /// Brackets and quotes typed in prose come in pairs (`edit::pair`);
+    /// Source mode and code blocks type exactly what is pressed.
+    fn auto_pair(&self, typed: &str) -> Option<Change> {
+        let mut chars = typed.chars();
+        let (Some(ch), None) = (chars.next(), chars.next()) else {
+            return None;
+        };
+        if !self.rich() || matches!(self.caret_kind(), LineKind::Code | LineKind::FenceOpen) {
+            return None;
+        }
+        edit::pair(&self.text, self.sel, ch)
+    }
+
     fn caret_kind(&self) -> LineKind {
         self.syntax.lines[self.syntax.line_at(self.sel.head)].kind
     }
@@ -1839,6 +1859,11 @@ impl MarkdownEditor {
         }
         let in_code = matches!(self.caret_kind(), LineKind::Code | LineKind::FenceOpen);
         let c = edit::enter(&self.text, self.sel, self.rich(), in_code);
+        let c = if in_code {
+            c
+        } else {
+            edit::then_renumber(&self.text, c)
+        };
         self.apply(c, Kind::Other, cx);
     }
 
@@ -1860,7 +1885,10 @@ impl MarkdownEditor {
             return;
         }
         match edit::indent(&self.text, self.sel) {
-            Some(c) => self.apply(c, Kind::Other, cx),
+            Some(c) => {
+                let c = edit::then_renumber(&self.text, c);
+                self.apply(c, Kind::Other, cx)
+            }
             None if !self.rich() || self.caret_kind() == LineKind::Code => {
                 self.replace_selection("    ", Kind::Typing, cx)
             }
@@ -1873,6 +1901,7 @@ impl MarkdownEditor {
             return;
         }
         if let Some(c) = edit::outdent(&self.text, self.sel) {
+            let c = edit::then_renumber(&self.text, c);
             self.apply(c, Kind::Other, cx);
         }
     }
@@ -1908,6 +1937,17 @@ impl MarkdownEditor {
     /// Smart paste: rich content (a web page, Word, Google Docs) arrives as
     /// HTML and goes in as markdown. Ctrl/Cmd+Shift+V pastes plain text.
     fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+        // A web address pasted over a selection links it.
+        if !self.sel.is_empty()
+            && !self.text[self.sel.range()].contains('\n')
+            && self.grid_widget(self.sel.head).is_none()
+            && let Some(url) = cx.read_from_clipboard().and_then(|i| i.text())
+            && !url.trim().contains(char::is_whitespace)
+            && os::is_openable_link(url.trim())
+        {
+            let c = edit::insert_link(&self.text, self.sel, url.trim(), false);
+            return self.apply(c, Kind::Other, cx);
+        }
         let md = clipboard_html()
             .map(|h| mdedit_core::html_import::html_to_markdown(&h))
             .filter(|m| !m.trim().is_empty());
@@ -2412,7 +2452,16 @@ impl EntityInputHandler for MarkdownEditor {
             .map(|r| buffer::from_utf16(&self.text, r.start)..buffer::from_utf16(&self.text, r.end))
             .or(self.marked.clone())
             .unwrap_or(self.sel.range());
-        self.marked = None;
+        let was_marked = self.marked.take().is_some();
+        if !was_marked
+            && r == self.sel.range()
+            && let Some(c) = self.auto_pair(text)
+        {
+            self.apply(c, Kind::Typing, cx);
+            self.update_slash(Some(text));
+            cx.notify();
+            return;
+        }
         let (edits, at) = self
             .table_safe_edits(r.clone(), text)
             .unwrap_or_else(|| (vec![Edit::replace(r.clone(), text)], r.start + text.len()));

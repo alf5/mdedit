@@ -33,7 +33,13 @@ nothing is converted back and forth behind your back.
   pointer turns to a hand over one.
 - **Lists that keep going**: `Enter` continues a list, a task list or a
   quote, and `Enter` on an empty item ends it. `Tab` and `Shift+Tab` indent
-  and outdent. Task boxes tick with a click.
+  and outdent. Task boxes tick with a click. A numbered list renumbers
+  itself when an item is added, taken out, indented or outdented.
+- **Brackets and quotes come in pairs**: typing `(`, `[`, `{`, `"`, `'` or
+  `` ` `` adds its closer, typing the closer steps over it, and `Backspace`
+  takes out an empty pair. With text selected, they (and `*`, `_`, `~`)
+  wrap it. Source mode and code blocks type exactly what you press.
+- **Paste a web address over selected text** to make it a link.
 - **Tables you edit in place.** Type straight into the cells. In Live
   mode the cell you're in shows its Markdown. A `|` you type is escaped, so
   it stays text.

@@ -383,6 +383,16 @@ pub fn indent(text: &str, sel: Selection) -> Option<Change> {
                 _ => 2,
             };
             edits.push(Edit::insert(line.start, " ".repeat(width)));
+            // A nested numbered list starts at 1; `renumber` carries it on
+            // from there, or from the item above at its new depth.
+            if let Prefix::Ordered(n, _) = prefix
+                && n != 1
+            {
+                let (indent, ..) = line_prefix(&text[line.clone()]);
+                let digits = n.to_string().len();
+                let at = line.start + indent;
+                edits.push(Edit::replace(at..at + digits, "1"));
+            }
         }
     }
     (!edits.is_empty()).then(|| change(edits, sel))
@@ -449,6 +459,215 @@ pub fn insert_link(text: &str, sel: Selection, url: &str, image: bool) -> Change
     Change {
         edits: vec![Edit::replace(r, s)],
         selection: Selection::caret(at),
+    }
+}
+
+/// The closer that goes with an opener `auto-pair` knows.
+fn closer(open: char) -> Option<char> {
+    Some(match open {
+        '(' => ')',
+        '[' => ']',
+        '{' => '}',
+        '"' => '"',
+        '\'' => '\'',
+        '`' => '`',
+        _ => return None,
+    })
+}
+
+/// Typing `ch` with brackets and quotes paired:
+/// - with a selection, an opener (or `*`, `_`) wraps it and keeps it selected;
+/// - with a caret, an opener inserts its pair around the caret, unless the
+///   next character is a word (`(|word`), or for a quote, the previous one is
+///   (an apostrophe: `don't`), or for a backquote, it follows another;
+/// - a closer that is already the next character is stepped over.
+///
+/// `None` means type `ch` as it is.
+pub fn pair(text: &str, sel: Selection, ch: char) -> Option<Change> {
+    let r = sel.range();
+    if !sel.is_empty() {
+        let close = closer(ch).or(matches!(ch, '*' | '_' | '~').then_some(ch))?;
+        if text[r.clone()].contains('\n') {
+            return None;
+        }
+        let o = ch.len_utf8();
+        let edits = vec![
+            Edit::insert(r.start, ch.to_string()),
+            Edit::insert(r.end, close.to_string()),
+        ];
+        let (a, b) = (r.start + o, r.end + o);
+        let selection = if sel.reversed() {
+            Selection::new(b, a)
+        } else {
+            Selection::new(a, b)
+        };
+        return Some(Change { edits, selection });
+    }
+    let at = r.start;
+    let next = text[at..].chars().next();
+    let prev = text[..at].chars().next_back();
+    if next == Some(ch) && matches!(ch, ')' | ']' | '}' | '"' | '\'' | '`') {
+        return Some(Change {
+            edits: vec![],
+            selection: Selection::caret(at + ch.len_utf8()),
+        });
+    }
+    let close = closer(ch)?;
+    let open_after = next.is_none_or(|n| n.is_whitespace() || ")]}.,;:!?".contains(n));
+    if !open_after {
+        return None;
+    }
+    let quote = matches!(ch, '"' | '\'' | '`');
+    if quote && prev.is_some_and(|p| p.is_alphanumeric() || p == ch) {
+        return None;
+    }
+    Some(Change {
+        edits: vec![Edit::insert(at, format!("{ch}{close}"))],
+        selection: Selection::caret(at + ch.len_utf8()),
+    })
+}
+
+/// Backspace between an empty pair (`(|)`) takes both out.
+pub fn unpair(text: &str, sel: Selection) -> Option<Change> {
+    if !sel.is_empty() {
+        return None;
+    }
+    let at = sel.head;
+    let prev = text[..at].chars().next_back()?;
+    let next = text[at..].chars().next()?;
+    (closer(prev) == Some(next)).then(|| Change {
+        edits: vec![Edit::delete(at - prev.len_utf8()..at + next.len_utf8())],
+        selection: Selection::caret(at - prev.len_utf8()),
+    })
+}
+
+/// The ordered list items around `pos`, at every depth the lines from one
+/// line above to one line below touch, numbered again from each list's
+/// first number. Items keep their delimiter. A nested list that an indent
+/// has just made (its first item is not the list's continuation) starts at
+/// 1. Empty when nothing needs changing.
+pub fn renumber(text: &str, span: std::ops::Range<usize>) -> Vec<Edit> {
+    // Every line, as (start, end, indent, prefix, prefix length).
+    let mut lines = Vec::new();
+    let mut at = 0;
+    loop {
+        let end = line_end(text, at);
+        let (indent, prefix, len) = line_prefix(&text[at..end]);
+        lines.push((at, end, indent, prefix, len));
+        if end >= text.len() {
+            break;
+        }
+        at = end + 1;
+    }
+    let line_of = |pos: usize| lines.partition_point(|l| l.1 < pos).min(lines.len() - 1);
+    let first = line_of(span.start).saturating_sub(1);
+    let last = (line_of(span.end) + 1).min(lines.len() - 1);
+    let blank = |i: usize| text[lines[i].0..lines[i].1].trim().is_empty();
+    // Is line `i` part of a list whose items sit at `indent`: an item at
+    // that depth, or something nested deeper (a child item, a paragraph
+    // under an item)?
+    let inside = |i: usize, indent: usize| {
+        let (_, _, ind, p, _) = lines[i];
+        (ind == indent && matches!(p, Prefix::Ordered(..))) || (ind > indent && !blank(i))
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let mut edits = Vec::new();
+    for i in first..=last {
+        let (_, _, indent, Prefix::Ordered(..), _) = lines[i] else {
+            continue;
+        };
+        // Walk up to the list's first item; one blank line between items
+        // (a loose list) does not end it.
+        let mut top = i;
+        let mut j = i;
+        while j > 0 {
+            let k = j - 1;
+            if inside(k, indent) {
+                j = k;
+            } else if blank(k) && k > 0 && inside(k - 1, indent) {
+                j = k - 1;
+            } else {
+                break;
+            }
+            if lines[j].2 == indent && matches!(lines[j].3, Prefix::Ordered(..)) {
+                top = j;
+            }
+        }
+        if !seen.insert((top, indent)) {
+            continue;
+        }
+        let Prefix::Ordered(start, _) = lines[top].3 else {
+            continue;
+        };
+        let mut n = start;
+        let mut j = top;
+        while j < lines.len() {
+            let (ls, _, ind, p, _) = lines[j];
+            if ind == indent
+                && let Prefix::Ordered(have, _) = p
+            {
+                if have != n {
+                    let digits = text[ls + ind..]
+                        .chars()
+                        .take_while(char::is_ascii_digit)
+                        .count();
+                    edits.push(Edit::replace(ls + ind..ls + ind + digits, format!("{n}")));
+                }
+                n += 1;
+            }
+            let k = j + 1;
+            if k < lines.len() && inside(k, indent) {
+                j = k;
+            } else if k + 1 < lines.len() && blank(k) && inside(k + 1, indent) {
+                j = k + 1;
+            } else {
+                break;
+            }
+        }
+    }
+    edits
+}
+
+/// `change`, then the ordered lists around it renumbered, as one change:
+/// a single edit over the stretch that differs, so it undoes in one step.
+pub fn then_renumber(text: &str, change: Change) -> Change {
+    let mut after = text.to_string();
+    crate::buffer::apply(&mut after, &change.edits);
+    let span = change
+        .edits
+        .iter()
+        .map(|e| map_pos(e.range.start, &change.edits, false))
+        .min()
+        .unwrap_or(change.selection.start())
+        .min(change.selection.start())..change.selection.end();
+    let fix = renumber(&after, span);
+    if fix.is_empty() {
+        return change;
+    }
+    let selection = Selection::new(
+        map_pos(change.selection.anchor, &fix, true),
+        map_pos(change.selection.head, &fix, true),
+    );
+    crate::buffer::apply(&mut after, &fix);
+    // The one edit that turns `text` into `after`.
+    let pre = text
+        .char_indices()
+        .zip(after.chars())
+        .find(|((_, a), b)| a != b)
+        .map_or(text.len().min(after.len()), |((i, _), _)| i);
+    let suf = text[pre..]
+        .chars()
+        .rev()
+        .zip(after[pre..].chars().rev())
+        .take_while(|(a, b)| a == b)
+        .map(|(a, _)| a.len_utf8())
+        .sum::<usize>();
+    Change {
+        edits: vec![Edit::replace(
+            pre..text.len() - suf,
+            &after[pre..after.len() - suf],
+        )],
+        selection,
     }
 }
 
@@ -608,7 +827,7 @@ mod tests {
         let tab = |t: &str, s| indent(t, s).unwrap();
         let untab = |t: &str, s| outdent(t, s).unwrap();
         assert_eq!(run("- a\n- |b", tab), "- a\n  - |b");
-        assert_eq!(run("1. a\n2. |b", tab), "1. a\n   2. |b");
+        assert_eq!(run("1. a\n2. |b", tab), "1. a\n   1. |b");
         assert_eq!(run("- a\n  - |b", untab), "- a\n- |b");
         assert!(indent("plain", Selection::caret(0)).is_none());
     }
@@ -642,5 +861,58 @@ mod tests {
         let e = toggle_task(&t, 2).unwrap();
         apply(&mut t, &[e]);
         assert_eq!(t, "- [x] x");
+    }
+
+    #[test]
+    fn brackets_and_quotes_pair() {
+        let ty = |c: char| {
+            move |t: &str, s| {
+                pair(t, s, c).unwrap_or(Change {
+                    edits: vec![Edit::replace(s.range(), c.to_string())],
+                    selection: Selection::caret(s.start() + c.len_utf8()),
+                })
+            }
+        };
+        assert_eq!(run("a |", ty('(')), "a (|)");
+        assert_eq!(run("a (|)", ty(')')), "a ()|");
+        assert_eq!(run("|word", ty('(')), "(|word");
+        assert_eq!(run("don|", ty('\'')), "don'|");
+        assert_eq!(run("say |", ty('"')), "say \"|\"");
+        assert_eq!(run("[|]", ty('[')), "[[|]]");
+        assert_eq!(run("a [word] b", ty('*')), "a *[word]* b");
+        assert_eq!(run("a [word] b", ty('(')), "a ([word]) b");
+        assert_eq!(run("a [word] b", ty('x')), "a x| b");
+        // Three backquotes make a fence, not a pile of pairs.
+        let three = run(&run(&run("|", ty('`')), ty('`')), ty('`'));
+        assert_eq!(three, "```|");
+        assert_eq!(run("a (|)", |t, s| unpair(t, s).unwrap()), "a |");
+        assert!(unpair("a (|x)".replace('|', "").as_str(), Selection::caret(3)).is_none());
+    }
+
+    #[test]
+    fn numbered_lists_renumber() {
+        let fix = |t: &str, s: Selection| then_renumber(t, enter(t, s, true, false));
+        assert_eq!(run("1. a|\n2. b\n3. c", fix), "1. a\n2. |\n3. b\n4. c");
+        assert_eq!(run("3. a|\n4. b", fix), "3. a\n4. |\n5. b");
+        // Taking an item out of the list (Backspace at its marker).
+        let unwrap = |t: &str, s| then_renumber(t, backspace_prefix(t, s).unwrap());
+        assert_eq!(
+            run("1. a\n2. |b\n3. c\n4. d", unwrap),
+            "1. a\n|b\n3. c\n4. d"
+        );
+        // Indenting starts a nested list; outdenting rejoins the outer one.
+        let tab = |t: &str, s| then_renumber(t, indent(t, s).unwrap());
+        assert_eq!(run("1. a\n2. |b\n3. c", tab), "1. a\n   1. |b\n2. c");
+        assert_eq!(
+            run("1. a\n   1. x\n3. |b\n4. c", tab),
+            "1. a\n   1. x\n   2. |b\n2. c"
+        );
+        let untab = |t: &str, s| then_renumber(t, outdent(t, s).unwrap());
+        assert_eq!(run("1. a\n   1. |b\n2. c", untab), "1. a\n2. |b\n3. c");
+        // A loose list, and digits growing past 9.
+        assert_eq!(run("8. a|\n\n9. b", fix), "8. a\n9. |\n\n10. b");
+        // Nothing to do leaves the change alone.
+        let c = then_renumber("x", enter("x", Selection::caret(1), true, false));
+        assert_eq!(c.edits.len(), 1);
     }
 }

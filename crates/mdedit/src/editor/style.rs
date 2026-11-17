@@ -72,6 +72,10 @@ pub struct DocStyle {
     pub muted_body: bool,
     /// Outline numbers on headings.
     pub numbered: bool,
+    /// Source line numbers in the margin.
+    pub line_numbers: bool,
+    /// The line-height setting's factor, already in `leading`.
+    pub spacing: f32,
     pub colors: Colors,
     /// The theme's palette as is, for what's drawn outside GPUI (diagrams,
     /// formulas).
@@ -104,6 +108,8 @@ impl DocStyle {
         // Each style has its own column; the setting only chooses between a
         // column and the full pane.
         let width = prefs.reading_width.map(|_| width);
+        let spacing = prefs.line_spacing.clamp(0.8, 1.4);
+        let leading = leading * spacing;
         let accent = hsla(p.accent);
         let bg = hsla(p.bg);
         let surface_alt = hsla(p.diagram_surface_alt);
@@ -115,6 +121,8 @@ impl DocStyle {
             width,
             muted_body,
             numbered: prefs.numbered,
+            line_numbers: prefs.line_numbers,
+            spacing,
             colors: Colors {
                 bg,
                 text: hsla(p.text),
@@ -151,7 +159,8 @@ impl DocStyle {
     pub fn metrics(&self, kind: LineKind, mode: Mode) -> (f32, f32) {
         if mode == Mode::Source {
             let s = self.size * 0.92;
-            return (s, s * 1.55);
+            // Source mode's own height, spaced as the style's is.
+            return (s, s * 1.55 * self.spacing);
         }
         let body = self.size * self.leading;
         match kind {

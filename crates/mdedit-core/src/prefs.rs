@@ -97,6 +97,10 @@ pub struct Prefs {
     /// The English spelling follows: american, british, canadian,
     /// australian or indian.
     pub dialect: String,
+    /// Number the source lines in the margin.
+    pub line_numbers: bool,
+    /// The style's line height times this: 0.9 compact, 1.0, 1.15 relaxed.
+    pub line_spacing: f32,
 }
 
 impl Default for Prefs {
@@ -115,6 +119,8 @@ impl Default for Prefs {
             spell_check: false,
             grammar: false,
             dialect: "american".into(),
+            line_numbers: false,
+            line_spacing: 1.0,
         }
     }
 }

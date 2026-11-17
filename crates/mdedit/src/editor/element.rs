@@ -58,6 +58,9 @@ pub(crate) struct Frame {
     folds: Vec<FoldMark>,
     /// Spelling and grammar: the words to underline, and in what colour.
     squiggles: Vec<(Bounds<Pixels>, Hsla)>,
+    /// Source line numbers, right-aligned at the margin, and the line
+    /// height each sits in.
+    numbers: Vec<(ShapedLine, Point<Pixels>, Pixels)>,
 }
 
 pub(crate) struct FoldMark {
@@ -156,6 +159,45 @@ impl MarkdownEditor {
     }
 }
 
+impl MarkdownEditor {
+    /// Each visible row's first source line number, faint and small, right
+    /// against the margin's edge, level with the row's first line.
+    fn line_numbers(
+        &self,
+        lines: &[Placed],
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+    ) -> Vec<(ShapedLine, Point<Pixels>, Pixels)> {
+        if !self.style.line_numbers || self.is_embedded() {
+            return Vec::new();
+        }
+        let size = px(self.style.size * 0.72);
+        // Beside a reading column, near it (clear of the chevrons and
+        // heading numbers); at the window's edge when the text fills it.
+        let column = lines.first().map_or(bounds.left(), |(_, o, _)| o.x);
+        let right = max(bounds.left() + px(48.), column - px(60.));
+        lines
+            .iter()
+            .map(|(ix, origin, l)| {
+                let n = (self.rows[*ix].lines.start + 1).to_string();
+                let run = TextRun {
+                    len: n.len(),
+                    font: font(self.style.mono.clone()),
+                    color: self.style.colors.faint,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let shaped = window
+                    .text_system()
+                    .shape_line(n.into(), size, &[run], None);
+                let at = point(right - shaped.width(), origin.y + l.pad_top);
+                (shaped, at, l.line_height)
+            })
+            .collect()
+    }
+}
+
 /// What `prepare` hands back: the visible rows, the widgets drawn among
 /// them (laid out and placed), the reading column, and the content height.
 type Prepared = (Vec<Placed>, Vec<AnyElement>, Pixels, Pixels, Pixels);
@@ -167,7 +209,15 @@ impl MarkdownEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Prepared {
-        let pad = px(if self.is_embedded() { 12. } else { PAD_X });
+        // Line numbers need a margin of their own.
+        let numbers = self.style.line_numbers && !self.is_embedded();
+        let pad = px(if self.is_embedded() {
+            12.
+        } else if numbers {
+            PAD_X + 36.
+        } else {
+            PAD_X
+        });
         let avail = max(bounds.size.width - pad * 2., px(160.));
         let content_w = match self.style.width {
             Some(w) => min(px(w), avail),
@@ -851,6 +901,7 @@ impl Element for EditorElement {
             };
             let folds = ed.fold_marks(&lines, bounds, window);
             let squiggles = ed.squiggles(&lines, content_w);
+            let numbers = ed.line_numbers(&lines, bounds, window);
             let (deco, tasks, copy, langs) = if ed.mode == Mode::Source {
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new())
             } else {
@@ -879,6 +930,7 @@ impl Element for EditorElement {
                 drag_cursor,
                 folds,
                 squiggles,
+                numbers,
             }
         })
     }
@@ -1052,6 +1104,9 @@ impl Element for EditorElement {
                     )
                     .ok();
                 }
+            }
+            for (n, at, lh) in &frame.numbers {
+                n.paint(*at, *lh, TextAlign::Left, None, window, cx).ok();
             }
             for t in &frame.tasks {
                 t.paint(window);

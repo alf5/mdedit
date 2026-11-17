@@ -225,6 +225,8 @@ applies it at once, and remembers it:
   reading column or the full width.
 - **Numbered headings**: headings can be numbered like an outline (1., 1.1.,
   …).
+- **Line numbers** in the margin, and a **line height** (compact, normal
+  or relaxed).
 
 Inter, Source Serif 4 and JetBrains Mono are bundled, so mdedit looks the
 same on every system.

@@ -304,6 +304,29 @@ impl Render for SettingsPage {
                                 ),
                         ))
                         .child(Self::row(
+                            "Line height",
+                            div().flex().gap(px(4.)).children(
+                                [(0.9f32, "Compact"), (1.0, "Normal"), (1.15, "Relaxed")].map(|(f, label)| {
+                                    Button::new(label)
+                                        .small()
+                                        .label(label)
+                                        .map(|b| {
+                                            if (prefs.line_spacing - f).abs() < 0.01 { b.primary() } else { b.outline() }
+                                        })
+                                        .on_click(move |_, w, cx| change(w, cx, |p| p.line_spacing = f))
+                                }),
+                            ),
+                        ))
+                        .child(Self::row(
+                            "Number the lines in the margin",
+                            Switch::new("line-numbers")
+                                .checked(prefs.line_numbers)
+                                .on_click(|on, w, cx| {
+                                    let on = *on;
+                                    change(w, cx, |p| p.line_numbers = on)
+                                }),
+                        ))
+                        .child(Self::row(
                             "Number headings like an outline (1., 1.1., …)",
                             Switch::new("numbered")
                                 .checked(prefs.numbered)

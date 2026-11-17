@@ -1274,3 +1274,22 @@ fn misspellings_are_underlined_only_when_asked(cx: &mut TestAppContext) {
     });
     assert_eq!(ed.read_with(cx, |e, _| e.shown_issues().count()), 0);
 }
+
+#[test]
+fn line_spacing_scales_every_mode() {
+    use mdedit_core::syntax::LineKind;
+    let p = themes::system_palette(false);
+    let normal = DocStyle::new(&Prefs::default(), &p);
+    let relaxed = DocStyle::new(
+        &Prefs {
+            line_spacing: 1.15,
+            ..Prefs::default()
+        },
+        &p,
+    );
+    for mode in [Mode::Rendered, Mode::Source] {
+        let (_, a) = normal.metrics(LineKind::Paragraph, mode);
+        let (_, b) = relaxed.metrics(LineKind::Paragraph, mode);
+        assert!((b / a - 1.15).abs() < 0.001, "{mode:?}: {a} → {b}");
+    }
+}
